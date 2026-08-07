@@ -98,6 +98,10 @@ describe('reduceSession', () => {
       type: 'recovery-failed',
       reason: 'recovery exhausted',
     })
+    const abnormalAfterBudget = reduceSession(thirdAttempt, {
+      type: 'abnormal-exit',
+      reason: 'another disconnect',
+    })
 
     expect(ordinaryFailure.status).toBe('failed')
     expect(ordinaryFailure.recoveryAttempts).toBe(0)
@@ -117,6 +121,11 @@ describe('reduceSession', () => {
       status: 'failed',
       recoveryAttempts: 3,
       lastError: 'recovery exhausted',
+    })
+    expect(abnormalAfterBudget).toMatchObject({
+      status: 'failed',
+      recoveryAttempts: 3,
+      lastError: 'another disconnect',
     })
   })
 

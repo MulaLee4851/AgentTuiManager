@@ -34,6 +34,24 @@ export type SessionEvent =
 
 const MAX_RECOVERY_ATTEMPTS = 3
 
+function advanceRecovery(state: SessionState, reason: string): SessionState {
+  if (state.recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
+    return {
+      ...state,
+      status: 'failed',
+      recoveryAttempts: MAX_RECOVERY_ATTEMPTS,
+      lastError: reason,
+    }
+  }
+
+  return {
+    ...state,
+    status: 'recovering',
+    recoveryAttempts: state.recoveryAttempts + 1,
+    lastError: reason,
+  }
+}
+
 export function reduceSession(
   state: SessionState,
   event: SessionEvent,
@@ -69,36 +87,9 @@ export function reduceSession(
       }
     case 'user-stop-requested':
       return { ...state, status: 'stopped', userStopRequested: true }
-    case 'abnormal-exit': {
-      const recoveryAttempts = Math.min(
-        state.recoveryAttempts + 1,
-        MAX_RECOVERY_ATTEMPTS,
-      )
-      return {
-        ...state,
-        status: 'recovering',
-        recoveryAttempts,
-        lastError: event.reason,
-      }
-    }
-    case 'recovery-failed': {
-      if (state.recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
-        return {
-          ...state,
-          status: 'failed',
-          recoveryAttempts: MAX_RECOVERY_ATTEMPTS,
-          lastError: event.reason,
-        }
-      }
-
-      const recoveryAttempts = state.recoveryAttempts + 1
-      return {
-        ...state,
-        status: 'recovering',
-        recoveryAttempts,
-        lastError: event.reason,
-      }
-    }
+    case 'abnormal-exit':
+    case 'recovery-failed':
+      return advanceRecovery(state, event.reason)
     case 'unknown':
       return { ...state, status: 'unknown' }
     case 'no-output-timeout':
