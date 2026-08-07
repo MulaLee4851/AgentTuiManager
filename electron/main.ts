@@ -4,7 +4,10 @@ import { join } from 'node:path'
 function createWindow(): void {
   const window = new BrowserWindow({
     webPreferences: {
-      preload: join(__dirname, 'preload.js')
+      preload: join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true
     }
   })
 
