@@ -6,10 +6,16 @@ export default defineConfig({
   main: {
     build: {
       outDir: 'dist-electron',
+      rollupOptions: {
+        external: ['node-pty']
+      },
       lib: {
-        entry: resolve(__dirname, 'electron/main.ts'),
+        entry: {
+          main: resolve(__dirname, 'electron/main.ts'),
+          'session-host': resolve(__dirname, 'electron/session-host.ts')
+        },
         formats: ['cjs'],
-        fileName: () => 'main.js'
+        fileName: (_format, entryName) => `${entryName}.js`
       }
     }
   },
