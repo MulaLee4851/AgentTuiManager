@@ -1,7 +1,7 @@
 .superpowers/
+.worktrees/
 node_modules/
 dist/
 build/
 coverage/
 *.log
-
