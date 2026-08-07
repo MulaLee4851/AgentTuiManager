@@ -38,6 +38,18 @@ export function reduceSession(
   state: SessionState,
   event: SessionEvent,
 ): SessionState {
+  if (state.userStopRequested) {
+    return { ...state, status: 'stopped' }
+  }
+
+  if (
+    state.status === 'completed' ||
+    state.status === 'stopped' ||
+    state.status === 'failed'
+  ) {
+    return { ...state }
+  }
+
   switch (event.type) {
     case 'started':
       return { ...state, status: 'running' }
@@ -47,7 +59,7 @@ export function reduceSession(
       if (event.userInitiated || state.userStopRequested) {
         return { ...state, status: 'stopped' }
       }
-      if (event.exitCode === 0 || event.adapterCompletion) {
+      if (event.exitCode === 0) {
         return { ...state, status: 'completed' }
       }
       return {
@@ -64,21 +76,25 @@ export function reduceSession(
       )
       return {
         ...state,
-        status:
-          recoveryAttempts >= MAX_RECOVERY_ATTEMPTS ? 'failed' : 'recovering',
+        status: 'recovering',
         recoveryAttempts,
         lastError: event.reason,
       }
     }
     case 'recovery-failed': {
-      const recoveryAttempts = Math.min(
-        state.recoveryAttempts + 1,
-        MAX_RECOVERY_ATTEMPTS,
-      )
+      if (state.recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
+        return {
+          ...state,
+          status: 'failed',
+          recoveryAttempts: MAX_RECOVERY_ATTEMPTS,
+          lastError: event.reason,
+        }
+      }
+
+      const recoveryAttempts = state.recoveryAttempts + 1
       return {
         ...state,
-        status:
-          recoveryAttempts >= MAX_RECOVERY_ATTEMPTS ? 'failed' : 'recovering',
+        status: 'recovering',
         recoveryAttempts,
         lastError: event.reason,
       }
@@ -86,6 +102,6 @@ export function reduceSession(
     case 'unknown':
       return { ...state, status: 'unknown' }
     case 'no-output-timeout':
-      return { ...state, status: 'running' }
+      return { ...state }
   }
 }

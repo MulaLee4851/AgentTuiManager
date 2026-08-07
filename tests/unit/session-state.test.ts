@@ -40,6 +40,15 @@ describe('reduceSession', () => {
   })
 
   it('preserves stop intent when the process later exits non-zero', () => {
+    const userInitiatedExit = reduceSession(
+      { ...baseState(), status: 'running' },
+      {
+        type: 'process-exited',
+        exitCode: 130,
+        userInitiated: true,
+        adapterCompletion: false,
+      },
+    )
     const stopped = reduceSession(
       { ...baseState(), status: 'running' },
       { type: 'user-stop-requested' },
@@ -56,6 +65,10 @@ describe('reduceSession', () => {
       status: 'stopped',
       userStopRequested: true,
     })
+    expect(userInitiatedExit).toMatchObject({
+      status: 'stopped',
+      recoveryAttempts: 0,
+    })
     expect(exited.status).toBe('stopped')
   })
 
@@ -66,7 +79,7 @@ describe('reduceSession', () => {
         type: 'process-exited',
         exitCode: 1,
         userInitiated: false,
-        adapterCompletion: false,
+        adapterCompletion: true,
       },
     )
     const firstAttempt = reduceSession(
@@ -81,6 +94,10 @@ describe('reduceSession', () => {
       type: 'recovery-failed',
       reason: 'host unavailable',
     })
+    const exhausted = reduceSession(thirdAttempt, {
+      type: 'recovery-failed',
+      reason: 'recovery exhausted',
+    })
 
     expect(ordinaryFailure.status).toBe('failed')
     expect(ordinaryFailure.recoveryAttempts).toBe(0)
@@ -93,19 +110,53 @@ describe('reduceSession', () => {
       recoveryAttempts: 2,
     })
     expect(thirdAttempt).toMatchObject({
+      status: 'recovering',
+      recoveryAttempts: 3,
+    })
+    expect(exhausted).toMatchObject({
       status: 'failed',
       recoveryAttempts: 3,
-      lastError: 'host unavailable',
+      lastError: 'recovery exhausted',
     })
   })
 
   it('marks unknown evidence unknown and treats no output as non-actionable', () => {
-    const running = { ...baseState(), status: 'running' as const }
+    const awaitingApproval = {
+      ...baseState(),
+      status: 'needs_approval' as const,
+    }
 
-    expect(reduceSession(running, { type: 'unknown' }).status).toBe('unknown')
-    expect(reduceSession(running, { type: 'no-output-timeout' })).toMatchObject({
-      status: 'running',
+    expect(reduceSession(awaitingApproval, { type: 'unknown' }).status).toBe(
+      'unknown',
+    )
+    expect(
+      reduceSession(awaitingApproval, { type: 'no-output-timeout' }),
+    ).toMatchObject({
+      status: 'needs_approval',
       recoveryAttempts: 0,
     })
+  })
+
+  it('keeps stop intent and terminal states absorbing during late abnormal events', () => {
+    const stopped = {
+      ...baseState(),
+      status: 'stopped' as const,
+      userStopRequested: true,
+    }
+    const completed = { ...baseState(), status: 'completed' as const }
+
+    const stoppedAfterAbnormal = reduceSession(stopped, {
+      type: 'abnormal-exit',
+      reason: 'late host exit',
+    })
+    const completedAfterAbnormal = reduceSession(completed, {
+      type: 'abnormal-exit',
+      reason: 'late host exit',
+    })
+
+    expect(stoppedAfterAbnormal).not.toBe(stopped)
+    expect(stoppedAfterAbnormal).toEqual(stopped)
+    expect(completedAfterAbnormal).not.toBe(completed)
+    expect(completedAfterAbnormal).toEqual(completed)
   })
 })
