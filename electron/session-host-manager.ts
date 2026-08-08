@@ -227,7 +227,7 @@ export class SessionHostManager {
 
   async listLiveHosts(): Promise<HostRecord[]> {
     await mkdir(this.runtimeDir, { recursive: true })
-    const files = (await readdir(this.runtimeDir)).filter((file) => file.endsWith('.json'))
+    const files = (await readdir(this.runtimeDir)).filter((file) => /^host-[a-zA-Z0-9-]+\.json$/.test(file))
     const live: HostRecord[] = []
     for (const file of files) {
       const path = join(this.runtimeDir, file)
@@ -281,11 +281,15 @@ export class SessionHostManager {
   }
 
   private async readRecord(hostId: string): Promise<HostRecord> {
-    if (!/^[a-zA-Z0-9-]+$/.test(hostId)) throw new Error('Invalid host id')
-    return JSON.parse(await readFile(join(this.runtimeDir, `${hostId}.json`), 'utf8')) as HostRecord
+    return JSON.parse(await readFile(this.registryPath(hostId), 'utf8')) as HostRecord
   }
 
   private async writeRecord(record: HostRecord): Promise<void> {
-    await writeFile(join(this.runtimeDir, `${record.hostId}.json`), JSON.stringify(record, null, 2))
+    await writeFile(this.registryPath(record.hostId), JSON.stringify(record, null, 2))
+  }
+
+  private registryPath(hostId: string): string {
+    if (!/^[a-zA-Z0-9-]+$/.test(hostId)) throw new Error('Invalid host id')
+    return join(this.runtimeDir, `host-${hostId}.json`)
   }
 }

@@ -78,11 +78,13 @@ describe('SessionHostManager integration', () => {
 
     const sentinel = join(workspace, 'agent-history.jsonl')
     await writeFile(sentinel, 'do-not-delete')
-    await writeFile(join(runtimeDir, 'stale-host.json'), JSON.stringify({ hostId: 'stale-host', agentKind: 'generic', cwd: workspace, pid: 999999, endpoint: '\\\\.\\pipe\\agent-tui-missing-host' }))
+    await writeFile(join(runtimeDir, 'settings.json'), JSON.stringify({ theme: 'system' }))
+    await writeFile(join(runtimeDir, 'host-stale-host.json'), JSON.stringify({ hostId: 'stale-host', agentKind: 'generic', cwd: workspace, pid: 999999, endpoint: '\\\\.\\pipe\\agent-tui-missing-host' }))
     const live = await replacement.listLiveHosts()
 
     expect(live.map((record) => record.hostId)).toContain(original.hostId)
-    expect(await readdir(runtimeDir)).not.toContain('stale-host.json')
+    expect(await readdir(runtimeDir)).not.toContain('host-stale-host.json')
+    expect(await readFile(join(runtimeDir, 'settings.json'), 'utf8')).toBe('{"theme":"system"}')
     expect(await readFile(sentinel, 'utf8')).toBe('do-not-delete')
   })
 })
