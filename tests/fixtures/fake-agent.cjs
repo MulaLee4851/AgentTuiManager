@@ -8,4 +8,7 @@ if (mode === 'crash') process.exit(1)
 if (mode !== 'running') process.exit(2)
 
 process.stdin.setEncoding('utf8')
-process.stdin.on('data', (data) => process.stdout.write(data))
+process.stdin.on('data', (data) => {
+  process.stdout.write(data)
+  if (data.includes('exit 1')) process.exit(1)
+})

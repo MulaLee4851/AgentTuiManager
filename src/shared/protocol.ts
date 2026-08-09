@@ -18,3 +18,10 @@ export type HostEvent =
   | { type: 'exit'; exitCode: number; signal?: number }
   | { type: 'error'; message: string }
   | { type: 'pong' }
+
+export interface HostExitFact {
+  hostId: string
+  exitCode: number
+  signal?: number
+  exitedAt: string
+}

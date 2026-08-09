@@ -1,10 +1,10 @@
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises'
 import net, { type Socket } from 'node:net'
 import { join } from 'node:path'
 
-import type { HostCommand, HostEvent } from '../src/shared/protocol'
+import type { HostCommand, HostEvent, HostExitFact } from '../src/shared/protocol'
 
 const DEFAULT_TIMEOUT_MS = 5_000
 
@@ -15,6 +15,9 @@ export interface HostRecord {
   nativeSessionId?: string
   pid: number
   endpoint: string
+  lifecycle: 'starting' | 'running'
+  createdAt: string
+  updatedAt: string
 }
 
 export interface StartHostOptions {
@@ -48,6 +51,22 @@ interface EventWaiter {
   timer: ReturnType<typeof setTimeout>
 }
 
+interface PendingEvent {
+  promise: Promise<HostEvent>
+  cancel: (error: Error) => void
+}
+
+async function atomicWriteJson(path: string, value: unknown): Promise<void> {
+  const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`
+  try {
+    await writeFile(temporaryPath, JSON.stringify(value, null, 2))
+    await rename(temporaryPath, path)
+  } catch (error) {
+    await unlink(temporaryPath).catch(() => undefined)
+    throw error
+  }
+}
+
 class PipeHostHandle implements HostHandle {
   readonly hostId: string
   private readonly socket: Socket
@@ -56,10 +75,12 @@ class PipeHostHandle implements HostHandle {
   private readonly pongWaiters: EventWaiter[] = []
   private buffer = ''
   private closedError: Error | undefined
+  private readonly timeoutMs: number
 
-  constructor(hostId: string, socket: Socket) {
+  constructor(hostId: string, socket: Socket, timeoutMs: number) {
     this.hostId = hostId
     this.socket = socket
+    this.timeoutMs = timeoutMs
     socket.setEncoding('utf8')
     socket.on('data', (chunk) => this.onData(chunk.toString()))
     socket.on('error', (error) => this.close(error))
@@ -70,7 +91,7 @@ class PipeHostHandle implements HostHandle {
     const event = this.events.shift()
     if (event) return Promise.resolve(event)
     if (this.closedError) return Promise.reject(this.closedError)
-    return this.waitFor(this.waiters, timeoutMs, 'host event')
+    return this.createWaiter(this.waiters, timeoutMs, 'host event').promise
   }
 
   write(data: string): void {
@@ -82,16 +103,16 @@ class PipeHostHandle implements HostHandle {
   }
 
   async stop(): Promise<void> {
-    if (this.closedError || this.socket.destroyed) return
+    if (this.closedError || this.socket.destroyed) {
+      throw this.closedError ?? new Error(`Host ${this.hostId} connection is closed`)
+    }
     this.send({ type: 'stop' })
-    const deadline = Date.now() + DEFAULT_TIMEOUT_MS
-    while (!this.closedError && Date.now() < deadline) {
-      try {
-        const event = await this.nextEvent(deadline - Date.now())
-        if (event.type === 'exit') return
-      } catch {
-        return
-      }
+    const deadline = Date.now() + this.timeoutMs
+    for (;;) {
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) throw new Error(`Timed out waiting for host event from host ${this.hostId}`)
+      const event = await this.nextEvent(remaining)
+      if (event.type === 'exit') return
     }
   }
 
@@ -107,14 +128,19 @@ class PipeHostHandle implements HostHandle {
   }
 
   ping(timeoutMs: number): Promise<void> {
-    const pong = this.waitFor(this.pongWaiters, timeoutMs, 'pong').then(() => undefined)
-    this.send({ type: 'ping' })
-    return pong
+    const pending = this.createWaiter(this.pongWaiters, timeoutMs, 'pong')
+    try {
+      this.send({ type: 'ping' })
+    } catch (error) {
+      pending.cancel(error instanceof Error ? error : new Error(String(error)))
+    }
+    return pending.promise.then(() => undefined)
   }
 
-  private waitFor(waiters: EventWaiter[], timeoutMs: number, label: string): Promise<HostEvent> {
-    return new Promise((resolve, reject) => {
-      const waiter: EventWaiter = {
+  private createWaiter(waiters: EventWaiter[], timeoutMs: number, label: string): PendingEvent {
+    let waiter: EventWaiter
+    const promise = new Promise<HostEvent>((resolve, reject) => {
+      waiter = {
         resolve,
         reject,
         timer: setTimeout(() => {
@@ -125,6 +151,16 @@ class PipeHostHandle implements HostHandle {
       }
       waiters.push(waiter)
     })
+    return {
+      promise,
+      cancel: (error) => {
+        const index = waiters.indexOf(waiter)
+        if (index < 0) return
+        waiters.splice(index, 1)
+        clearTimeout(waiter.timer)
+        waiter.reject(error)
+      },
+    }
   }
 
   private onData(chunk: string): void {
@@ -182,33 +218,59 @@ export class SessionHostManager {
     await mkdir(this.runtimeDir, { recursive: true })
     const hostId = randomUUID()
     const endpoint = this.endpointFor(hostId)
-    const child = spawn(this.nodeExecutable, [this.hostEntry, '--host-id', hostId, '--endpoint', endpoint], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
-    })
-    child.unref()
+    const exitPath = this.exitPath(hostId)
+    const createdAt = new Date().toISOString()
+    const pendingRecord: HostRecord = {
+      hostId,
+      agentKind: 'generic',
+      cwd: options.cwd,
+      ...(options.nativeSessionId ? { nativeSessionId: options.nativeSessionId } : {}),
+      pid: 0,
+      endpoint,
+      lifecycle: 'starting',
+      createdAt,
+      updatedAt: createdAt,
+    }
+    await this.writeRecord(pendingRecord)
+
+    let child: ReturnType<typeof spawn> | undefined
+    let handle: PipeHostHandle | undefined
 
     try {
-      const handle = await this.connect(hostId, endpoint)
+      child = spawn(this.nodeExecutable, [this.hostEntry, '--host-id', hostId, '--endpoint', endpoint, '--exit-path', exitPath], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+      })
+      const childFailure = new Promise<Error>((resolve) => {
+        child!.once('error', (error) => resolve(error))
+        child!.once('exit', (code, signal) => resolve(new Error(`Session Host exited before ready (code ${code ?? 'null'}, signal ${signal ?? 'null'})`)))
+      })
+      const raceChild = async <T>(operation: Promise<T>): Promise<T> => {
+        const result = await Promise.race([
+          operation.then((value) => ({ value })),
+          childFailure.then((error) => ({ error })),
+        ])
+        if ('error' in result) throw result.error
+        return result.value
+      }
+
+      if (child.pid === undefined) throw await childFailure
+      await this.writeRecord({ ...pendingRecord, pid: child.pid, updatedAt: new Date().toISOString() })
+      child.unref()
+      handle = await raceChild(this.connect(hostId, endpoint))
       handle.send({ type: 'start', ...options })
-      const event = await handle.nextEvent(this.timeoutMs)
+      const event = await raceChild(handle.nextEvent(this.timeoutMs))
       if (event.type !== 'ready') {
         throw new Error(event.type === 'error' ? event.message : `Expected ready, received ${event.type}`)
       }
-      if (child.pid === undefined) throw new Error('Session Host did not report a process id')
-      await this.writeRecord({
-        hostId,
-        agentKind: 'generic',
-        cwd: options.cwd,
-        ...(options.nativeSessionId ? { nativeSessionId: options.nativeSessionId } : {}),
-        pid: child.pid,
-        endpoint,
-      })
+      await this.writeRecord({ ...pendingRecord, pid: child.pid, lifecycle: 'running', updatedAt: new Date().toISOString() })
       return handle
     } catch (error) {
-      child.kill()
+      handle?.disconnect()
+      if (child && !child.killed) child.kill()
+      await unlink(this.registryPath(hostId)).catch(() => undefined)
       throw error
     }
   }
@@ -231,17 +293,38 @@ export class SessionHostManager {
     const live: HostRecord[] = []
     for (const file of files) {
       const path = join(this.runtimeDir, file)
+      let record: HostRecord
       try {
-        const record = JSON.parse(await readFile(path, 'utf8')) as HostRecord
-        const handle = await this.connect(record.hostId, record.endpoint, Math.min(this.timeoutMs, 250))
-        await handle.ping(this.timeoutMs)
-        handle.disconnect()
+        record = JSON.parse(await readFile(path, 'utf8')) as HostRecord
+      } catch {
+        continue
+      }
+      if (!Number.isInteger(record.pid) || record.pid <= 0) continue
+      if (!this.processExists(record.pid)) {
+        await unlink(path).catch(() => undefined)
+        continue
+      }
+      let handle: PipeHostHandle | undefined
+      try {
+        handle = await this.connect(record.hostId, record.endpoint, Math.min(this.timeoutMs, 250))
+        await handle.ping(Math.min(this.timeoutMs, 250))
         live.push(record)
       } catch {
-        await unlink(path).catch(() => undefined)
+        // A live process with a transiently missing endpoint is retained for a later probe.
+      } finally {
+        handle?.disconnect()
       }
     }
     return live
+  }
+
+  async readLastExit(hostId: string): Promise<HostExitFact | undefined> {
+    try {
+      return JSON.parse(await readFile(this.exitPath(hostId), 'utf8')) as HostExitFact
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+      throw error
+    }
   }
 
   private endpointFor(hostId: string): string {
@@ -271,7 +354,7 @@ export class SessionHostManager {
           })
           candidate.once('error', onError)
         })
-        return new PipeHostHandle(hostId, socket)
+        return new PipeHostHandle(hostId, socket, this.timeoutMs)
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error))
         await new Promise((resolve) => setTimeout(resolve, 25))
@@ -285,11 +368,25 @@ export class SessionHostManager {
   }
 
   private async writeRecord(record: HostRecord): Promise<void> {
-    await writeFile(this.registryPath(record.hostId), JSON.stringify(record, null, 2))
+    await atomicWriteJson(this.registryPath(record.hostId), record)
   }
 
   private registryPath(hostId: string): string {
     if (!/^[a-zA-Z0-9-]+$/.test(hostId)) throw new Error('Invalid host id')
     return join(this.runtimeDir, `host-${hostId}.json`)
+  }
+
+  private exitPath(hostId: string): string {
+    if (!/^[a-zA-Z0-9-]+$/.test(hostId)) throw new Error('Invalid host id')
+    return join(this.runtimeDir, `exit-${hostId}.json`)
+  }
+
+  private processExists(pid: number): boolean {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== 'ESRCH'
+    }
   }
 }

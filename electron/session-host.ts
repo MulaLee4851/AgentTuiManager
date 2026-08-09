@@ -1,8 +1,10 @@
 import net, { type Socket } from 'node:net'
+import { randomUUID } from 'node:crypto'
+import { rename, unlink, writeFile } from 'node:fs/promises'
 
 import * as pty from 'node-pty'
 
-import type { HostCommand, HostEvent } from '../src/shared/protocol'
+import type { HostCommand, HostEvent, HostExitFact } from '../src/shared/protocol'
 
 function argument(name: string): string {
   const index = process.argv.indexOf(name)
@@ -13,9 +15,22 @@ function argument(name: string): string {
 
 const hostId = argument('--host-id')
 const endpoint = argument('--endpoint')
+const exitPath = argument('--exit-path')
 const clients = new Set<Socket>()
 let terminal: pty.IPty | undefined
 let shuttingDown = false
+let finalizing = false
+
+async function atomicWriteJson(path: string, value: unknown): Promise<void> {
+  const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`
+  try {
+    await writeFile(temporaryPath, JSON.stringify(value, null, 2))
+    await rename(temporaryPath, path)
+  } catch (error) {
+    await unlink(temporaryPath).catch(() => undefined)
+    throw error
+  }
+}
 
 function send(socket: Socket, event: HostEvent): void {
   if (!socket.destroyed) socket.write(`${JSON.stringify(event)}\n`)
@@ -33,6 +48,26 @@ function shutdown(exitCode: number): void {
     for (const socket of clients) socket.end()
     process.exit(exitCode)
   }, 50).unref()
+}
+
+async function finalizeExit(exitCode: number, signal?: number): Promise<void> {
+  if (finalizing) return
+  finalizing = true
+  const fact: HostExitFact = {
+    hostId,
+    exitCode,
+    ...(signal === undefined ? {} : { signal }),
+    exitedAt: new Date().toISOString(),
+  }
+  try {
+    await atomicWriteJson(exitPath, fact)
+    broadcast({ type: 'exit', exitCode, ...(signal === undefined ? {} : { signal }) })
+  } catch (error) {
+    broadcast({ type: 'error', message: `Failed to persist final exit: ${error instanceof Error ? error.message : String(error)}` })
+  } finally {
+    terminal = undefined
+    shutdown(exitCode === 0 ? 0 : 1)
+  }
 }
 
 function startTerminal(socket: Socket, command: Extract<HostCommand, { type: 'start' }>): void {
@@ -56,9 +91,7 @@ function startTerminal(socket: Socket, command: Extract<HostCommand, { type: 'st
       else pendingOutput.push(data)
     })
     terminal.onExit(({ exitCode, signal }) => {
-      broadcast({ type: 'exit', exitCode, ...(signal === undefined ? {} : { signal }) })
-      terminal = undefined
-      shutdown(exitCode === 0 ? 0 : 1)
+      void finalizeExit(exitCode, signal)
     })
 
     send(socket, { type: 'ready', hostId })

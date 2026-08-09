@@ -64,6 +64,20 @@ describe('SessionHostManager integration', () => {
     await expect(nextMatching(handle, (event) => event.type === 'exit')).resolves.toMatchObject({ type: 'exit', exitCode })
   })
 
+  it('persists the final exit fact after the client disconnects', async () => {
+    const { manager, runtimeDir, workspace } = await fixture()
+    const handle = await start(manager, workspace, 'running')
+    await nextMatching(handle, (event) => event.type === 'output' && event.data.includes('fake-agent>'))
+    handle.write('exit 1\r')
+    handle.disconnect()
+
+    const replacement = new SessionHostManager({ runtimeDir, hostEntry: HOST_ENTRY })
+    await expect.poll(() => replacement.readLastExit(handle.hostId), { timeout: 5_000 }).toMatchObject({
+      hostId: handle.hostId,
+      exitCode: 1,
+    })
+  })
+
   it('reconnects live hosts and deletes only stale registry data', async () => {
     const { manager, runtimeDir, workspace } = await fixture()
     const original = await start(manager, workspace, 'running')
@@ -79,12 +93,36 @@ describe('SessionHostManager integration', () => {
     const sentinel = join(workspace, 'agent-history.jsonl')
     await writeFile(sentinel, 'do-not-delete')
     await writeFile(join(runtimeDir, 'settings.json'), JSON.stringify({ theme: 'system' }))
+    const now = new Date().toISOString()
+    await writeFile(join(runtimeDir, 'host-live-missing.json'), JSON.stringify({ hostId: 'live-missing', agentKind: 'generic', cwd: workspace, pid: process.pid, endpoint: '\\\\.\\pipe\\agent-tui-missing-live', lifecycle: 'running', createdAt: now, updatedAt: now }))
+    await writeFile(join(runtimeDir, 'host-pending.json'), JSON.stringify({ hostId: 'pending', agentKind: 'generic', cwd: workspace, pid: 0, endpoint: '\\\\.\\pipe\\agent-tui-pending', lifecycle: 'starting', createdAt: now, updatedAt: now }))
+    await writeFile(join(runtimeDir, 'host-invalid.json'), '{not-json')
     await writeFile(join(runtimeDir, 'host-stale-host.json'), JSON.stringify({ hostId: 'stale-host', agentKind: 'generic', cwd: workspace, pid: 999999, endpoint: '\\\\.\\pipe\\agent-tui-missing-host' }))
     const live = await replacement.listLiveHosts()
 
     expect(live.map((record) => record.hostId)).toContain(original.hostId)
     expect(await readdir(runtimeDir)).not.toContain('host-stale-host.json')
+    expect(await readdir(runtimeDir)).toEqual(expect.arrayContaining(['host-live-missing.json', 'host-pending.json', 'host-invalid.json']))
     expect(await readFile(join(runtimeDir, 'settings.json'), 'utf8')).toBe('{"theme":"system"}')
     expect(await readFile(sentinel, 'utf8')).toBe('do-not-delete')
+  })
+
+  it('rejects stop when the host connection is already gone', async () => {
+    const { manager, runtimeDir, workspace } = await fixture()
+    const handle = await start(manager, workspace, 'running')
+    await nextMatching(handle, (event) => event.type === 'output' && event.data.includes('fake-agent>'))
+    handle.disconnect()
+    await expect(handle.stop()).rejects.toThrow(/closed/i)
+    const replacement = new SessionHostManager({ runtimeDir, hostEntry: HOST_ENTRY })
+    const cleanup = await replacement.reconnect(handle.hostId)
+    handles.push(cleanup)
+    await cleanup.stop()
+  })
+
+  it('rejects spawn failures and removes its pending registry record', async () => {
+    const { runtimeDir, workspace } = await fixture()
+    const manager = new SessionHostManager({ runtimeDir, hostEntry: HOST_ENTRY, nodeExecutable: join(runtimeDir, 'missing-node.exe'), timeoutMs: 250 })
+    await expect(manager.start({ executable: process.execPath, args: [FAKE_AGENT, '--mode', 'running'], cwd: workspace, cols: 80, rows: 24 })).rejects.toThrow()
+    expect((await readdir(runtimeDir)).filter((file) => file.startsWith('host-'))).toEqual([])
   })
 })
