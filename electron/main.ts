@@ -7,6 +7,7 @@ import { SessionHostManager } from './session-host-manager'
 import { discoverNativeSessions } from './native-session-discovery'
 import { canonicalNativeRecovery, validateExecutable } from './start-request-policy'
 import { ApprovalPolicyStore } from './approval-policy-store'
+import { resolveExecutableForPty } from './executable-resolution'
 import { IPC_CHANNELS, type AgentKind, type NativeSessionSummary, type RecoveryRecipe, type StartSessionRequest } from '../src/shared/manager-api'
 
 let mainWindow: BrowserWindow | undefined
@@ -33,7 +34,8 @@ function dimensions(cols: unknown, rows: unknown): { cols: number; rows: number 
 
 function executable(agentKind: AgentKind, value: unknown): string {
   const candidate = text(value, 'executable', 1_024)
-  return validateExecutable(agentKind, candidate, process.env.AGENT_TUI_ALLOWED_EXECUTABLES ?? '')
+  const validated = validateExecutable(agentKind, candidate, process.env.AGENT_TUI_ALLOWED_EXECUTABLES ?? '')
+  return resolveExecutableForPty(validated)
 }
 
 function workspace(value: unknown): string {
