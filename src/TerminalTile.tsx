@@ -62,6 +62,7 @@ export default function TerminalTile({ session, detail = false, hidden = false, 
         </div>
         <div className="terminal-actions">
           <span className={`status-badge status-${session.status}`}>{STATUS_LABEL[session.status]}</span>
+          {session.status === 'needs_approval' && <button className="button-approve" type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.approveSession(session.sessionId) }}>批准</button>}
           {!detail && <button className="button-ghost" type="button" onClick={(event) => { event.stopPropagation(); onOpen?.() }} aria-label={`查看 ${session.displayName}`}>放大</button>}
           <button className="button-danger" type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.stopSession(session.sessionId) }}>停止</button>
         </div>

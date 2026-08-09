@@ -35,6 +35,11 @@ export interface StartHostOptions {
   recovery?: RecoveryRecipe
 }
 
+export interface HostMetadataUpdate {
+  nativeSessionId: string
+  recovery: RecoveryRecipe
+}
+
 export interface HostHandle {
   readonly hostId: string
   nextEvent(timeoutMs?: number): Promise<HostEvent>
@@ -341,6 +346,20 @@ export class SessionHostManager {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
       throw error
     }
+  }
+
+  async updateMetadata(hostId: string, update: HostMetadataUpdate): Promise<void> {
+    const record = await this.readRecord(hostId)
+    await this.writeRecord({
+      ...record,
+      nativeSessionId: update.nativeSessionId,
+      recovery: {
+        executable: update.recovery.executable,
+        args: [...update.recovery.args],
+        ...(update.recovery.continueInput === undefined ? {} : { continueInput: update.recovery.continueInput }),
+      },
+      updatedAt: new Date().toISOString(),
+    })
   }
 
   private endpointFor(hostId: string): string {

@@ -45,6 +45,7 @@ export const IPC_CHANNELS = {
   write: 'agent-manager:write',
   resize: 'agent-manager:resize',
   stopSession: 'agent-manager:stop-session',
+  approveSession: 'agent-manager:approve-session',
   chooseWorkspace: 'agent-manager:choose-workspace',
   discoverSessions: 'agent-manager:discover-sessions',
   event: 'agent-manager:event',
@@ -56,6 +57,7 @@ export interface AgentManagerApi {
   write(sessionId: string, data: string): Promise<void> | void
   resize(sessionId: string, cols: number, rows: number): Promise<void> | void
   stopSession(sessionId: string): Promise<void>
+  approveSession(sessionId: string): Promise<void>
   chooseWorkspace(): Promise<string | undefined>
   discoverSessions(agentKind: AgentKind, workspace: string): Promise<NativeSessionSummary[]>
   subscribe(listener: (event: ManagerEvent) => void): () => void

@@ -8,6 +8,7 @@ const api: AgentManagerApi = {
   write: (sessionId, data) => ipcRenderer.invoke(IPC_CHANNELS.write, sessionId, data),
   resize: (sessionId, cols, rows) => ipcRenderer.invoke(IPC_CHANNELS.resize, sessionId, cols, rows),
   stopSession: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.stopSession, sessionId),
+  approveSession: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.approveSession, sessionId),
   chooseWorkspace: () => ipcRenderer.invoke(IPC_CHANNELS.chooseWorkspace),
   discoverSessions: (agentKind, workspace) => ipcRenderer.invoke(IPC_CHANNELS.discoverSessions, agentKind, workspace),
   subscribe: (listener) => {

@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { SessionController, type SessionHostManagerPort } from '../../electron/session-controller'
+import { SessionController, type NativeSessionDiscoveryPort, type SessionHostManagerPort } from '../../electron/session-controller'
 import type { HostEvent } from '../../src/shared/protocol'
 import type { StartSessionRequest } from '../../src/shared/manager-api'
 import type { HostHandle, HostRecord, StartHostOptions } from '../../electron/session-host-manager'
+import { ApprovalPolicyEngine } from '../../electron/approval-policy'
 
 class FakeHandle implements HostHandle {
   readonly writes: string[] = []
@@ -19,15 +20,23 @@ class FakeHandle implements HostHandle {
     if (event) return Promise.resolve(event)
     return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }))
   }
-  emit(event: HostEvent): void { this.waiters.shift()?.resolve(event) ?? this.events.push(event) }
-  fail(error: Error): void { this.waiters.shift()?.reject(error) ?? this.events.push(error) }
+  emit(event: HostEvent): void {
+    const waiter = this.waiters.shift()
+    if (waiter) waiter.resolve(event)
+    else this.events.push(event)
+  }
+  fail(error: Error): void {
+    const waiter = this.waiters.shift()
+    if (waiter) waiter.reject(error)
+    else this.events.push(error)
+  }
   write(data: string): void { this.writes.push(data) }
   resize(): void {}
   async stop(): Promise<void> { this.stops += 1 }
   disconnect(): void {}
 }
 
-function fixture() {
+function fixture(discovery?: NativeSessionDiscoveryPort) {
   const handles: FakeHandle[] = []
   const starts: StartHostOptions[] = []
   const manager: SessionHostManagerPort = {
@@ -40,8 +49,9 @@ function fixture() {
     reconnect: vi.fn(),
     listLiveHosts: vi.fn(async (): Promise<HostRecord[]> => []),
     readLastExit: vi.fn(async () => undefined),
+    updateMetadata: vi.fn(async () => undefined),
   }
-  return { controller: new SessionController(manager), handles, starts, manager }
+  return { controller: new SessionController(manager, undefined, discovery), handles, starts, manager }
 }
 
 const request = (recovery = false): StartSessionRequest => ({
@@ -99,7 +109,7 @@ describe('SessionController recovery evidence', () => {
     expect(starts).toHaveLength(1)
   })
 
-  it('starts the resume host only after abnormal exit and continues only after first output', async () => {
+  it('starts the resume host only after abnormal exit and continues only after adapter readiness', async () => {
     const { controller, handles, starts } = fixture()
     const session = await controller.startSession(request(true))
     handles[0]!.emit({ type: 'exit', exitCode: 1 })
@@ -110,7 +120,12 @@ describe('SessionController recovery evidence', () => {
     expect(handles[1]!.writes).toEqual([])
     expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('recovering')
 
-    handles[1]!.emit({ type: 'output', data: 'codex ready' })
+    handles[1]!.emit({ type: 'output', data: 'loading session' })
+    await settle()
+    expect(handles[1]!.writes).toEqual([])
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('recovering')
+
+    handles[1]!.emit({ type: 'output', data: 'OpenAI Codex\r\n›\r\n' })
     await settle()
     expect(handles[1]!.writes).toEqual(['continue\r'])
     expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
@@ -190,8 +205,72 @@ describe('SessionController recovery evidence', () => {
     expect(starts).toHaveLength(1)
     expect(starts[0]).toMatchObject({ agentKind: 'claude', executable: 'claude', args: ['--resume', 'claude-native'] })
     expect(handles.at(-1)?.writes).toEqual([])
-    handles.at(-1)?.emit({ type: 'output', data: 'ready' })
+    handles.at(-1)?.emit({ type: 'output', data: 'Claude Code\r\n❯\r\n' })
     await settle()
     expect(handles.at(-1)?.writes).toEqual(['continue\r'])
+  })
+
+  it('projects an explicit approval prompt into the session summary', async () => {
+    const { controller, handles } = fixture()
+    const session = await controller.startSession(request())
+    handles[0]!.emit({ type: 'output', data: 'Would you like to run the following command?' })
+    await settle()
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('needs_approval')
+
+    controller.write(session.sessionId, '\r')
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
+  })
+
+  it('approves only a session with explicit approval evidence', async () => {
+    const { controller, handles } = fixture()
+    const session = await controller.startSession(request())
+    expect(() => controller.approveSession(session.sessionId)).toThrow(/not awaiting approval/i)
+
+    handles[0]!.emit({ type: 'output', data: 'Approval required' })
+    await settle()
+    controller.approveSession(session.sessionId)
+    expect(handles[0]!.writes).toEqual(['\r'])
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
+    expect(() => controller.approveSession(session.sessionId)).toThrow(/not awaiting approval/i)
+  })
+
+  it('auto-approves only a recognized command allowed by policy', async () => {
+    const base = fixture()
+    const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
+    const session = await controller.startSession(request())
+    base.handles[0]!.emit({ type: 'output', data: '$ git status --short\r\nWould you like to run the following command?' })
+    await settle()
+    expect(base.handles[0]!.writes).toEqual(['\r'])
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
+
+    base.handles[0]!.emit({ type: 'output', data: 'command completed' })
+    await settle()
+    base.handles[0]!.emit({ type: 'output', data: '$ Remove-Item -Recurse build\r\nWould you like to run the following command?' })
+    await settle()
+    expect(base.handles[0]!.writes).toEqual(['\r'])
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('needs_approval')
+  })
+
+  it('captures one new native session and persists an exact recovery recipe', async () => {
+    let discoveryCalls = 0
+    const discovery: NativeSessionDiscoveryPort = {
+      discover: vi.fn(async () => {
+        discoveryCalls += 1
+        return discoveryCalls === 1 ? [] : [{
+          id: 'captured-native', title: 'Captured', updatedAt: Date.now(), workspace: 'B:\\work',
+        }]
+      }),
+    }
+    const { controller, handles, manager } = fixture(discovery)
+    const session = await controller.startSession(request())
+    handles[0]!.emit({ type: 'output', data: 'OpenAI Codex\r\n›\r\n' })
+    await settle()
+    await settle()
+
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.nativeSessionId).toBe('captured-native')
+    expect(manager.updateMetadata).toHaveBeenCalledWith('host-1', {
+      nativeSessionId: 'captured-native',
+      recovery: { executable: 'codex', args: ['resume', 'captured-native'] },
+    })
   })
 })

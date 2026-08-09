@@ -6,6 +6,7 @@ import { SessionController } from './session-controller'
 import { SessionHostManager } from './session-host-manager'
 import { discoverNativeSessions } from './native-session-discovery'
 import { canonicalNativeRecovery, validateExecutable } from './start-request-policy'
+import { ApprovalPolicyEngine } from './approval-policy'
 import { IPC_CHANNELS, type AgentKind, type NativeSessionSummary, type RecoveryRecipe, type StartSessionRequest } from '../src/shared/manager-api'
 
 let mainWindow: BrowserWindow | undefined
@@ -130,6 +131,10 @@ function registerIpc(): void {
     trustedRenderer(event)
     return controller.stopSession(sessionId(id))
   })
+  ipcMain.handle(IPC_CHANNELS.approveSession, (event, id: unknown) => {
+    trustedRenderer(event)
+    return controller.approveSession(sessionId(id))
+  })
   ipcMain.handle(IPC_CHANNELS.chooseWorkspace, async (event) => {
     trustedRenderer(event)
     const options: Electron.OpenDialogOptions = { properties: ['openDirectory'] }
@@ -174,7 +179,7 @@ void app.whenReady().then(async () => {
   const manager = new SessionHostManager({ runtimeDir: join(app.getPath('userData'), 'runtime', 'session-hosts'), hostEntry: join(__dirname, 'session-host.js') })
   controller = new SessionController(manager, (event) => {
     for (const window of BrowserWindow.getAllWindows()) window.webContents.send(IPC_CHANNELS.event, event)
-  })
+  }, { discover: discoverNativeSessions }, new ApprovalPolicyEngine())
   registerIpc()
   await controller.restoreLiveHosts()
   createWindow(); createTray()

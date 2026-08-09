@@ -11,11 +11,12 @@ button { cursor: pointer; }
 .topbar-actions { display: flex; align-items: center; gap: 11px; }
 .metric { display: grid; grid-template-columns: auto auto; align-items: baseline; gap: 6px; padding: 8px 12px; border: 1px solid #202a42; border-radius: 10px; background: #101729cc; }
 .metric strong { color: #80e6b1; font-size: 18px; }.metric.pending strong { color: #f7c66d; }.metric span { color: #8290ad; font-size: 11px; }
-.button-primary, .button-secondary, .button-ghost, .button-danger, .icon-button { border: 0; border-radius: 8px; color: #eef2ff; }
+.button-primary, .button-secondary, .button-ghost, .button-danger, .button-approve, .icon-button { border: 0; border-radius: 8px; color: #eef2ff; }
 .button-primary { padding: 10px 15px; background: linear-gradient(135deg, #6d84ff, #5068de); font-weight: 700; box-shadow: 0 8px 28px #4260df33; }
 .button-secondary { padding: 9px 13px; border: 1px solid #2b3652; background: #141c30; }
 .button-ghost { padding: 6px 9px; border: 1px solid #2b3755; background: #151e33; font-size: 11px; }
 .button-danger { padding: 6px 9px; border: 1px solid #55303c; background: #291923; color: #ff9dad; font-size: 11px; }
+.button-approve { padding: 6px 10px; border: 1px solid #78601f; background: #5a4310; color: #ffe09a; font-size: 11px; font-weight: 700; }
 .terminal-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 15px; max-width: 1500px; margin: auto; }
 .terminal-grid-detail { display: flex; flex: 1; width: 100%; min-height: 0; }
 .terminal-card-hidden { display: none; }
