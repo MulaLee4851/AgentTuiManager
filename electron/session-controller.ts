@@ -4,7 +4,7 @@ import type { HostHandle, HostMetadataUpdate, HostRecord, SessionHostManager, St
 import type { HostEvent, HostExitFact } from '../src/shared/protocol'
 import type { AgentKind, ManagerEvent, NativeSessionSummary, SessionSummary, StartSessionRequest } from '../src/shared/manager-api'
 import { reduceSession } from '../src/shared/session-state'
-import { createAgentAdapter, type AgentAdapter } from './agent-adapters'
+import { createAgentAdapter, extractApprovalCommand, type AgentAdapter } from './agent-adapters'
 import type { ApprovalDecision } from './approval-policy'
 
 export interface SessionHostManagerPort {
@@ -21,6 +21,8 @@ export interface NativeSessionDiscoveryPort {
 
 export interface ApprovalPolicyPort {
   decide(command: string | undefined): ApprovalDecision
+  noteManualApproval(command: string | undefined): { command: string; approvalCount: number } | undefined
+  addRule(command: string): Promise<void> | void
 }
 
 interface NativeSessionCapture {
@@ -177,10 +179,35 @@ export class SessionController {
   approveSession(sessionId: string): void {
     const managed = this.required(sessionId)
     if (managed.summary.status !== 'needs_approval') throw new Error('Session is not awaiting approval')
+    const command = managed.pendingApprovalCommand
     managed.adapter.acknowledgeUserInput()
     managed.handle.write(managed.adapter.approvalInput())
-    managed.summary = reduceSession(managed.summary, { type: 'started' }) as SessionSummary
+    const running = reduceSession(managed.summary, { type: 'started' }) as SessionSummary
+    const suggestion = this.approvalPolicy?.noteManualApproval(command)
+    const { pendingApprovalCommand: _pending, ...withoutPending } = running
+    managed.summary = {
+      ...withoutPending,
+      ...(suggestion ? { approvalSuggestion: suggestion } : {}),
+    }
     delete managed.pendingApprovalCommand
+    this.changed(sessionId)
+  }
+
+  async acceptApprovalSuggestion(sessionId: string): Promise<void> {
+    const managed = this.required(sessionId)
+    const suggestion = managed.summary.approvalSuggestion
+    if (!suggestion || !this.approvalPolicy) throw new Error('Session has no approval rule suggestion')
+    await this.approvalPolicy.addRule(suggestion.command)
+    const { approvalSuggestion: _suggestion, ...summary } = managed.summary
+    managed.summary = summary
+    this.changed(sessionId)
+  }
+
+  dismissApprovalSuggestion(sessionId: string): void {
+    const managed = this.required(sessionId)
+    if (!managed.summary.approvalSuggestion) return
+    const { approvalSuggestion: _suggestion, ...summary } = managed.summary
+    managed.summary = summary
     this.changed(sessionId)
   }
 
@@ -223,14 +250,18 @@ export class SessionController {
       if (event.type === 'output') {
         const observation = managed.adapter.observeOutput(event.data)
         if (observation.approvalRequired && managed.summary.status !== 'needs_approval') {
-          const decision = this.approvalPolicy?.decide(observation.approvalCommand)
+          const approvalCommand = observation.approvalCommand ?? extractApprovalCommand(event.data)
+          const decision = this.approvalPolicy?.decide(approvalCommand)
           if (decision?.action === 'auto-approve') {
             managed.adapter.acknowledgeUserInput()
             managed.handle.write(managed.adapter.approvalInput())
             managed.summary = reduceSession(managed.summary, { type: 'started' }) as SessionSummary
           } else {
-            managed.pendingApprovalCommand = observation.approvalCommand
-            managed.summary = reduceSession(managed.summary, { type: 'approval-required' }) as SessionSummary
+            managed.pendingApprovalCommand = approvalCommand
+            managed.summary = {
+              ...reduceSession(managed.summary, { type: 'approval-required' }) as SessionSummary,
+              ...(approvalCommand ? { pendingApprovalCommand: approvalCommand } : {}),
+            }
           }
           this.changed(managed.summary.sessionId)
         }

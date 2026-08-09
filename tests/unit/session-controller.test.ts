@@ -251,6 +251,32 @@ describe('SessionController recovery evidence', () => {
     expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('needs_approval')
   })
 
+  it('suggests a read-only command after three manual approvals and accepts the exact rule', async () => {
+    const base = fixture()
+    const policy = new ApprovalPolicyEngine()
+    const decide = vi.spyOn(policy, 'decide')
+    const controller = new SessionController(base.manager, undefined, undefined, policy)
+    const session = await controller.startSession(request())
+
+    for (let index = 0; index < 3; index += 1) {
+      base.handles[0]!.emit({ type: 'output', data: '$ git log --oneline\r\nWould you like to run the following command?' })
+      await settle()
+      expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('needs_approval')
+      expect(decide).toHaveBeenLastCalledWith('git log --oneline')
+      expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.pendingApprovalCommand).toBe('git log --oneline')
+      controller.approveSession(session.sessionId)
+      base.handles[0]!.emit({ type: 'output', data: 'command completed' })
+      await settle()
+    }
+
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.approvalSuggestion).toEqual({
+      command: 'git log --oneline', approvalCount: 3,
+    })
+    await controller.acceptApprovalSuggestion(session.sessionId)
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.approvalSuggestion).toBeUndefined()
+    expect(policy.decide('git log --oneline').action).toBe('auto-approve')
+  })
+
   it('captures one new native session and persists an exact recovery recipe', async () => {
     let discoveryCalls = 0
     const discovery: NativeSessionDiscoveryPort = {

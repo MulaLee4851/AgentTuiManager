@@ -6,7 +6,7 @@ import { SessionController } from './session-controller'
 import { SessionHostManager } from './session-host-manager'
 import { discoverNativeSessions } from './native-session-discovery'
 import { canonicalNativeRecovery, validateExecutable } from './start-request-policy'
-import { ApprovalPolicyEngine } from './approval-policy'
+import { ApprovalPolicyStore } from './approval-policy-store'
 import { IPC_CHANNELS, type AgentKind, type NativeSessionSummary, type RecoveryRecipe, type StartSessionRequest } from '../src/shared/manager-api'
 
 let mainWindow: BrowserWindow | undefined
@@ -135,6 +135,14 @@ function registerIpc(): void {
     trustedRenderer(event)
     return controller.approveSession(sessionId(id))
   })
+  ipcMain.handle(IPC_CHANNELS.acceptApprovalSuggestion, (event, id: unknown) => {
+    trustedRenderer(event)
+    return controller.acceptApprovalSuggestion(sessionId(id))
+  })
+  ipcMain.handle(IPC_CHANNELS.dismissApprovalSuggestion, (event, id: unknown) => {
+    trustedRenderer(event)
+    return controller.dismissApprovalSuggestion(sessionId(id))
+  })
   ipcMain.handle(IPC_CHANNELS.chooseWorkspace, async (event) => {
     trustedRenderer(event)
     const options: Electron.OpenDialogOptions = { properties: ['openDirectory'] }
@@ -177,9 +185,10 @@ function createTray(): void {
 
 void app.whenReady().then(async () => {
   const manager = new SessionHostManager({ runtimeDir: join(app.getPath('userData'), 'runtime', 'session-hosts'), hostEntry: join(__dirname, 'session-host.js') })
+  const approvalPolicy = await ApprovalPolicyStore.load(join(app.getPath('userData'), 'approval-policy.json'))
   controller = new SessionController(manager, (event) => {
     for (const window of BrowserWindow.getAllWindows()) window.webContents.send(IPC_CHANNELS.event, event)
-  }, { discover: discoverNativeSessions }, new ApprovalPolicyEngine())
+  }, { discover: discoverNativeSessions }, approvalPolicy)
   registerIpc()
   await controller.restoreLiveHosts()
   createWindow(); createTray()

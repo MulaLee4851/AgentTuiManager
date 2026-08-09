@@ -29,10 +29,17 @@ export interface StartSessionRequest {
   recovery?: RecoveryRecipe
 }
 
+export interface ApprovalRuleSuggestion {
+  command: string
+  approvalCount: number
+}
+
 export interface SessionSummary extends SessionState {
   displayName: string
   agentKind: AgentKind
   nativeSessionId?: string
+  pendingApprovalCommand?: string
+  approvalSuggestion?: ApprovalRuleSuggestion
 }
 
 export type ManagerEvent =
@@ -46,6 +53,8 @@ export const IPC_CHANNELS = {
   resize: 'agent-manager:resize',
   stopSession: 'agent-manager:stop-session',
   approveSession: 'agent-manager:approve-session',
+  acceptApprovalSuggestion: 'agent-manager:accept-approval-suggestion',
+  dismissApprovalSuggestion: 'agent-manager:dismiss-approval-suggestion',
   chooseWorkspace: 'agent-manager:choose-workspace',
   discoverSessions: 'agent-manager:discover-sessions',
   event: 'agent-manager:event',
@@ -58,6 +67,8 @@ export interface AgentManagerApi {
   resize(sessionId: string, cols: number, rows: number): Promise<void> | void
   stopSession(sessionId: string): Promise<void>
   approveSession(sessionId: string): Promise<void>
+  acceptApprovalSuggestion(sessionId: string): Promise<void>
+  dismissApprovalSuggestion(sessionId: string): Promise<void> | void
   chooseWorkspace(): Promise<string | undefined>
   discoverSessions(agentKind: AgentKind, workspace: string): Promise<NativeSessionSummary[]>
   subscribe(listener: (event: ManagerEvent) => void): () => void

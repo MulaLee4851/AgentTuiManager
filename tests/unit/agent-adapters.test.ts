@@ -18,6 +18,9 @@ describe('native agent adapters', () => {
     expect(result).toEqual({ approvalRequired: true, approvalCommand: 'git status --short', ready: false })
     adapter.acknowledgeUserInput()
     expect(adapter.observeOutput('Would you like to run the following command?').approvalRequired).toBe(false)
+    const fresh = createAgentAdapter('codex')
+    expect(fresh.observeOutput('$ git log --oneline\r\nWould you like to run the following command?').approvalCommand)
+      .toBe('git log --oneline')
   })
 
   it('recognizes Claude readiness and approval separately', () => {

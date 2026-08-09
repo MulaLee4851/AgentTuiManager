@@ -25,6 +25,10 @@ const BUILT_IN_RULES: Array<{ name: string; pattern: RegExp }> = [
   { name: 'git-revision', pattern: /^git\s+rev-parse(?:\s+(?:--show-toplevel|--show-prefix|--is-inside-work-tree|--abbrev-ref\s+HEAD))$/i },
 ]
 
+const KNOWN_READ_ONLY = [
+  /^git\s+(?:log|show|diff)(?:\s+.*)?$/i,
+]
+
 function normalizedCommand(command: string): string | undefined {
   if (!command || command.length > MAX_COMMAND_LENGTH || command.includes('\0') || /[\r\n]/.test(command)) return undefined
   const normalized = command.trim().replace(/\s+/g, ' ')
@@ -37,8 +41,10 @@ function riskOf(command: string): ApprovalRisk {
   if (/(?:^|\s)(?:Set-Content|Add-Content|Out-File|New-Item|Copy-Item|Move-Item|mkdir|md|touch)(?:\s|$)/i.test(command)
     || /(?:^|\s)(?:npm|pnpm|yarn)\s+(?:install|add|remove|uninstall)(?:\s|$)/i.test(command)
     || /git\s+(?:add|commit|checkout|switch|merge|rebase|cherry-pick|tag|push)(?:\s|$)/i.test(command)) return 'write'
-  if (/[;&|><`]/.test(command) || /\$\(/.test(command) || /--pre(?:=|\s)/i.test(command)) return 'unknown'
+  if (/[;&|><`]/.test(command) || /\$\(/.test(command) || /--pre(?:=|\s)/i.test(command)
+    || /--(?:output|ext-diff|textconv)(?:=|\s|$)/i.test(command)) return 'unknown'
   if (BUILT_IN_RULES.some((rule) => rule.pattern.test(command))) return 'read'
+  if (KNOWN_READ_ONLY.some((pattern) => pattern.test(command))) return 'read'
   return 'unknown'
 }
 

@@ -69,7 +69,7 @@ function includesAny(value: string, patterns: RegExp[]): boolean {
   return patterns.some((pattern) => pattern.test(value))
 }
 
-function commandFromApproval(evidence: string): string | undefined {
+export function extractApprovalCommand(evidence: string): string | undefined {
   const shellLines = [...evidence.matchAll(/(?:^|\n)\s*\$\s+([^\n]+)/g)]
   const shellCommand = shellLines.at(-1)?.[1]?.trim()
   if (shellCommand) return shellCommand
@@ -94,7 +94,7 @@ class CodexAdapter extends EvidenceAdapter {
     const hasIdentity = /(?:openai\s+)?codex/i.test(evidence)
     const hasPrompt = /(?:^|[\r\n])\s*[›❯]\s*(?:$|[\r\n])/m.test(evidence)
       || /type \/ to select a command/i.test(evidence)
-    const approvalCommand = approvalRequired ? commandFromApproval(evidence) : undefined
+    const approvalCommand = approvalRequired ? extractApprovalCommand(evidence) : undefined
     return { approvalRequired, ...(approvalCommand ? { approvalCommand } : {}), ready: !approvalRequired && hasIdentity && hasPrompt }
   }
 }
@@ -118,7 +118,7 @@ class ClaudeAdapter extends EvidenceAdapter {
     const hasIdentity = /claude\s+code/i.test(evidence)
     const hasPrompt = /(?:^|[\r\n])\s*[❯›]\s*(?:$|[\r\n])/m.test(evidence)
       || /\? for shortcuts/i.test(evidence)
-    const approvalCommand = approvalRequired ? commandFromApproval(evidence) : undefined
+    const approvalCommand = approvalRequired ? extractApprovalCommand(evidence) : undefined
     return { approvalRequired, ...(approvalCommand ? { approvalCommand } : {}), ready: !approvalRequired && hasIdentity && hasPrompt }
   }
 }

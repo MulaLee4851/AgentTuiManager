@@ -67,6 +67,11 @@ export default function TerminalTile({ session, detail = false, hidden = false, 
           <button className="button-danger" type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.stopSession(session.sessionId) }}>停止</button>
         </div>
       </header>
+      {session.approvalSuggestion && <div className="approval-suggestion">
+        <span title={session.approvalSuggestion.command}>已手动批准 {session.approvalSuggestion.approvalCount} 次，加入自动批准？</span>
+        <button type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.acceptApprovalSuggestion(session.sessionId) }}>加入</button>
+        <button type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.dismissApprovalSuggestion(session.sessionId) }}>暂不</button>
+      </div>}
       <div className="terminal-surface" ref={hostRef} onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()} />
       {session.status === 'recovering' && <div className="recovery-cover">请稍后…</div>}
     </article>

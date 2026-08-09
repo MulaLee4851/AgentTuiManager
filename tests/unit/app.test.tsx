@@ -29,6 +29,7 @@ describe('App terminal wall', () => {
     api = {
       listSessions: vi.fn(async () => [session]), startSession: vi.fn(), write: vi.fn(), resize: vi.fn(),
       stopSession: vi.fn(), approveSession: vi.fn(), chooseWorkspace: vi.fn(async () => 'B:\\chosen\\workspace'), subscribe: vi.fn(() => () => undefined),
+      acceptApprovalSuggestion: vi.fn(), dismissApprovalSuggestion: vi.fn(),
       discoverSessions: vi.fn(async () => [{ id: 'codex-1', title: '修复登录流程', updatedAt: 1_786_000_000_000, workspace: 'B:\\chosen\\workspace' }]),
     }
     window.agentManager = api
@@ -67,6 +68,19 @@ describe('App terminal wall', () => {
     fireEvent.click(within(tile).getByRole('button', { name: '批准' }))
     expect(api.approveSession).toHaveBeenCalledWith('session-1')
     expect(screen.getByRole('heading', { name: 'Agent 总览' })).toBeInTheDocument()
+  })
+
+  it('accepts or dismisses an approval rule suggestion on the Agent tile', async () => {
+    vi.mocked(api.listSessions).mockResolvedValue([{
+      ...session, approvalSuggestion: { command: 'git log --oneline', approvalCount: 3 },
+    }])
+    render(<App />)
+    const tile = await screen.findByTestId('terminal-tile-session-1')
+    expect(within(tile).getByText(/已手动批准 3 次/)).toBeInTheDocument()
+    fireEvent.click(within(tile).getByRole('button', { name: '加入' }))
+    expect(api.acceptApprovalSuggestion).toHaveBeenCalledWith('session-1')
+    fireEvent.click(within(tile).getByRole('button', { name: '暂不' }))
+    expect(api.dismissApprovalSuggestion).toHaveBeenCalledWith('session-1')
   })
 
   it('chooses the workspace through the system directory picker', async () => {
