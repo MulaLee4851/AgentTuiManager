@@ -56,6 +56,10 @@ export function reduceSession(
   state: SessionState,
   event: SessionEvent,
 ): SessionState {
+  if (event.type === 'process-exited' && event.exitCode === 0) {
+    return { ...state, status: 'completed', userStopRequested: false }
+  }
+
   if (state.userStopRequested) {
     return { ...state, status: 'stopped' }
   }

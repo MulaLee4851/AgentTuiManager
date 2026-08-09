@@ -17,6 +17,7 @@ interface ManagedSession {
   request?: StartSessionRequest
   handle: HostHandle
   generation: number
+  recoveryToken: number
   pendingUserInterrupt: boolean
   awaitingRecoveryOutput: boolean
 }
@@ -58,6 +59,7 @@ export class SessionController {
       request,
       handle,
       generation: 1,
+      recoveryToken: 0,
       pendingUserInterrupt: false,
       awaitingRecoveryOutput: false,
     }
@@ -72,11 +74,12 @@ export class SessionController {
       if (this.sessions.has(record.hostId)) continue
       try {
         const handle = await this.manager.reconnect(record.hostId)
+        const agentKind = record.agentKind ?? 'generic'
         const managed: ManagedSession = {
           summary: {
             sessionId: record.hostId,
             displayName: `已恢复 Agent ${record.hostId.slice(0, 8)}`,
-            agentKind: record.agentKind,
+            agentKind,
             workspace: record.cwd,
             status: 'running',
             recoveryAttempts: 0,
@@ -85,8 +88,26 @@ export class SessionController {
           },
           handle,
           generation: 1,
+          recoveryToken: 0,
           pendingUserInterrupt: false,
           awaitingRecoveryOutput: false,
+        }
+        if (record.recovery) {
+          managed.request = {
+            displayName: managed.summary.displayName,
+            agentKind,
+            workspace: record.cwd,
+            executable: record.recovery.executable,
+            args: [...record.recovery.args],
+            cols: record.cols ?? 80,
+            rows: record.rows ?? 24,
+            ...(record.nativeSessionId ? { nativeSessionId: record.nativeSessionId } : {}),
+            recovery: {
+              executable: record.recovery.executable,
+              args: [...record.recovery.args],
+              ...(record.recovery.continueInput ? { continueInput: record.recovery.continueInput } : {}),
+            },
+          }
         }
         this.sessions.set(record.hostId, managed)
         this.changed(record.hostId)
@@ -110,10 +131,15 @@ export class SessionController {
 
   async stopSession(sessionId: string): Promise<void> {
     const managed = this.required(sessionId)
+    managed.recoveryToken += 1
+    const generation = managed.generation
+    const hostId = managed.handle.hostId
     managed.pendingUserInterrupt = true
     managed.summary = reduceSession(managed.summary, { type: 'user-stop-requested' }) as SessionSummary
     this.changed(sessionId)
     await managed.handle.stop().catch(() => undefined)
+    const exit = await this.manager.readLastExit(hostId).catch(() => undefined)
+    if (exit) await this.onExit(managed, generation, exit.exitCode)
   }
 
   private async pump(managed: ManagedSession, generation: number): Promise<void> {
@@ -124,8 +150,17 @@ export class SessionController {
       } catch (error) {
         if (managed.generation !== generation) return
         if (isTimeout(error)) continue
-        const exit = await this.manager.readLastExit(managed.handle.hostId).catch(() => undefined)
+        const exit = await this.readExitFact(managed.handle.hostId)
         if (exit) await this.onExit(managed, generation, exit.exitCode)
+        else if (managed.pendingUserInterrupt || managed.summary.userStopRequested) {
+          managed.summary = reduceSession(managed.summary, {
+            type: 'process-exited', exitCode: 1, userInitiated: true, adapterCompletion: false,
+          }) as SessionSummary
+          this.changed(managed.summary.sessionId)
+        } else {
+          managed.handle.disconnect()
+          await this.failOrRecover(managed, generation, 'Host connection lost')
+        }
         return
       }
       if (managed.generation !== generation) return
@@ -150,11 +185,18 @@ export class SessionController {
   private async onExit(managed: ManagedSession, generation: number, exitCode: number): Promise<void> {
     if (managed.generation !== generation) return
     managed.handle.disconnect()
-    if (exitCode === 0 || managed.pendingUserInterrupt || managed.summary.userStopRequested) {
+    if (exitCode === 0) {
+      managed.summary = reduceSession(managed.summary, {
+        type: 'process-exited', exitCode: 0, userInitiated: false, adapterCompletion: false,
+      }) as SessionSummary
+      this.changed(managed.summary.sessionId)
+      return
+    }
+    if (managed.pendingUserInterrupt || managed.summary.userStopRequested) {
       managed.summary = reduceSession(managed.summary, {
         type: 'process-exited',
         exitCode,
-        userInitiated: managed.pendingUserInterrupt || managed.summary.userStopRequested,
+        userInitiated: true,
         adapterCompletion: false,
       }) as SessionSummary
       this.changed(managed.summary.sessionId)
@@ -184,34 +226,57 @@ export class SessionController {
   private async startRecovery(managed: ManagedSession): Promise<void> {
     const recipe = managed.request?.recovery
     if (!recipe) return
+    const generation = managed.generation
+    const recoveryToken = ++managed.recoveryToken
     try {
       const handle = await this.manager.start({
+        agentKind: managed.summary.agentKind,
         executable: recipe.executable,
         args: recipe.args,
         cwd: managed.summary.workspace,
         cols: managed.request?.cols ?? 80,
         rows: managed.request?.rows ?? 24,
         ...(managed.summary.nativeSessionId ? { nativeSessionId: managed.summary.nativeSessionId } : {}),
+        recovery: recipe,
       })
+      if (managed.generation !== generation || managed.recoveryToken !== recoveryToken
+        || managed.summary.userStopRequested || managed.summary.status === 'stopped') {
+        await handle.stop().catch(() => undefined)
+        handle.disconnect()
+        return
+      }
       managed.handle = handle
       managed.generation += 1
       managed.pendingUserInterrupt = false
       managed.awaitingRecoveryOutput = true
       void this.pump(managed, managed.generation)
     } catch (error) {
-      await this.failOrRecover(managed, managed.generation, error instanceof Error ? error.message : String(error))
+      if (managed.generation !== generation || managed.recoveryToken !== recoveryToken
+        || managed.summary.userStopRequested || managed.summary.status === 'stopped') return
+      await this.failOrRecover(managed, generation, error instanceof Error ? error.message : String(error))
     }
   }
 
   private hostOptions(request: StartSessionRequest): StartHostOptions {
     return {
+      agentKind: request.agentKind,
       executable: request.executable,
       args: request.args,
       cwd: request.workspace,
       cols: request.cols,
       rows: request.rows,
       ...(request.nativeSessionId ? { nativeSessionId: request.nativeSessionId } : {}),
+      ...(request.recovery ? { recovery: request.recovery } : {}),
     }
+  }
+
+  private async readExitFact(hostId: string): Promise<HostExitFact | undefined> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const exit = await this.manager.readLastExit(hostId).catch(() => undefined)
+      if (exit) return exit
+      if (attempt < 2) await Promise.resolve()
+    }
+    return undefined
   }
 
   private required(sessionId: string): ManagedSession {

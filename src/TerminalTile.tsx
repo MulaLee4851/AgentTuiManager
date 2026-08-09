@@ -11,10 +11,11 @@ const STATUS_LABEL: Record<SessionSummary['status'], string> = {
 interface TerminalTileProps {
   session: SessionSummary
   detail?: boolean
+  hidden?: boolean
   onOpen?: () => void
 }
 
-export default function TerminalTile({ session, detail = false, onOpen }: TerminalTileProps): JSX.Element {
+export default function TerminalTile({ session, detail = false, hidden = false, onOpen }: TerminalTileProps): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -24,7 +25,7 @@ export default function TerminalTile({ session, detail = false, onOpen }: Termin
       cursorBlink: true,
       convertEol: true,
       fontFamily: 'Cascadia Code, Consolas, monospace',
-      fontSize: detail ? 14 : 12,
+      fontSize: 12,
       theme: { background: '#090d18', foreground: '#d8e1f5', cursor: '#7c98ff', selectionBackground: '#334269' },
     })
     terminal.open(host)
@@ -41,10 +42,19 @@ export default function TerminalTile({ session, detail = false, onOpen }: Termin
     const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(resize)
     observer?.observe(host)
     return () => { observer?.disconnect(); unsubscribe(); input.dispose(); terminal.dispose() }
-  }, [detail, session.sessionId])
+  }, [session.sessionId])
+
+  const openDetail = (): void => { if (!detail) onOpen?.() }
 
   return (
-    <article className={`terminal-card${detail ? ' terminal-card-detail' : ''}`} data-testid={`terminal-tile-${session.sessionId}`}>
+    <article
+      className={`terminal-card${detail ? ' terminal-card-detail' : ''}${hidden ? ' terminal-card-hidden' : ''}`}
+      data-testid={`terminal-tile-${session.sessionId}`}
+      onClick={openDetail}
+      onKeyDown={(event) => { if ((event.key === 'Enter' || event.key === ' ') && !detail) openDetail() }}
+      tabIndex={detail || hidden ? -1 : 0}
+      aria-hidden={hidden || undefined}
+    >
       <header className="terminal-card-header">
         <div className="agent-identity">
           <span className={`agent-dot agent-${session.agentKind}`} />
@@ -52,11 +62,11 @@ export default function TerminalTile({ session, detail = false, onOpen }: Termin
         </div>
         <div className="terminal-actions">
           <span className={`status-badge status-${session.status}`}>{STATUS_LABEL[session.status]}</span>
-          {!detail && <button className="button-ghost" type="button" onClick={onOpen} aria-label={`查看 ${session.displayName}`}>放大</button>}
-          <button className="button-danger" type="button" onClick={() => { void window.agentManager.stopSession(session.sessionId) }}>停止</button>
+          {!detail && <button className="button-ghost" type="button" onClick={(event) => { event.stopPropagation(); onOpen?.() }} aria-label={`查看 ${session.displayName}`}>放大</button>}
+          <button className="button-danger" type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.stopSession(session.sessionId) }}>停止</button>
         </div>
       </header>
-      <div className="terminal-surface" ref={hostRef} />
+      <div className="terminal-surface" ref={hostRef} onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()} />
       {session.status === 'recovering' && <div className="recovery-cover">请稍后…</div>}
     </article>
   )

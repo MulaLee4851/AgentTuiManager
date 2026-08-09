@@ -3,6 +3,14 @@ import type { SessionState } from './session-state'
 
 export type AgentKind = 'generic' | 'codex' | 'claude' | 'pi'
 
+export interface NativeSessionSummary {
+  id: string
+  title: string
+  updatedAt: number
+  workspace: string
+  subtitle?: string
+}
+
 export interface RecoveryRecipe {
   executable: string
   args: string[]
@@ -37,6 +45,8 @@ export const IPC_CHANNELS = {
   write: 'agent-manager:write',
   resize: 'agent-manager:resize',
   stopSession: 'agent-manager:stop-session',
+  chooseWorkspace: 'agent-manager:choose-workspace',
+  discoverSessions: 'agent-manager:discover-sessions',
   event: 'agent-manager:event',
 } as const
 
@@ -46,5 +56,7 @@ export interface AgentManagerApi {
   write(sessionId: string, data: string): Promise<void> | void
   resize(sessionId: string, cols: number, rows: number): Promise<void> | void
   stopSession(sessionId: string): Promise<void>
+  chooseWorkspace(): Promise<string | undefined>
+  discoverSessions(agentKind: AgentKind, workspace: string): Promise<NativeSessionSummary[]>
   subscribe(listener: (event: ManagerEvent) => void): () => void
 }

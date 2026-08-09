@@ -5,14 +5,18 @@ import net, { type Socket } from 'node:net'
 import { join } from 'node:path'
 
 import type { HostCommand, HostEvent, HostExitFact } from '../src/shared/protocol'
+import type { AgentKind, RecoveryRecipe } from '../src/shared/manager-api'
 
 const DEFAULT_TIMEOUT_MS = 5_000
 
 export interface HostRecord {
   hostId: string
-  agentKind: 'generic'
+  agentKind?: AgentKind
   cwd: string
   nativeSessionId?: string
+  recovery?: RecoveryRecipe
+  cols?: number
+  rows?: number
   pid: number
   endpoint: string
   lifecycle: 'starting' | 'running'
@@ -21,12 +25,14 @@ export interface HostRecord {
 }
 
 export interface StartHostOptions {
+  agentKind: AgentKind
   executable: string
   args: string[]
   cwd: string
   cols: number
   rows: number
   nativeSessionId?: string
+  recovery?: RecoveryRecipe
 }
 
 export interface HostHandle {
@@ -222,9 +228,12 @@ export class SessionHostManager {
     const createdAt = new Date().toISOString()
     const pendingRecord: HostRecord = {
       hostId,
-      agentKind: 'generic',
+      agentKind: options.agentKind,
       cwd: options.cwd,
       ...(options.nativeSessionId ? { nativeSessionId: options.nativeSessionId } : {}),
+      ...(options.recovery ? { recovery: options.recovery } : {}),
+      cols: options.cols,
+      rows: options.rows,
       pid: 0,
       endpoint,
       lifecycle: 'starting',
@@ -260,7 +269,14 @@ export class SessionHostManager {
       await this.writeRecord({ ...pendingRecord, pid: child.pid, updatedAt: new Date().toISOString() })
       child.unref()
       handle = await raceChild(this.connect(hostId, endpoint))
-      handle.send({ type: 'start', ...options })
+      handle.send({
+        type: 'start',
+        executable: options.executable,
+        args: options.args,
+        cwd: options.cwd,
+        cols: options.cols,
+        rows: options.rows,
+      })
       const event = await raceChild(handle.nextEvent(this.timeoutMs))
       if (event.type !== 'ready') {
         throw new Error(event.type === 'error' ? event.message : `Expected ready, received ${event.type}`)

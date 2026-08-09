@@ -38,6 +38,7 @@ describe('SessionHostManager integration', () => {
 
   async function start(manager: SessionHostManager, workspace: string, mode: 'running' | 'normal-exit' | 'crash') {
     const handle = await manager.start({
+      agentKind: 'generic',
       executable: process.execPath,
       args: [FAKE_AGENT, '--mode', mode],
       cwd: workspace,
@@ -132,6 +133,31 @@ describe('SessionHostManager integration', () => {
     })
   })
 
+  it('persists manager-only recovery metadata without changing the host protocol', async () => {
+    const { manager, runtimeDir, workspace } = await fixture()
+    const handle = await manager.start({
+      agentKind: 'claude',
+      executable: process.execPath,
+      args: [FAKE_AGENT, '--mode', 'running'],
+      cwd: workspace,
+      cols: 91,
+      rows: 27,
+      nativeSessionId: 'claude-native',
+      recovery: { executable: 'claude', args: ['--resume', 'claude-native'] },
+    })
+    handles.push(handle)
+    startedHosts.push({ manager, hostId: handle.hostId, runtimeDir })
+
+    const record = JSON.parse(await readFile(join(runtimeDir, `host-${handle.hostId}.json`), 'utf8'))
+    expect(record).toMatchObject({
+      agentKind: 'claude',
+      cols: 91,
+      rows: 27,
+      nativeSessionId: 'claude-native',
+      recovery: { executable: 'claude', args: ['--resume', 'claude-native'] },
+    })
+  })
+
   it('reconnects live hosts and deletes only stale registry data', async () => {
     const { manager, runtimeDir, workspace } = await fixture()
     const original = await start(manager, workspace, 'running')
@@ -176,7 +202,7 @@ describe('SessionHostManager integration', () => {
   it('rejects spawn failures and removes its pending registry record', async () => {
     const { runtimeDir, workspace } = await fixture()
     const manager = new SessionHostManager({ runtimeDir, hostEntry: HOST_ENTRY, nodeExecutable: join(runtimeDir, 'missing-node.exe'), timeoutMs: 250 })
-    await expect(manager.start({ executable: process.execPath, args: [FAKE_AGENT, '--mode', 'running'], cwd: workspace, cols: 80, rows: 24 })).rejects.toThrow()
+    await expect(manager.start({ agentKind: 'generic', executable: process.execPath, args: [FAKE_AGENT, '--mode', 'running'], cwd: workspace, cols: 80, rows: 24 })).rejects.toThrow()
     expect((await readdir(runtimeDir)).filter((file) => file.startsWith('host-'))).toEqual([])
   })
 })
