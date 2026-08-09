@@ -2,6 +2,8 @@
 .worktrees/
 node_modules/
 dist/
+dist-electron/
 build/
 coverage/
 *.log
+*.tsbuildinfo
