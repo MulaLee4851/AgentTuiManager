@@ -21,6 +21,8 @@ async function nextMatching(handle: HostHandle, predicate: (event: HostEvent) =>
 describe('SessionHostManager integration', () => {
   const handles: HostHandle[] = []
   const tempRoots: string[] = []
+  const managerRuntimeDirs = new WeakMap<SessionHostManager, string>()
+  const startedHosts: Array<{ manager: SessionHostManager; hostId: string; runtimeDir: string }> = []
 
   async function fixture() {
     const root = await mkdtemp(join(tmpdir(), 'agent-tui-host-'))
@@ -29,7 +31,9 @@ describe('SessionHostManager integration', () => {
     await mkdir(runtimeDir)
     await mkdir(workspace)
     tempRoots.push(root)
-    return { manager: new SessionHostManager({ runtimeDir, hostEntry: HOST_ENTRY }), runtimeDir, workspace }
+    const manager = new SessionHostManager({ runtimeDir, hostEntry: HOST_ENTRY })
+    managerRuntimeDirs.set(manager, runtimeDir)
+    return { manager, runtimeDir, workspace }
   }
 
   async function start(manager: SessionHostManager, workspace: string, mode: 'running' | 'normal-exit' | 'crash') {
@@ -41,11 +45,61 @@ describe('SessionHostManager integration', () => {
       rows: 24,
     })
     handles.push(handle)
+    const runtimeDir = managerRuntimeDirs.get(manager)
+    if (!runtimeDir) throw new Error('Test manager is missing its runtime directory')
+    startedHosts.push({ manager, hostId: handle.hostId, runtimeDir })
     return handle
+  }
+
+  function isProcessAlive(pid: number): boolean {
+    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== 'ESRCH'
+    }
+  }
+
+  async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    while (isProcessAlive(pid) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    return !isProcessAlive(pid)
+  }
+
+  async function readRegisteredPid(entry: { hostId: string; runtimeDir: string }): Promise<number> {
+    try {
+      const record = JSON.parse(await readFile(join(entry.runtimeDir, `host-${entry.hostId}.json`), 'utf8')) as { pid?: unknown }
+      return typeof record.pid === 'number' ? record.pid : 0
+    } catch {
+      return 0
+    }
+  }
+
+  async function cleanupStartedHost(entry: { manager: SessionHostManager; hostId: string; runtimeDir: string }): Promise<void> {
+    const pid = await readRegisteredPid(entry)
+    if (!isProcessAlive(pid) || await waitForProcessExit(pid, 100)) return
+
+    let cleanupHandle: HostHandle | undefined
+    try {
+      cleanupHandle = await entry.manager.reconnect(entry.hostId)
+      await cleanupHandle.stop()
+    } catch {
+      // The Host may already be exiting or its endpoint may be gone.
+    } finally {
+      cleanupHandle?.disconnect()
+    }
+
+    if (!isProcessAlive(pid) || await waitForProcessExit(pid, 250)) return
+    process.kill(pid)
+    await waitForProcessExit(pid, 2_000)
   }
 
   afterEach(async () => {
     await Promise.allSettled(handles.splice(0).map((handle) => handle.stop()))
+    await Promise.allSettled(startedHosts.splice(0).map((entry) => cleanupStartedHost(entry)))
     await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
   })
 
