@@ -55,6 +55,9 @@ export const IPC_CHANNELS = {
   approveSession: 'agent-manager:approve-session',
   acceptApprovalSuggestion: 'agent-manager:accept-approval-suggestion',
   dismissApprovalSuggestion: 'agent-manager:dismiss-approval-suggestion',
+  listApprovalRules: 'agent-manager:list-approval-rules',
+  addApprovalRule: 'agent-manager:add-approval-rule',
+  removeApprovalRule: 'agent-manager:remove-approval-rule',
   chooseWorkspace: 'agent-manager:choose-workspace',
   discoverSessions: 'agent-manager:discover-sessions',
   event: 'agent-manager:event',
@@ -69,6 +72,9 @@ export interface AgentManagerApi {
   approveSession(sessionId: string): Promise<void>
   acceptApprovalSuggestion(sessionId: string): Promise<void>
   dismissApprovalSuggestion(sessionId: string): Promise<void> | void
+  listApprovalRules(): Promise<string[]>
+  addApprovalRule(command: string): Promise<void>
+  removeApprovalRule(command: string): Promise<void>
   chooseWorkspace(): Promise<string | undefined>
   discoverSessions(agentKind: AgentKind, workspace: string): Promise<NativeSessionSummary[]>
   subscribe(listener: (event: ManagerEvent) => void): () => void

@@ -1,6 +1,7 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import TerminalTile from './TerminalTile'
+import ApprovalRulesDialog from './ApprovalRulesDialog'
 import type { AgentKind, NativeSessionSummary, StartSessionRequest, SessionSummary } from './shared/manager-api'
 
 function NewAgentForm({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }): JSX.Element {
@@ -104,6 +105,7 @@ export default function App(): JSX.Element {
   const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [selectedId, setSelectedId] = useState<string>()
   const [showForm, setShowForm] = useState(false)
+  const [showApprovalRules, setShowApprovalRules] = useState(false)
   const reload = useCallback(async () => setSessions(await window.agentManager.listSessions()), [])
 
   useEffect(() => {
@@ -119,10 +121,11 @@ export default function App(): JSX.Element {
     <main className={`app-shell${selected ? ' detail-shell' : ''}`}>
       {selected ? <div className="detail-toolbar"><button type="button" className="button-secondary" onClick={() => setSelectedId(undefined)} aria-label="返回总览">← 返回总览</button><span>{selected.agentKind.toUpperCase()} · 终端详情</span></div> : <header className="topbar">
         <div><span className="eyebrow">WORKSPACE CONTROL</span><h1>Agent 总览</h1><p>在一个窗口里掌控所有终端会话</p></div>
-        <div className="topbar-actions"><div className="metric"><strong>{runningCount}</strong><span>运行中</span></div><div className="metric pending"><strong>{pendingCount}</strong><span>待处理</span></div><button className="button-primary" type="button" onClick={() => setShowForm(true)}>＋ 新增 Agent</button></div>
+        <div className="topbar-actions"><div className="metric"><strong>{runningCount}</strong><span>运行中</span></div><div className="metric pending"><strong>{pendingCount}</strong><span>待处理</span></div><button className="button-secondary" type="button" onClick={() => setShowApprovalRules(true)}>批准规则</button><button className="button-primary" type="button" onClick={() => setShowForm(true)}>＋ 新增 Agent</button></div>
       </header>}
       {sessions.length === 0 ? <section className="empty-state"><div className="empty-icon">›_</div><h2>还没有受管 Agent</h2><p>选择工作区并启动你的第一个终端 Agent。</p><button className="button-primary" type="button" onClick={() => setShowForm(true)}>新增 Agent</button></section> : <section className={`terminal-grid${selected ? ' terminal-grid-detail' : ''}`}>{sessions.map((session) => <TerminalTile key={session.sessionId} session={session} detail={selected?.sessionId === session.sessionId} hidden={selected !== undefined && selected.sessionId !== session.sessionId} onOpen={() => setSelectedId(session.sessionId)} />)}</section>}
       {showForm && <NewAgentForm onClose={() => setShowForm(false)} onCreated={() => { setShowForm(false); void reload() }} />}
+      {showApprovalRules && <ApprovalRulesDialog onClose={() => setShowApprovalRules(false)} />}
     </main>
   )
 }

@@ -30,6 +30,7 @@ describe('App terminal wall', () => {
       listSessions: vi.fn(async () => [session]), startSession: vi.fn(), write: vi.fn(), resize: vi.fn(),
       stopSession: vi.fn(), approveSession: vi.fn(), chooseWorkspace: vi.fn(async () => 'B:\\chosen\\workspace'), subscribe: vi.fn(() => () => undefined),
       acceptApprovalSuggestion: vi.fn(), dismissApprovalSuggestion: vi.fn(),
+      listApprovalRules: vi.fn(async () => ['git log --oneline']), addApprovalRule: vi.fn(), removeApprovalRule: vi.fn(),
       discoverSessions: vi.fn(async () => [{ id: 'codex-1', title: '修复登录流程', updatedAt: 1_786_000_000_000, workspace: 'B:\\chosen\\workspace' }]),
     }
     window.agentManager = api
@@ -81,6 +82,20 @@ describe('App terminal wall', () => {
     expect(api.acceptApprovalSuggestion).toHaveBeenCalledWith('session-1')
     fireEvent.click(within(tile).getByRole('button', { name: '暂不' }))
     expect(api.dismissApprovalSuggestion).toHaveBeenCalledWith('session-1')
+  })
+
+  it('manages exact approval rules from the overview', async () => {
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: '批准规则' }))
+    expect(await screen.findByText('git log --oneline')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('新增批准命令'), { target: { value: 'git show --stat' } })
+    fireEvent.click(screen.getByRole('button', { name: '添加' }))
+    await waitFor(() => expect(api.addApprovalRule).toHaveBeenCalledWith('git show --stat'))
+    fireEvent.click(screen.getByRole('button', { name: '撤销' }))
+    await waitFor(() => expect(api.removeApprovalRule).toHaveBeenCalledWith('git log --oneline'))
+    fireEvent.click(screen.getByRole('button', { name: '完成' }))
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   })
 
   it('chooses the workspace through the system directory picker', async () => {

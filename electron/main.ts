@@ -109,7 +109,7 @@ function trustedRenderer(event: IpcMainInvokeEvent): void {
   }
 }
 
-function registerIpc(): void {
+function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
   ipcMain.handle(IPC_CHANNELS.listSessions, (event) => {
     trustedRenderer(event)
     return controller.listSessions()
@@ -142,6 +142,18 @@ function registerIpc(): void {
   ipcMain.handle(IPC_CHANNELS.dismissApprovalSuggestion, (event, id: unknown) => {
     trustedRenderer(event)
     return controller.dismissApprovalSuggestion(sessionId(id))
+  })
+  ipcMain.handle(IPC_CHANNELS.listApprovalRules, (event) => {
+    trustedRenderer(event)
+    return approvalPolicy.listRules()
+  })
+  ipcMain.handle(IPC_CHANNELS.addApprovalRule, (event, command: unknown) => {
+    trustedRenderer(event)
+    return approvalPolicy.addRule(text(command, 'approval rule', 2_048))
+  })
+  ipcMain.handle(IPC_CHANNELS.removeApprovalRule, (event, command: unknown) => {
+    trustedRenderer(event)
+    return approvalPolicy.removeRule(text(command, 'approval rule', 2_048))
   })
   ipcMain.handle(IPC_CHANNELS.chooseWorkspace, async (event) => {
     trustedRenderer(event)
@@ -189,7 +201,7 @@ void app.whenReady().then(async () => {
   controller = new SessionController(manager, (event) => {
     for (const window of BrowserWindow.getAllWindows()) window.webContents.send(IPC_CHANNELS.event, event)
   }, { discover: discoverNativeSessions }, approvalPolicy)
-  registerIpc()
+  registerIpc(approvalPolicy)
   await controller.restoreLiveHosts()
   createWindow(); createTray()
   app.on('activate', () => {
