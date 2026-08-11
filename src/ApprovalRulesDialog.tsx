@@ -1,5 +1,10 @@
 import { type FormEvent, useEffect, useState } from 'react'
 
+function readableError(reason: unknown): string {
+  const message = reason instanceof Error ? reason.message : String(reason)
+  return message.replace(/^Error invoking remote method '[^']+': Error:\s*/i, '')
+}
+
 export default function ApprovalRulesDialog({ onClose }: { onClose: () => void }): JSX.Element {
   const [rules, setRules] = useState<string[]>([])
   const [command, setCommand] = useState('')
@@ -11,7 +16,7 @@ export default function ApprovalRulesDialog({ onClose }: { onClose: () => void }
   }
 
   useEffect(() => {
-    void reload().catch((reason) => setError(reason instanceof Error ? reason.message : String(reason))).finally(() => setBusy(false))
+    void reload().catch((reason) => setError(readableError(reason))).finally(() => setBusy(false))
   }, [])
 
   const add = async (event: FormEvent): Promise<void> => {
@@ -22,7 +27,7 @@ export default function ApprovalRulesDialog({ onClose }: { onClose: () => void }
       setCommand('')
       await reload()
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
+      setError(readableError(reason))
     }
   }
 
@@ -32,14 +37,14 @@ export default function ApprovalRulesDialog({ onClose }: { onClose: () => void }
       await window.agentManager.removeApprovalRule(rule)
       await reload()
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
+      setError(readableError(reason))
     }
   }
 
   return <div className="modal-backdrop" role="presentation">
     <section className="rules-dialog" role="dialog" aria-modal="true" aria-labelledby="approval-rules-title">
       <header><div><span className="eyebrow">SAFETY</span><h2 id="approval-rules-title">自动批准规则</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="关闭规则设置">×</button></header>
-      <p className="rules-help">仅完整匹配的只读命令会自动批准。写入、删除和复合命令不会加入规则。</p>
+      <p className="rules-help">填写一条实际执行的完整命令。规则只做完整匹配；写入、删除、管道和复合命令不会加入。</p>
       <form className="rule-add" onSubmit={(event) => { void add(event) }}>
         <input aria-label="新增批准命令" required value={command} onChange={(event) => setCommand(event.target.value)} placeholder="例如：git log --oneline" />
         <button type="submit" className="button-primary">添加</button>

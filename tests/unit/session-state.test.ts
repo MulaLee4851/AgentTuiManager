@@ -14,6 +14,20 @@ const baseState = (): SessionState => ({
 })
 
 describe('reduceSession', () => {
+  it('honors a custom recovery-attempt limit', () => {
+    let state = reduceSession(baseState(), { type: 'started' })
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      state = reduceSession(state, { type: 'abnormal-exit', reason: 'capacity', maxAttempts: 5 })
+      expect(state.status).toBe('recovering')
+      state = reduceSession(state, { type: 'started' })
+    }
+    expect(reduceSession(state, {
+      type: 'abnormal-exit',
+      reason: 'capacity',
+      maxAttempts: 5,
+    })).toMatchObject({ status: 'failed', recoveryAttempts: 5 })
+  })
+
   it('moves started sessions to running and approval requests to needs_approval', () => {
     const running = reduceSession(baseState(), { type: 'started' })
     const awaitingApproval = reduceSession(running, {

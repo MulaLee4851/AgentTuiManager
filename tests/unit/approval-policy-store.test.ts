@@ -30,7 +30,7 @@ describe('ApprovalPolicyStore', () => {
     await writeFile(path, '{bad json', 'utf8')
     const store = await ApprovalPolicyStore.load(path)
     expect(store.listRules()).toEqual([])
-    await expect(store.addRule('Remove-Item -Recurse build')).rejects.toThrow(/read-only/i)
+    await expect(store.addRule('Remove-Item -Recurse build')).rejects.toThrow(/不能加入自动批准/)
 
     await writeFile(path, JSON.stringify({ version: 1, rules: ['Remove-Item -Recurse build'] }), 'utf8')
     const handEdited = await ApprovalPolicyStore.load(path)

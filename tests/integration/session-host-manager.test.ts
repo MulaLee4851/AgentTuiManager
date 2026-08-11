@@ -162,11 +162,14 @@ describe('SessionHostManager integration', () => {
     const { manager, runtimeDir, workspace } = await fixture()
     const original = await start(manager, workspace, 'running')
     await nextMatching(original, (event) => event.type === 'output' && event.data.includes('fake-agent>'))
+    original.write('replay-marker\r')
+    await nextMatching(original, (event) => event.type === 'output' && event.data.includes('replay-marker'))
     original.disconnect()
 
     const replacement = new SessionHostManager({ runtimeDir, hostEntry: HOST_ENTRY })
     const reconnected = await replacement.reconnect(original.hostId)
     handles.push(reconnected)
+    await expect(reconnected.replay()).resolves.toContain('replay-marker')
     reconnected.write('reconnected\r')
     await expect(nextMatching(reconnected, (event) => event.type === 'output' && event.data.includes('reconnected'))).resolves.toMatchObject({ type: 'output' })
 

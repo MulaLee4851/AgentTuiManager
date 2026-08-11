@@ -12,7 +12,8 @@ export default defineConfig({
       lib: {
         entry: {
           main: resolve(__dirname, 'electron/main.ts'),
-          'session-host': resolve(__dirname, 'electron/session-host.ts')
+          'session-host': resolve(__dirname, 'electron/session-host.ts'),
+          'claude-permission-hook': resolve(__dirname, 'electron/claude-permission-hook.ts')
         },
         formats: ['cjs'],
         fileName: (_format, entryName) => `${entryName}.js`

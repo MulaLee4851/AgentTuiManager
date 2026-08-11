@@ -4,10 +4,19 @@ import { IPC_CHANNELS, type AgentManagerApi, type ManagerEvent, type StartSessio
 
 const api: AgentManagerApi = {
   listSessions: () => ipcRenderer.invoke(IPC_CHANNELS.listSessions),
+  terminalReplay: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.terminalReplay, sessionId),
+  terminalHistory: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.terminalHistory, sessionId),
+  listAuditEntries: () => ipcRenderer.invoke(IPC_CHANNELS.listAuditEntries),
   startSession: (request: StartSessionRequest) => ipcRenderer.invoke(IPC_CHANNELS.startSession, request),
   write: (sessionId, data) => ipcRenderer.invoke(IPC_CHANNELS.write, sessionId, data),
   resize: (sessionId, cols, rows) => ipcRenderer.invoke(IPC_CHANNELS.resize, sessionId, cols, rows),
   stopSession: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.stopSession, sessionId),
+  restartSession: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.restartSession, sessionId),
+  continueSession: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.continueSession, sessionId),
+  tryRecoveryOnce: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.tryRecoveryOnce, sessionId),
+  acceptRecoverySuggestion: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.acceptRecoverySuggestion, sessionId),
+  dismissRecoverySuggestion: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.dismissRecoverySuggestion, sessionId),
+  removeSession: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.removeSession, sessionId),
   approveSession: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.approveSession, sessionId),
   acceptApprovalSuggestion: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.acceptApprovalSuggestion, sessionId),
   dismissApprovalSuggestion: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.dismissApprovalSuggestion, sessionId),
@@ -16,6 +25,8 @@ const api: AgentManagerApi = {
   removeApprovalRule: (command) => ipcRenderer.invoke(IPC_CHANNELS.removeApprovalRule, command),
   chooseWorkspace: () => ipcRenderer.invoke(IPC_CHANNELS.chooseWorkspace),
   discoverSessions: (agentKind, workspace) => ipcRenderer.invoke(IPC_CHANNELS.discoverSessions, agentKind, workspace),
+  readClipboardText: () => ipcRenderer.invoke(IPC_CHANNELS.readClipboardText),
+  writeClipboardText: (text) => ipcRenderer.invoke(IPC_CHANNELS.writeClipboardText, text),
   subscribe: (listener) => {
     const handler = (_event: Electron.IpcRendererEvent, message: ManagerEvent): void => listener(message)
     ipcRenderer.on(IPC_CHANNELS.event, handler)

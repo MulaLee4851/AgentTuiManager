@@ -17,6 +17,7 @@ export interface HostRecord {
   recovery?: RecoveryRecipe
   cols?: number
   rows?: number
+  maxContinueRetries?: number
   pid: number
   endpoint: string
   lifecycle: 'starting' | 'running'
@@ -31,6 +32,7 @@ export interface StartHostOptions {
   cwd: string
   cols: number
   rows: number
+  maxContinueRetries?: number
   nativeSessionId?: string
   recovery?: RecoveryRecipe
 }
@@ -45,6 +47,8 @@ export interface HostHandle {
   nextEvent(timeoutMs?: number): Promise<HostEvent>
   write(data: string): void
   resize(cols: number, rows: number): void
+  replay(timeoutMs?: number): Promise<string>
+  respondToPermission(requestId: string, action: 'allow' | 'ask'): void
   stop(): Promise<void>
   disconnect(): void
 }
@@ -84,6 +88,7 @@ class PipeHostHandle implements HostHandle {
   private readonly events: HostEvent[] = []
   private readonly waiters: EventWaiter[] = []
   private readonly pongWaiters: EventWaiter[] = []
+  private readonly replayWaiters: EventWaiter[] = []
   private buffer = ''
   private closedError: Error | undefined
   private readonly timeoutMs: number
@@ -111,6 +116,20 @@ class PipeHostHandle implements HostHandle {
 
   resize(cols: number, rows: number): void {
     this.send({ type: 'resize', cols, rows })
+  }
+
+  replay(timeoutMs = 250): Promise<string> {
+    const pending = this.createWaiter(this.replayWaiters, timeoutMs, 'terminal replay')
+    try {
+      this.send({ type: 'replay' })
+    } catch (error) {
+      pending.cancel(error instanceof Error ? error : new Error(String(error)))
+    }
+    return pending.promise.then((event) => event.type === 'replay' ? event.data : '')
+  }
+
+  respondToPermission(requestId: string, action: 'allow' | 'ask'): void {
+    this.send({ type: 'permission-response', requestId, action })
   }
 
   async stop(): Promise<void> {
@@ -185,6 +204,7 @@ class PipeHostHandle implements HostHandle {
       try {
         const event = JSON.parse(line) as HostEvent
         if (event.type === 'pong') this.deliver(this.pongWaiters, event)
+        else if (event.type === 'replay') this.deliver(this.replayWaiters, event)
         else if (!this.deliver(this.waiters, event)) this.events.push(event)
       } catch {
         this.close(new Error(`Host ${this.hostId} sent invalid JSON`))
@@ -203,12 +223,13 @@ class PipeHostHandle implements HostHandle {
   private close(error: Error): void {
     if (this.closedError) return
     this.closedError = error
-    for (const waiter of [...this.waiters, ...this.pongWaiters]) {
+    for (const waiter of [...this.waiters, ...this.pongWaiters, ...this.replayWaiters]) {
       clearTimeout(waiter.timer)
       waiter.reject(error)
     }
     this.waiters.length = 0
     this.pongWaiters.length = 0
+    this.replayWaiters.length = 0
   }
 }
 
@@ -239,6 +260,7 @@ export class SessionHostManager {
       ...(options.recovery ? { recovery: options.recovery } : {}),
       cols: options.cols,
       rows: options.rows,
+      ...(options.maxContinueRetries === undefined ? {} : { maxContinueRetries: options.maxContinueRetries }),
       pid: 0,
       endpoint,
       lifecycle: 'starting',
@@ -276,6 +298,7 @@ export class SessionHostManager {
       handle = await raceChild(this.connect(hostId, endpoint))
       handle.send({
         type: 'start',
+        agentKind: options.agentKind,
         executable: options.executable,
         args: options.args,
         cwd: options.cwd,
@@ -360,6 +383,15 @@ export class SessionHostManager {
       },
       updatedAt: new Date().toISOString(),
     })
+  }
+
+  async removeArtifacts(hostId: string): Promise<void> {
+    await Promise.all([
+      unlink(this.registryPath(hostId)).catch(() => undefined),
+      unlink(this.exitPath(hostId)).catch(() => undefined),
+      unlink(`${this.exitPath(hostId)}.claude-settings.json`).catch(() => undefined),
+      ...(process.platform === 'win32' ? [] : [unlink(join(this.runtimeDir, `${hostId}.sock`)).catch(() => undefined)]),
+    ])
   }
 
   private endpointFor(hostId: string): string {
