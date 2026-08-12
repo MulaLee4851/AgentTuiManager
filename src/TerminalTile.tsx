@@ -5,6 +5,32 @@ import type { SessionSummary } from './shared/manager-api'
 
 const STABLE_TERMINAL_COLS = 100
 const STABLE_TERMINAL_ROWS = 30
+// Bounds mirror the validation in electron/main.ts `dimensions()`, so a fitted size
+// can never be rejected by the main process.
+const MIN_TERMINAL_COLS = 24
+const MAX_TERMINAL_COLS = 500
+const MIN_TERMINAL_ROWS = 8
+const MAX_TERMINAL_ROWS = 200
+const MIN_FONT_SIZE = 8
+const MAX_FONT_SIZE = 18
+// `.xterm-viewport` keeps a thin scrollbar gutter; reserve it so the last column
+// is never clipped and the grid still fills the surface.
+const TERMINAL_SCROLLBAR_WIDTH = 9
+
+function clamp(value: number, low: number, high: number): number {
+  return Math.max(low, Math.min(high, value))
+}
+
+// xterm measures its own cell box after every font change and exposes it only through
+// its internal render service; the official fit addon reads the same field. Guard the
+// access so an xterm upgrade degrades to "keep current size" instead of throwing.
+export function terminalCellSize(terminal: Terminal): { width: number; height: number } | undefined {
+  const dimensions = (terminal as unknown as {
+    _core?: { _renderService?: { dimensions?: { css?: { cell?: { width?: number; height?: number } } } } }
+  })._core?._renderService?.dimensions?.css?.cell
+  if (!dimensions?.width || !dimensions.height) return undefined
+  return { width: dimensions.width, height: dimensions.height }
+}
 
 export function isTerminalProtocolResponse(data: string): boolean {
   return /^(?:\x1b\[\??\d+;\d+R|\x1b\[\??[\d;]*c|\x1b\[>[\d;]*c|\x1b\[\?[\d;]*u)$/.test(data)
@@ -323,18 +349,57 @@ export default function TerminalTile({ session, detail = false, embedded = false
       }
     })
     let resizeFrame = 0
-    const resizeFontOnly = (): void => {
-      if (!host.isConnected || host.clientWidth === 0 || host.clientHeight === 0) return
-      const availableWidth = Math.max(1, host.clientWidth - 20)
-      const availableHeight = Math.max(1, host.clientHeight - 16)
-      const fitByWidth = availableWidth / (STABLE_TERMINAL_COLS * .62)
-      const fitByHeight = availableHeight / (STABLE_TERMINAL_ROWS * 1.25)
-      const fontSize = Math.max(8, Math.min(18, Math.floor(Math.min(fitByWidth, fitByHeight))))
-      if (terminal.options.fontSize !== fontSize) terminal.options.fontSize = fontSize
+    let ptyResizeTimer: ReturnType<typeof setTimeout> | undefined
+    let lastSentCols = STABLE_TERMINAL_COLS
+    let lastSentRows = STABLE_TERMINAL_ROWS
+    const sendPtyResize = (cols: number, rows: number): void => {
+      if (ptyResizeTimer) clearTimeout(ptyResizeTimer)
+      // Agents reflow their whole TUI on SIGWINCH, so only tell the PTY once the
+      // drag has settled instead of on every intermediate frame.
+      ptyResizeTimer = setTimeout(() => {
+        ptyResizeTimer = undefined
+        if (disposed || (cols === lastSentCols && rows === lastSentRows)) return
+        lastSentCols = cols
+        lastSentRows = rows
+        void Promise.resolve(window.agentManager.resize(session.sessionId, cols, rows)).catch(() => undefined)
+      }, 180)
+    }
+    const fitTerminal = (): void => {
+      if (disposed || !host.isConnected || host.clientWidth === 0 || host.clientHeight === 0) return
+      const style = getComputedStyle(host)
+      const paddingX = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0)
+      const paddingY = (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0)
+      const availableWidth = host.clientWidth - paddingX - TERMINAL_SCROLLBAR_WIDTH
+      const availableHeight = host.clientHeight - paddingY
+      if (availableWidth <= 0 || availableHeight <= 0) return
+      // Keep roughly today's text density: pick the font from the width a full-width
+      // agent screen wants, then let the column and row counts take up whatever space
+      // is left. Scaling the font alone pinned the grid at 100x30, so any container
+      // whose aspect ratio or size did not match that box was left with black margins.
+      const fontSize = clamp(Math.floor(availableWidth / (STABLE_TERMINAL_COLS * .62)), MIN_FONT_SIZE, MAX_FONT_SIZE)
+      if (terminal.options.fontSize !== fontSize) {
+        terminal.options.fontSize = fontSize
+        // xterm re-measures its cell box after the font changes, so fit the grid on the
+        // next frame when the new metrics are available rather than with stale ones.
+        scheduleResize()
+        return
+      }
+      const cell = terminalCellSize(terminal)
+      if (!cell) return
+      const cols = clamp(Math.floor(availableWidth / cell.width), MIN_TERMINAL_COLS, MAX_TERMINAL_COLS)
+      const rows = clamp(Math.floor(availableHeight / cell.height), MIN_TERMINAL_ROWS, MAX_TERMINAL_ROWS)
+      if (cols === terminal.cols && rows === terminal.rows) return
+      showResizeCover()
+      resizeRedrawActive = true
+      resizeRedrawDeadline = performance.now() + 600
+      if (resizeCoverFailsafeTimer) clearTimeout(resizeCoverFailsafeTimer)
+      resizeCoverFailsafeTimer = setTimeout(hideResizeCover, 900)
+      terminal.resize(cols, rows)
+      sendPtyResize(cols, rows)
     }
     const scheduleResize = (): void => {
       cancelAnimationFrame(resizeFrame)
-      resizeFrame = requestAnimationFrame(resizeFontOnly)
+      resizeFrame = requestAnimationFrame(fitTerminal)
     }
     scheduleResize()
     const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(scheduleResize)
@@ -345,6 +410,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
       if (inputFrame) cancelAnimationFrame(inputFrame)
       cancelAnimationFrame(resizeFrame)
       cancelAnimationFrame(outputFrame)
+      if (ptyResizeTimer) clearTimeout(ptyResizeTimer)
       if (resizeRedrawTimer) clearTimeout(resizeRedrawTimer)
       if (resizeCoverFailsafeTimer) clearTimeout(resizeCoverFailsafeTimer)
       if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer)
