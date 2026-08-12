@@ -1,0 +1,37 @@
+diff --git a/src/TerminalTile.tsx b/src/TerminalTile.tsx
+--- a/src/TerminalTile.tsx
++++ b/src/TerminalTile.tsx
+@@ -37,9 +37,12 @@ export default function TerminalTile({ session, detail = false, hidden = false,
+       if ('sessionId' in event && event.sessionId === session.sessionId && event.type === 'output') terminal.write(event.data)
+     })
+     const resize = (): void => {
+       const cols = Math.max(20, Math.min(500, Math.floor((host.clientWidth || 640) / 8.2)))
+       const rows = Math.max(5, Math.min(200, Math.floor((host.clientHeight || 260) / 18)))
++      if (terminal.cols === cols && terminal.rows === rows) return
++      terminal.resize(cols, rows)
+       void window.agentManager.resize(session.sessionId, cols, rows)
+     }
+-    resize()
++    const frame = requestAnimationFrame(resize)
+     const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(resize)
+     observer?.observe(host)
+-    return () => { observer?.disconnect(); unsubscribe(); input.dispose(); terminal.dispose() }
++    return () => { cancelAnimationFrame(frame); observer?.disconnect(); unsubscribe(); input.dispose(); terminal.dispose() }
+   }, [session.sessionId, terminalEnded])
+diff --git a/tests/unit/approval-policy.test.ts b/tests/unit/approval-policy.test.ts
+--- a/tests/unit/approval-policy.test.ts
++++ b/tests/unit/approval-policy.test.ts
+@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest'
+ import { ApprovalPolicyEngine, classifyApprovalRisk } from '../../electron/approval-policy'
+ 
+ describe('ApprovalPolicyEngine', () => {
+-  it.each(['pwd', 'Get-Location', 'Get-Content -LiteralPath package.json', 'Get-ChildItem -Force', 'git status --short', 'rg -n TODO src'])('auto-approves a bounded built-in read command: %s', (command) => {
++  it.each(['tool:Read', 'tool:Glob', 'tool:Grep', 'pwd', 'Get-Location', 'Get-Content -LiteralPath package.json', 'Get-ChildItem -Force', 'git status --short', 'rg -n TODO src'])('auto-approves a bounded built-in read command: %s', (command) => {
+@@ -16,6 +16,9 @@ describe('ApprovalPolicyEngine', () => {
+     ['Get-Content a.txt | Set-Content b.txt', 'write'],
+     ['rg TODO . --pre dangerous.exe', 'unknown'],
+     ['Get-Content a.txt; Remove-Item a.txt', 'delete'],
++    ['tool:Edit', 'write'],
++    ['tool:Write', 'write'],
++    ['tool:Task', 'unknown'],
+   ] as const)('never auto-approves %s', (command, risk) => {

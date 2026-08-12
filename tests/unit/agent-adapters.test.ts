@@ -8,7 +8,7 @@ describe('native agent adapters', () => {
     expect(adapter.observeOutput('loading session...').ready).toBe(false)
     expect(adapter.observeOutput('\x1b[2JOpenAI Codex\r\n\r\n›\r\n').ready).toBe(true)
     expect(adapter.recoveryRecipe('codex.cmd', 'native-1')).toEqual({
-      executable: 'codex.cmd', args: ['resume', 'native-1'],
+      executable: 'codex.cmd', args: ['--no-alt-screen', 'resume', 'native-1'],
     })
   })
 

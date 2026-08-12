@@ -5,12 +5,13 @@ import net, { type Socket } from 'node:net'
 import { join } from 'node:path'
 
 import type { HostCommand, HostEvent, HostExitFact } from '../src/shared/protocol'
-import type { AgentKind, RecoveryRecipe } from '../src/shared/manager-api'
+import type { AgentConfigSummary, AgentKind, AgentProxySummary, RecoveryRecipe } from '../src/shared/manager-api'
 
 const DEFAULT_TIMEOUT_MS = 5_000
 
 export interface HostRecord {
   hostId: string
+  displayName?: string
   agentKind?: AgentKind
   cwd: string
   nativeSessionId?: string
@@ -18,6 +19,9 @@ export interface HostRecord {
   cols?: number
   rows?: number
   maxContinueRetries?: number
+  agentConfig?: AgentConfigSummary
+  agentProxy?: AgentProxySummary
+  fullAutoEnabled?: boolean
   pid: number
   endpoint: string
   lifecycle: 'starting' | 'running'
@@ -26,6 +30,7 @@ export interface HostRecord {
 }
 
 export interface StartHostOptions {
+  displayName?: string
   agentKind: AgentKind
   executable: string
   args: string[]
@@ -33,13 +38,20 @@ export interface StartHostOptions {
   cols: number
   rows: number
   maxContinueRetries?: number
+  agentConfig?: AgentConfigSummary
+  agentProxy?: AgentProxySummary
+  fullAutoEnabled?: boolean
   nativeSessionId?: string
   recovery?: RecoveryRecipe
 }
 
 export interface HostMetadataUpdate {
-  nativeSessionId: string
-  recovery: RecoveryRecipe
+  displayName?: string
+  nativeSessionId?: string
+  recovery?: RecoveryRecipe
+  agentConfig?: AgentConfigSummary | null
+  agentProxy?: AgentProxySummary | null
+  fullAutoEnabled?: boolean
 }
 
 export interface HostHandle {
@@ -48,7 +60,7 @@ export interface HostHandle {
   write(data: string): void
   resize(cols: number, rows: number): void
   replay(timeoutMs?: number): Promise<string>
-  respondToPermission(requestId: string, action: 'allow' | 'ask'): void
+  respondToPermission(requestId: string, action: 'allow' | 'ask' | 'deny'): void
   stop(): Promise<void>
   disconnect(): void
 }
@@ -58,6 +70,8 @@ export interface SessionHostManagerOptions {
   hostEntry: string
   nodeExecutable?: string
   timeoutMs?: number
+  resolveAgentConfig?: (profileId: string, agentKind: AgentKind, args: string[]) => Promise<{ environment: Record<string, string>; args: string[] }>
+  resolveAgentProxy?: (proxyId: string) => Promise<Record<string, string>>
 }
 
 interface EventWaiter {
@@ -128,7 +142,7 @@ class PipeHostHandle implements HostHandle {
     return pending.promise.then((event) => event.type === 'replay' ? event.data : '')
   }
 
-  respondToPermission(requestId: string, action: 'allow' | 'ask'): void {
+  respondToPermission(requestId: string, action: 'allow' | 'ask' | 'deny'): void {
     this.send({ type: 'permission-response', requestId, action })
   }
 
@@ -238,12 +252,16 @@ export class SessionHostManager {
   private readonly hostEntry: string
   private readonly nodeExecutable: string
   private readonly timeoutMs: number
+  private readonly resolveAgentConfig?: SessionHostManagerOptions['resolveAgentConfig']
+  private readonly resolveAgentProxy?: SessionHostManagerOptions['resolveAgentProxy']
 
   constructor(options: SessionHostManagerOptions) {
     this.runtimeDir = options.runtimeDir
     this.hostEntry = options.hostEntry
     this.nodeExecutable = options.nodeExecutable ?? process.execPath
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+    this.resolveAgentConfig = options.resolveAgentConfig
+    this.resolveAgentProxy = options.resolveAgentProxy
   }
 
   async start(options: StartHostOptions): Promise<HostHandle> {
@@ -254,6 +272,7 @@ export class SessionHostManager {
     const createdAt = new Date().toISOString()
     const pendingRecord: HostRecord = {
       hostId,
+      ...(options.displayName ? { displayName: options.displayName } : {}),
       agentKind: options.agentKind,
       cwd: options.cwd,
       ...(options.nativeSessionId ? { nativeSessionId: options.nativeSessionId } : {}),
@@ -261,6 +280,9 @@ export class SessionHostManager {
       cols: options.cols,
       rows: options.rows,
       ...(options.maxContinueRetries === undefined ? {} : { maxContinueRetries: options.maxContinueRetries }),
+      ...(options.agentConfig?.enabled ? { agentConfig: { ...options.agentConfig, extraArgs: [...options.agentConfig.extraArgs] } } : {}),
+      ...(options.agentProxy?.enabled ? { agentProxy: { ...options.agentProxy } } : {}),
+      ...(options.fullAutoEnabled ? { fullAutoEnabled: true } : {}),
       pid: 0,
       endpoint,
       lifecycle: 'starting',
@@ -296,14 +318,23 @@ export class SessionHostManager {
       await this.writeRecord({ ...pendingRecord, pid: child.pid, updatedAt: new Date().toISOString() })
       child.unref()
       handle = await raceChild(this.connect(hostId, endpoint))
+      const configured = options.agentConfig?.enabled && options.agentConfig.profileId
+        ? await this.resolveAgentConfig?.(options.agentConfig.profileId, options.agentKind, options.args)
+        : undefined
+      if (options.agentConfig?.enabled && options.agentConfig.profileId && !configured) throw new Error('独立配置不可用，未启动 Agent')
+      const proxyEnvironment = options.agentProxy?.enabled && options.agentProxy.proxyId
+        ? await this.resolveAgentProxy?.(options.agentProxy.proxyId)
+        : undefined
+      if (options.agentProxy?.enabled && options.agentProxy.proxyId && !proxyEnvironment) throw new Error('代理配置不可用，未启动 Agent')
       handle.send({
         type: 'start',
         agentKind: options.agentKind,
         executable: options.executable,
-        args: options.args,
+        args: configured?.args ?? options.args,
         cwd: options.cwd,
         cols: options.cols,
         rows: options.rows,
+        ...((configured || proxyEnvironment) ? { environment: { ...configured?.environment, ...proxyEnvironment } } : {}),
       })
       const event = await raceChild(handle.nextEvent(this.timeoutMs))
       if (event.type !== 'ready') {
@@ -373,16 +404,23 @@ export class SessionHostManager {
 
   async updateMetadata(hostId: string, update: HostMetadataUpdate): Promise<void> {
     const record = await this.readRecord(hostId)
-    await this.writeRecord({
+    const updated: HostRecord = {
       ...record,
-      nativeSessionId: update.nativeSessionId,
-      recovery: {
+      ...(update.displayName === undefined ? {} : { displayName: update.displayName }),
+      ...(update.nativeSessionId === undefined ? {} : { nativeSessionId: update.nativeSessionId }),
+      ...(update.recovery === undefined ? {} : { recovery: {
         executable: update.recovery.executable,
         args: [...update.recovery.args],
         ...(update.recovery.continueInput === undefined ? {} : { continueInput: update.recovery.continueInput }),
-      },
+      } }),
+      ...(update.agentConfig === undefined || update.agentConfig === null ? {} : { agentConfig: { ...update.agentConfig, extraArgs: [...update.agentConfig.extraArgs] } }),
+      ...(update.agentProxy === undefined || update.agentProxy === null ? {} : { agentProxy: { ...update.agentProxy } }),
+      ...(update.fullAutoEnabled === undefined ? {} : { fullAutoEnabled: update.fullAutoEnabled }),
       updatedAt: new Date().toISOString(),
-    })
+    }
+    if (update.agentConfig === null) delete updated.agentConfig
+    if (update.agentProxy === null) delete updated.agentProxy
+    await this.writeRecord(updated)
   }
 
   async removeArtifacts(hostId: string): Promise<void> {

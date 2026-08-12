@@ -4,6 +4,7 @@ import net from 'node:net'
 interface HookInput {
   tool_name?: unknown
   tool_input?: unknown
+  tool_use_id?: unknown
 }
 
 type ApprovalRisk = 'read' | 'write' | 'delete' | 'unknown'
@@ -14,6 +15,7 @@ interface PermissionDetails {
   filePath?: string
   targetPaths?: string[]
   toolInputSummary?: string
+  reason?: string
 }
 
 function readInput(): Promise<string> {
@@ -59,12 +61,16 @@ function permissionDetails(input: HookInput): PermissionDetails {
         ? 'write'
         : 'unknown'
   const summary = command ?? filePath ?? (targetPaths?.length ? targetPaths.join(', ') : undefined)
+    ?? (() => {
+      try { return details ? JSON.stringify(details).slice(0, 2_048) : undefined } catch { return undefined }
+    })()
   return {
     ...(command ? { command } : {}),
     operation,
     ...(filePath ? { filePath } : {}),
     ...(targetPaths?.length ? { targetPaths } : {}),
     ...(summary ? { toolInputSummary: summary.slice(0, 2_048) } : {}),
+    ...(boundedText(details?.description ?? details?.reason, 2_048) ? { reason: boundedText(details?.description ?? details?.reason, 2_048) } : {}),
   }
 }
 
@@ -78,18 +84,18 @@ async function main(): Promise<void> {
 
   const requestId = randomUUID()
   const details = permissionDetails(input)
-  const response = await new Promise<'allow' | 'ask'>((resolve) => {
+  const response = await new Promise<'allow' | 'ask' | 'deny'>((resolve) => {
     const socket = net.createConnection(endpoint)
     let buffer = ''
     let settled = false
-    const finish = (action: 'allow' | 'ask'): void => {
+    const finish = (action: 'allow' | 'ask' | 'deny'): void => {
       if (settled) return
       settled = true
       clearTimeout(timer)
       socket.destroy()
       resolve(action)
     }
-    const timer = setTimeout(() => finish('ask'), 8_000)
+    const timer = setTimeout(() => finish('ask'), 30 * 60_000)
     socket.setEncoding('utf8')
     socket.once('connect', () => socket.write(`${JSON.stringify({
       type: 'permission-hook', token, requestId, toolName: input.tool_name,
@@ -101,7 +107,7 @@ async function main(): Promise<void> {
       if (newline < 0) return
       try {
         const event = JSON.parse(buffer.slice(0, newline)) as { type?: string; action?: string }
-        finish(event.type === 'permission-response' && event.action === 'allow' ? 'allow' : 'ask')
+        finish(event.type === 'permission-response' && (event.action === 'allow' || event.action === 'deny') ? event.action : 'ask')
       } catch { finish('ask') }
     })
     socket.once('error', () => finish('ask'))
@@ -110,6 +116,10 @@ async function main(): Promise<void> {
   if (response === 'allow') {
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } },
+    }))
+  } else if (response === 'deny') {
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny', message: 'Denied by the user in Agent TUI Manager' } },
     }))
   }
 }

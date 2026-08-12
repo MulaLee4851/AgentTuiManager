@@ -1,0 +1,172 @@
+diff --git a/electron/agent-adapters.ts b/electron/agent-adapters.ts
+--- a/electron/agent-adapters.ts
++++ b/electron/agent-adapters.ts
+@@ -10,7 +10,7 @@ export interface AgentAdapter {
+   readonly kind: AgentKind
+   readonly supportsNativeSessions: boolean
+   observeOutput(data: string): AgentObservation
+-  acknowledgeUserInput(): void
++  acknowledgeUserInput(handledApproval?: boolean): void
+   resetForRecovery(): void
+@@ -29,25 +29,33 @@ abstract class EvidenceAdapter implements AgentAdapter {
+   abstract readonly kind: AgentKind
+   abstract readonly supportsNativeSessions: boolean
+   private evidence = ''
+-  private suppressHandledApproval = false
++  private handledApprovalSubject: string | undefined
++  private lastApprovalSubject: string | undefined
+ 
+   observeOutput(data: string): AgentObservation {
+     this.evidence = `${this.evidence}${terminalText(data)}`.slice(-MAX_EVIDENCE_CHARACTERS)
+     const observation = this.classify(this.evidence)
+-    if (this.suppressHandledApproval && observation.approvalRequired) {
++    const subject = observation.approvalCommand ?? (observation.approvalRequired ? 'approval:unknown' : undefined)
++    if (this.handledApprovalSubject && observation.approvalRequired && subject === this.handledApprovalSubject) {
+       return { ready: false, approvalRequired: false }
+     }
+-    if (!observation.approvalRequired) this.suppressHandledApproval = false
++    if (!observation.approvalRequired || (subject && subject !== this.handledApprovalSubject)) {
++      this.handledApprovalSubject = undefined
++    }
++    this.lastApprovalSubject = subject
+     return observation
+   }
+ 
+-  acknowledgeUserInput(): void {
++  acknowledgeUserInput(handledApproval = false): void {
+     // Old approval text remains in a full-screen terminal's scrollback. Clear it so
+-    // it cannot re-trigger after the user has answered the prompt.
++    // only the exact prompt just answered is ignored if the TUI redraws it.
++    this.handledApprovalSubject = handledApproval
++      ? this.lastApprovalSubject ?? 'approval:unknown'
++      : undefined
+     this.evidence = ''
+-    this.suppressHandledApproval = true
++    this.lastApprovalSubject = undefined
+   }
+ 
+   resetForRecovery(): void {
+     this.evidence = ''
+-    this.suppressHandledApproval = false
++    this.handledApprovalSubject = undefined
++    this.lastApprovalSubject = undefined
+   }
+@@ -78,9 +86,19 @@ function hasApprovalInteraction(evidence: string): boolean {
+ export function extractApprovalCommand(evidence: string): string | undefined {
+   const shellLines = [...evidence.matchAll(/(?:^|\n)\s*\$\s+([^\n]+)/g)]
+   const shellCommand = shellLines.at(-1)?.[1]?.trim()
+   if (shellCommand) return shellCommand
+-  return /(?:^|\n)\s*Bash command\s*\n\s*([^\n]+)/i.exec(evidence)?.[1]?.trim() || undefined
++  const bashCommand = /(?:^|\n)\s*Bash command\s*\n\s*([^\n]+)/i.exec(evidence)?.[1]?.trim()
++  if (bashCommand) return bashCommand
++
++  const labeledTools = [...evidence.matchAll(/(?:^|\n)\s*(?:tool(?: use)?|工具)\s*[:：]\s*([A-Za-z][\w-]*)/gi)]
++  const labeledTool = labeledTools.at(-1)?.[1]
++  if (labeledTool) return `tool:${labeledTool}`
++
++  const toolHeadings = [...evidence.matchAll(/(?:^|\n)\s*(Read|Glob|Grep|WebFetch|WebSearch|Edit|Write|NotebookEdit|TodoWrite|Bash|Task)\b(?:[^\n]*)/gi)]
++  const tool = toolHeadings.at(-1)?.[1]
++  return tool ? `tool:${tool}` : undefined
+ }
+diff --git a/electron/session-controller.ts b/electron/session-controller.ts
+--- a/electron/session-controller.ts
++++ b/electron/session-controller.ts
+@@ -166,16 +166,15 @@ export class SessionController {
+   write(sessionId: string, data: string): void {
+     const managed = this.required(sessionId)
+     if (isTerminalStatus(managed.summary.status)) throw new Error('Agent 已结束，请先重新启动')
+     if (data === '\x03' || data === '\x1b') managed.pendingUserInterrupt = true
+     else if (data.length > 0) {
+       managed.pendingUserInterrupt = false
+-      managed.adapter.acknowledgeUserInput()
+       if (managed.summary.status === 'needs_approval' && /[\r\n]/.test(data)) {
+-        managed.summary = reduceSession(managed.summary, { type: 'started' }) as SessionSummary
+-        this.changed(sessionId)
+-      }
++        managed.adapter.acknowledgeUserInput(true)
++        this.completeManualApproval(managed)
++      } else if (managed.summary.status !== 'needs_approval') managed.adapter.acknowledgeUserInput()
+     }
+     managed.handle.write(data)
+@@ -187,18 +186,9 @@ export class SessionController {
+     const managed = this.required(sessionId)
+     if (managed.summary.status !== 'needs_approval') throw new Error('Session is not awaiting approval')
+     const command = managed.pendingApprovalCommand
+-    managed.adapter.acknowledgeUserInput()
++    managed.adapter.acknowledgeUserInput(true)
+     managed.handle.write(managed.adapter.approvalInput())
+-    const running = reduceSession(managed.summary, { type: 'started' }) as SessionSummary
+-    const suggestion = this.approvalPolicy?.noteManualApproval(command)
+-    const { pendingApprovalCommand: _pending, ...withoutPending } = running
+-    managed.summary = {
+-      ...withoutPending,
+-      ...(suggestion ? { approvalSuggestion: suggestion } : {}),
+-    }
+-    delete managed.pendingApprovalCommand
+-    this.changed(sessionId)
++    this.completeManualApproval(managed, command)
+   }
+@@ -329,7 +319,7 @@ export class SessionController {
+           const approvalCommand = observation.approvalCommand ?? extractApprovalCommand(event.data)
+           const decision = this.approvalPolicy?.decide(approvalCommand)
+           if (decision?.action === 'auto-approve') {
+-            managed.adapter.acknowledgeUserInput()
++            managed.adapter.acknowledgeUserInput(true)
+             managed.handle.write(managed.adapter.approvalInput())
+@@ -527,6 +517,18 @@ export class SessionController {
+     if (!managed) throw new Error('Unknown session')
+     return managed
+   }
++
++  private completeManualApproval(managed: ManagedSession, command = managed.pendingApprovalCommand): void {
++    const running = reduceSession(managed.summary, { type: 'started' }) as SessionSummary
++    const suggestion = this.approvalPolicy?.noteManualApproval(command)
++    const { pendingApprovalCommand: _pending, ...withoutPending } = running
++    managed.summary = {
++      ...withoutPending,
++      ...(suggestion ? { approvalSuggestion: suggestion } : {}),
++    }
++    delete managed.pendingApprovalCommand
++    this.changed(managed.summary.sessionId)
++  }
+ 
+   private changed(sessionId: string): void {
+diff --git a/electron/approval-policy.ts b/electron/approval-policy.ts
+--- a/electron/approval-policy.ts
++++ b/electron/approval-policy.ts
+@@ -17,6 +17,7 @@ const LEARNING_THRESHOLD = 3
+ const MAX_COMMAND_LENGTH = 2_048
+ 
+ const BUILT_IN_RULES: Array<{ name: string; pattern: RegExp }> = [
++  { name: 'read-only-tool', pattern: /^tool:(?:Read|Glob|Grep|WebFetch|WebSearch)$/i },
+   { name: 'working-directory', pattern: /^(?:pwd|Get-Location)$/i },
+@@ -36,6 +37,8 @@ function normalizedCommand(command: string): string | undefined {
+ }
+ 
+ function riskOf(command: string): ApprovalRisk {
++  if (/^tool:(?:Edit|Write|NotebookEdit|TodoWrite)$/i.test(command)) return 'write'
++  if (/^tool:/i.test(command) && !/^tool:(?:Read|Glob|Grep|WebFetch|WebSearch)$/i.test(command)) return 'unknown'
+   if (/(?:^|\s)(?:rm|rmdir|del|erase|Remove-Item|Clear-Content|format)(?:\s|$)/i.test(command)
+@@ -49,6 +52,7 @@ function riskOf(command: string): ApprovalRisk {
+ }
+ function isUserRuleAllowed(command: string): boolean {
+   const risk = riskOf(command)
++  if (/^tool:/i.test(command)) return risk === 'read'
+   if (risk === 'write' || risk === 'delete') return false
+diff --git a/electron/main.ts b/electron/main.ts
+--- a/electron/main.ts
++++ b/electron/main.ts
+@@ -269,12 +269,14 @@ void app.whenReady().then(async () => {
+   auditStore = await ActivityAuditStore.load(join(app.getPath('userData'), 'activity-audit.json'))
+   const auditedApprovalPolicy = {
+     decide(command: string | undefined) {
+-      recordAudit({ level: 'warning', category: 'approval', action: 'approval_detected', message: '检测到 Agent 授权请求' })
++      const subject = command?.startsWith('tool:') ? command.slice('tool:'.length) : command ? 'Shell' : '未识别'
++      recordAudit({ level: 'warning', category: 'approval', action: 'approval_detected', message: `检测到 ${subject} 授权请求`, details: { subject } })
+       const decision = approvalPolicy.decide(command)
+       recordAudit(decision.action === 'auto-approve'
+-        ? { level: 'info', category: 'approval', action: 'approval_auto', message: '授权请求已按安全规则自动批准', details: { risk: decision.risk, rule: decision.matchedRule ?? 'built-in' } }
+-        : { level: 'warning', category: 'approval', action: 'approval_waiting', message: '授权请求正在等待人工处理', details: { risk: decision.risk } })
++        ? { level: 'info', category: 'approval', action: 'approval_auto', message: `${subject} 已按安全规则自动批准`, details: { subject, risk: decision.risk, rule: decision.matchedRule ?? 'built-in' } }
++        : { level: 'warning', category: 'approval', action: 'approval_waiting', message: `${subject} 正在等待人工处理`, details: { subject, risk: decision.risk } })
+       return decision

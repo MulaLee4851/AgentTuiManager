@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { SessionHostManager, type HostHandle } from '../../electron/session-host-manager'
 import type { HostEvent } from '../../src/shared/protocol'
@@ -136,6 +136,7 @@ describe('SessionHostManager integration', () => {
   it('persists manager-only recovery metadata without changing the host protocol', async () => {
     const { manager, runtimeDir, workspace } = await fixture()
     const handle = await manager.start({
+      displayName: 'Original Agent',
       agentKind: 'claude',
       executable: process.execPath,
       args: [FAKE_AGENT, '--mode', 'running'],
@@ -150,12 +151,84 @@ describe('SessionHostManager integration', () => {
 
     const record = JSON.parse(await readFile(join(runtimeDir, `host-${handle.hostId}.json`), 'utf8'))
     expect(record).toMatchObject({
+      displayName: 'Original Agent',
       agentKind: 'claude',
       cols: 91,
       rows: 27,
       nativeSessionId: 'claude-native',
       recovery: { executable: 'claude', args: ['--resume', 'claude-native'] },
     })
+
+    await manager.updateMetadata(handle.hostId, {
+      displayName: 'Renamed Agent',
+      agentConfig: {
+        enabled: true,
+        source: 'custom',
+        profileId: 'profile-1',
+        model: 'model-x',
+        extraArgs: [],
+        hasApiKey: true,
+      },
+    })
+    const updated = JSON.parse(await readFile(join(runtimeDir, `host-${handle.hostId}.json`), 'utf8'))
+    expect(updated).toMatchObject({
+      displayName: 'Renamed Agent',
+      nativeSessionId: 'claude-native',
+      recovery: { executable: 'claude', args: ['--resume', 'claude-native'] },
+      agentConfig: { profileId: 'profile-1', hasApiKey: true },
+    })
+  })
+
+  it('resolves one encrypted profile into only the target Host start command', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'agent-tui-host-config-'))
+    tempRoots.push(root)
+    const runtimeDir = join(root, 'runtime')
+    const workspace = join(root, 'workspace')
+    await mkdir(workspace, { recursive: true })
+    const resolveAgentConfig = vi.fn(async (_profileId: string, _agentKind: 'generic' | 'codex' | 'claude' | 'pi', args: string[]) => ({
+      environment: { MANAGER_PRIVATE_TOKEN: 'target-only-secret' },
+      args: [...args, '--print-env', 'MANAGER_PRIVATE_TOKEN'],
+    }))
+    const manager = new SessionHostManager({ runtimeDir, hostEntry: HOST_ENTRY, resolveAgentConfig })
+    const handle = await manager.start({
+      agentKind: 'generic',
+      executable: process.execPath,
+      args: [FAKE_AGENT, '--mode', 'running'],
+      cwd: workspace,
+      cols: 80,
+      rows: 24,
+      agentConfig: { enabled: true, source: 'custom', profileId: 'profile-1', extraArgs: [], hasApiKey: true },
+    })
+    handles.push(handle)
+    startedHosts.push({ manager, hostId: handle.hostId, runtimeDir })
+    await expect.poll(() => handle.replay(), { timeout: 5_000 }).toContain('env:target-only-secret')
+    expect(resolveAgentConfig).toHaveBeenCalledWith('profile-1', 'generic', [FAKE_AGENT, '--mode', 'running'])
+    const storedRecord = await readFile(join(runtimeDir, `host-${handle.hostId}.json`), 'utf8')
+    expect(storedRecord).not.toContain('target-only-secret')
+    expect(storedRecord).toContain('profile-1')
+  })
+
+  it('injects an HTTP proxy only into the target Host and never persists credentials', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'agent-tui-host-proxy-'))
+    tempRoots.push(root)
+    const runtimeDir = join(root, 'runtime')
+    const workspace = join(root, 'workspace')
+    await mkdir(workspace, { recursive: true })
+    const resolveAgentProxy = vi.fn(async () => ({ HTTP_PROXY: 'http://user:private-password@127.0.0.1:7897' }))
+    const manager = new SessionHostManager({ runtimeDir, hostEntry: HOST_ENTRY, resolveAgentProxy })
+    const handle = await manager.start({
+      agentKind: 'generic', executable: process.execPath,
+      args: [FAKE_AGENT, '--mode', 'running', '--print-env', 'HTTP_PROXY'],
+      cwd: workspace, cols: 80, rows: 24,
+      agentProxy: { enabled: true, proxyId: 'proxy-1', protocol: 'http', host: '127.0.0.1', port: 7897, hasPassword: true },
+    })
+    handles.push(handle)
+    startedHosts.push({ manager, hostId: handle.hostId, runtimeDir })
+    await expect.poll(() => handle.replay(), { timeout: 5_000 }).toContain('env:http://user:private-password@127.0.0.1:7897')
+    expect(resolveAgentProxy).toHaveBeenCalledWith('proxy-1')
+    const storedRecord = await readFile(join(runtimeDir, `host-${handle.hostId}.json`), 'utf8')
+    expect(storedRecord).not.toContain('private-password')
+    expect(storedRecord).toContain('proxy-1')
   })
 
   it('reconnects live hosts and deletes only stale registry data', async () => {

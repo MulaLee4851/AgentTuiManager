@@ -3,6 +3,13 @@ import { describe, expect, it } from 'vitest'
 import { TerminalReplayBuffer } from '../../electron/terminal-replay-buffer'
 
 describe('TerminalReplayBuffer', () => {
+  it('bounds the default replay retained for each xterm renderer', () => {
+    const replay = new TerminalReplayBuffer()
+    replay.append('x'.repeat(600 * 1024))
+
+    expect(replay.length).toBe(512 * 1024)
+  })
+
   it('keeps bounded output across many small appends', () => {
     const replay = new TerminalReplayBuffer(8)
     replay.append('abcd')

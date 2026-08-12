@@ -2,7 +2,97 @@ import type { HostEvent } from './protocol'
 import type { SessionState } from './session-state'
 
 export type AgentKind = 'generic' | 'codex' | 'claude' | 'pi'
+export type AgentConfigSource = 'local' | 'custom' | 'ccswitch'
+
+export interface AgentConfigInput {
+  enabled: boolean
+  source: AgentConfigSource
+  baseUrl?: string
+  apiKey?: string
+  clearApiKey?: boolean
+  model?: string
+  extraArgs?: string[]
+  providerId?: string
+  providerName?: string
+}
+
+export interface AgentConfigSummary {
+  enabled: boolean
+  source: AgentConfigSource
+  profileId?: string
+  baseUrl?: string
+  model?: string
+  extraArgs: string[]
+  hasApiKey: boolean
+  providerId?: string
+  providerName?: string
+}
+
+export interface AgentProxyInput {
+  enabled: boolean
+  protocol?: 'http'
+  host: string
+  port: number
+  username?: string
+  password?: string
+  clearPassword?: boolean
+}
+
+export interface AgentProxySummary {
+  enabled: true
+  proxyId: string
+  protocol: 'http'
+  host: string
+  port: number
+  username?: string
+  hasPassword: boolean
+}
+
+export interface ContinueKeywordSettings {
+  enabled: boolean
+  quietSeconds: number
+  keywords: string[]
+}
+
+export interface CCSwitchProviderSummary {
+  id: string
+  name: string
+  agentKind: 'codex' | 'claude'
+  baseUrl?: string
+  model?: string
+  isCurrent: boolean
+  hasApiKey: boolean
+  issue?: string
+}
 export type ApprovalRisk = 'read' | 'write' | 'delete' | 'unknown'
+export type ApprovalSource = 'terminal' | 'claude-hook'
+
+export interface ApprovalRequest {
+  requestId: string
+  sessionId: string
+  displayName: string
+  agentKind: AgentKind
+  workspace: string
+  nativeSessionId?: string
+  source: ApprovalSource
+  risk: ApprovalRisk
+  toolName?: string
+  command?: string
+  inputSummary?: string
+  reason: string
+  agentReason?: string
+  filePath?: string
+  targetPaths?: string[]
+  createdAt: number
+  canBulkApprove: boolean
+}
+
+export interface BulkApprovalResult {
+  approved: number
+  skipped: number
+  failed: number
+  skippedRequestIds: string[]
+}
 
 export interface NativeSessionSummary {
   id: string
@@ -29,6 +119,8 @@ export interface StartSessionRequest {
   maxContinueRetries?: number
   nativeSessionId?: string
   recovery?: RecoveryRecipe
+  agentConfig?: AgentConfigInput | AgentConfigSummary
+  agentProxy?: AgentProxyInput | AgentProxySummary
 }
 
 export interface ApprovalRuleSuggestion {
@@ -47,10 +139,14 @@ export interface SessionSummary extends SessionState {
   approvalFilePath?: string
   approvalTargetPaths?: string[]
   approvalInputSummary?: string
+  pendingApprovalCount?: number
   approvalSuggestion?: ApprovalRuleSuggestion
   recoveryAction?: 'continue' | 'resume'
   recoveryAttempted?: boolean
   recoveryRuleApplied?: boolean
+  agentConfig?: AgentConfigSummary
+  agentProxy?: AgentProxySummary
+  fullAutoEnabled?: boolean
 }
 
 export type AuditLevel = 'info' | 'warning' | 'error'
@@ -72,19 +168,6 @@ export interface TerminalReplaySnapshot {
   sequence: number
 }
 
-export type TerminalHistoryRole = 'user' | 'agent' | 'tool' | 'tool_result' | 'error' | 'system'
-
-export interface TerminalHistoryEntry {
-  role: TerminalHistoryRole
-  text: string
-  title?: string
-}
-
-export interface TerminalHistorySnapshot {
-  entries: TerminalHistoryEntry[]
-  truncated: boolean
-}
-
 export type ManagerEvent =
   | ({ sessionId: string; sequence?: number } & HostEvent)
   | { type: 'sessions-changed'; sessionId: string }
@@ -93,7 +176,6 @@ export type ManagerEvent =
 export const IPC_CHANNELS = {
   listSessions: 'agent-manager:list-sessions',
   terminalReplay: 'agent-manager:terminal-replay',
-  terminalHistory: 'agent-manager:terminal-history',
   listAuditEntries: 'agent-manager:list-audit-entries',
   startSession: 'agent-manager:start-session',
   write: 'agent-manager:write',
@@ -105,7 +187,19 @@ export const IPC_CHANNELS = {
   acceptRecoverySuggestion: 'agent-manager:accept-recovery-suggestion',
   dismissRecoverySuggestion: 'agent-manager:dismiss-recovery-suggestion',
   removeSession: 'agent-manager:remove-session',
+  renameSession: 'agent-manager:rename-session',
+  updateSessionConfig: 'agent-manager:update-session-config',
+  updateSessionProxy: 'agent-manager:update-session-proxy',
+  setFullAutoMode: 'agent-manager:set-full-auto-mode',
+  listCCSwitchProviders: 'agent-manager:list-ccswitch-providers',
+  getContinueKeywordSettings: 'agent-manager:get-continue-keyword-settings',
+  updateContinueKeywordSettings: 'agent-manager:update-continue-keyword-settings',
   approveSession: 'agent-manager:approve-session',
+  listPendingApprovals: 'agent-manager:list-pending-approvals',
+  approveRequest: 'agent-manager:approve-request',
+  approveAndRememberRequest: 'agent-manager:approve-and-remember-request',
+  rejectRequest: 'agent-manager:reject-request',
+  approveAllPending: 'agent-manager:approve-all-pending',
   acceptApprovalSuggestion: 'agent-manager:accept-approval-suggestion',
   dismissApprovalSuggestion: 'agent-manager:dismiss-approval-suggestion',
   listApprovalRules: 'agent-manager:list-approval-rules',
@@ -121,7 +215,6 @@ export const IPC_CHANNELS = {
 export interface AgentManagerApi {
   listSessions(): Promise<SessionSummary[]>
   terminalReplay(sessionId: string): Promise<TerminalReplaySnapshot>
-  terminalHistory(sessionId: string): Promise<TerminalHistorySnapshot>
   listAuditEntries(): Promise<AuditEntry[]>
   startSession(request: StartSessionRequest): Promise<SessionSummary>
   write(sessionId: string, data: string): Promise<void> | void
@@ -133,7 +226,19 @@ export interface AgentManagerApi {
   acceptRecoverySuggestion(sessionId: string): Promise<void>
   dismissRecoverySuggestion(sessionId: string): Promise<void> | void
   removeSession(sessionId: string): Promise<void>
+  renameSession(sessionId: string, displayName: string): Promise<void>
+  updateSessionConfig(sessionId: string, config: AgentConfigInput): Promise<void>
+  updateSessionProxy(sessionId: string, proxy: AgentProxyInput): Promise<void>
+  setFullAutoMode(sessionId: string, enabled: boolean): Promise<void>
+  listCCSwitchProviders(agentKind: AgentKind): Promise<CCSwitchProviderSummary[]>
+  getContinueKeywordSettings(): Promise<ContinueKeywordSettings>
+  updateContinueKeywordSettings(settings: ContinueKeywordSettings): Promise<ContinueKeywordSettings>
   approveSession(sessionId: string): Promise<void>
+  listPendingApprovals(): Promise<ApprovalRequest[]>
+  approveRequest(requestId: string): Promise<void>
+  approveAndRememberRequest(requestId: string): Promise<void>
+  rejectRequest(requestId: string): Promise<void>
+  approveAllPending(): Promise<BulkApprovalResult>
   acceptApprovalSuggestion(sessionId: string): Promise<void>
   dismissApprovalSuggestion(sessionId: string): Promise<void> | void
   listApprovalRules(): Promise<string[]>

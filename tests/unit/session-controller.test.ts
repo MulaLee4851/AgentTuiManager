@@ -8,7 +8,7 @@ import { ApprovalPolicyEngine } from '../../electron/approval-policy'
 
 class FakeHandle implements HostHandle {
   readonly writes: string[] = []
-  readonly permissionResponses: Array<{ requestId: string; action: 'allow' | 'ask' }> = []
+  readonly permissionResponses: Array<{ requestId: string; action: 'allow' | 'ask' | 'deny' }> = []
   stops = 0
   readonly hostId: string
   private readonly events: Array<HostEvent | Error> = []
@@ -34,7 +34,7 @@ class FakeHandle implements HostHandle {
   write(data: string): void { this.writes.push(data) }
   resize(): void {}
   async replay(): Promise<string> { return '' }
-  respondToPermission(requestId: string, action: 'allow' | 'ask'): void {
+  respondToPermission(requestId: string, action: 'allow' | 'ask' | 'deny'): void {
     this.permissionResponses.push({ requestId, action })
   }
   async stop(): Promise<void> { this.stops += 1 }
@@ -76,6 +76,34 @@ async function settle(): Promise<void> {
 }
 
 describe('SessionController recovery evidence', () => {
+  it('renames a managed Agent without restarting its Host and persists the display name', async () => {
+    const { controller, manager, starts } = fixture()
+    const session = await controller.startSession(request())
+    await controller.renameSession(session.sessionId, 'Renamed Agent')
+
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.displayName).toBe('Renamed Agent')
+    expect(manager.updateMetadata).toHaveBeenCalledWith('host-1', { displayName: 'Renamed Agent' })
+    expect(starts).toHaveLength(1)
+  })
+
+  it('updates an Agent configuration without restarting its Host', async () => {
+    const { controller, manager, starts } = fixture()
+    const session = await controller.startSession(request())
+    const config = {
+      enabled: true as const,
+      source: 'custom' as const,
+      profileId: 'profile-1',
+      baseUrl: 'https://gateway.example/v1',
+      model: 'model-x',
+      extraArgs: ['--feature'],
+      hasApiKey: true,
+    }
+    await controller.updateSessionConfig(session.sessionId, config)
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.agentConfig).toEqual(config)
+    expect(manager.updateMetadata).toHaveBeenCalledWith('host-1', { agentConfig: config })
+    expect(starts).toHaveLength(1)
+  })
+
   it('automatically continues a live terminal after a model-capacity error', async () => {
     vi.useFakeTimers()
     try {
@@ -324,14 +352,14 @@ describe('SessionController recovery evidence', () => {
   it('approves only a session with explicit approval evidence', async () => {
     const { controller, handles } = fixture()
     const session = await controller.startSession(request())
-    expect(() => controller.approveSession(session.sessionId)).toThrow(/not awaiting approval/i)
+    expect(() => controller.approveSession(session.sessionId)).toThrow(/没有等待处理的授权请求/)
 
     handles[0]!.emit({ type: 'output', data: 'Approval required\r\n1. Yes, proceed\r\n2. No' })
     await settle()
     controller.approveSession(session.sessionId)
     expect(handles[0]!.writes).toEqual(['\r'])
     expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
-    expect(() => controller.approveSession(session.sessionId)).toThrow(/not awaiting approval/i)
+    expect(() => controller.approveSession(session.sessionId)).toThrow(/没有等待处理的授权请求/)
   })
 
   it('auto-approves only a recognized command allowed by policy', async () => {
@@ -393,7 +421,7 @@ describe('SessionController recovery evidence', () => {
     expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
   })
 
-  it('keeps every structured write-tool approval visible in sequence', async () => {
+  it('keeps multiple structured tool approvals independently addressable', async () => {
     const base = fixture()
     const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
     const session = await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
@@ -406,7 +434,7 @@ describe('SessionController recovery evidence', () => {
       toolInputSummary: 'B:/workspace/src/App.tsx',
     })
     await settle()
-    expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'edit-1', action: 'ask' }])
+    expect(base.handles[0]!.permissionResponses).toEqual([])
     expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)).toMatchObject({
       status: 'needs_approval',
       pendingApprovalCommand: 'tool:Edit',
@@ -415,13 +443,121 @@ describe('SessionController recovery evidence', () => {
       approvalFilePath: 'B:/workspace/src/App.tsx',
       approvalInputSummary: 'B:/workspace/src/App.tsx',
     })
-    controller.approveSession(session.sessionId)
-    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)).not.toHaveProperty('approvalFilePath')
-
     base.handles[0]!.emit({ type: 'permission-request', requestId: 'write-2', toolName: 'Write' })
     await settle()
-    expect(base.handles[0]!.permissionResponses.at(-1)).toEqual({ requestId: 'write-2', action: 'ask' })
-    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)).toMatchObject({ status: 'needs_approval', pendingApprovalCommand: 'tool:Write' })
+    expect(controller.listPendingApprovals().map((request) => request.requestId)).toEqual(['edit-1', 'write-2'])
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)).toMatchObject({ status: 'needs_approval', pendingApprovalCount: 2 })
+
+    controller.approveRequest('edit-1')
+    expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'edit-1', action: 'allow' }])
+    expect(controller.listPendingApprovals().map((request) => request.requestId)).toEqual(['write-2'])
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)).toMatchObject({ status: 'needs_approval', pendingApprovalCommand: 'tool:Write', pendingApprovalCount: 1 })
+
+    controller.rejectRequest('write-2')
+    expect(base.handles[0]!.permissionResponses.at(-1)).toEqual({ requestId: 'write-2', action: 'deny' })
+    expect(controller.listPendingApprovals()).toEqual([])
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
+  })
+
+  it('keeps approvals from two Agents in one global queue without cross-clearing', async () => {
+    const base = fixture()
+    const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
+    const first = await controller.startSession({ ...request(), displayName: 'Claude A', agentKind: 'claude', executable: 'claude' })
+    const second = await controller.startSession({ ...request(), displayName: 'Claude B', agentKind: 'claude', executable: 'claude' })
+
+    base.handles[0]!.emit({ type: 'permission-request', requestId: 'agent-a-write', toolName: 'Write', operation: 'write' })
+    base.handles[1]!.emit({ type: 'permission-request', requestId: 'agent-b-edit', toolName: 'Edit', operation: 'write' })
+    await settle()
+
+    expect(controller.listPendingApprovals().map((item) => [item.requestId, item.sessionId])).toEqual([
+      ['agent-a-write', first.sessionId],
+      ['agent-b-edit', second.sessionId],
+    ])
+    controller.approveRequest('agent-a-write')
+    expect(controller.listPendingApprovals().map((item) => item.requestId)).toEqual(['agent-b-edit'])
+    expect(controller.listSessions().find((item) => item.sessionId === second.sessionId)?.status).toBe('needs_approval')
+  })
+
+  it('bulk-approves ordinary writes and unknown tools but preserves severe commands', async () => {
+    const base = fixture()
+    const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
+    await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+
+    base.handles[0]!.emit({ type: 'permission-request', requestId: 'safe-write', toolName: 'Edit', operation: 'write' })
+    base.handles[0]!.emit({ type: 'permission-request', requestId: 'safe-unknown', toolName: 'InspectResource', operation: 'unknown' })
+    base.handles[0]!.emit({ type: 'permission-request', requestId: 'danger-delete', toolName: 'Bash', command: 'rm -rf fixtures', operation: 'delete' })
+    await settle()
+
+    expect(controller.approveAllPending()).toEqual({
+      approved: 2,
+      skipped: 1,
+      failed: 0,
+      skippedRequestIds: ['danger-delete'],
+    })
+    expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'safe-write', action: 'allow' }, { requestId: 'safe-unknown', action: 'allow' }])
+    expect(controller.listPendingApprovals().map((item) => item.requestId)).toEqual(['danger-delete'])
+  })
+
+  it('auto-approves an in-workspace edit after full-auto is enabled and preserves deletion requests', async () => {
+    const base = fixture()
+    const activity = { approved: vi.fn(), blocked: vi.fn() }
+    const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine(), undefined, activity)
+    const session = await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+    await controller.setFullAutoMode(session.sessionId, true)
+
+    base.handles[0]!.emit({
+      type: 'permission-request', requestId: 'edit-auto', toolName: 'Edit', operation: 'write',
+      filePath: 'B:/work/src/App.tsx', toolInputSummary: 'B:/work/src/App.tsx', reason: '更新界面',
+    })
+    base.handles[0]!.emit({
+      type: 'permission-request', requestId: 'delete-blocked', toolName: 'Bash',
+      command: 'rm -rf fixtures', operation: 'delete',
+    })
+    await settle()
+
+    expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'edit-auto', action: 'allow' }])
+    expect(activity.approved).toHaveBeenCalledWith(expect.objectContaining({ requestId: 'edit-auto', agentReason: '更新界面' }))
+    expect(activity.blocked).toHaveBeenCalledWith(expect.objectContaining({ requestId: 'delete-blocked' }), expect.stringContaining('删除'))
+    expect(controller.listPendingApprovals().map((item) => item.requestId)).toEqual(['delete-blocked'])
+    expect(base.manager.updateMetadata).toHaveBeenCalledWith('host-1', { fullAutoEnabled: true })
+  })
+
+  it('immediately processes eligible pending requests when full-auto is enabled', async () => {
+    const base = fixture()
+    const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
+    const session = await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+    base.handles[0]!.emit({
+      type: 'permission-request', requestId: 'pending-edit', toolName: 'Edit',
+      operation: 'write', filePath: 'B:/work/src/App.tsx',
+    })
+    await settle()
+    expect(controller.listPendingApprovals()).toHaveLength(1)
+
+    await controller.setFullAutoMode(session.sessionId, true)
+    expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'pending-edit', action: 'allow' }])
+    expect(controller.listPendingApprovals()).toEqual([])
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)).toMatchObject({
+      status: 'running', fullAutoEnabled: true,
+    })
+  })
+
+  it('approves and remembers an explicitly confirmed custom safe tool', async () => {
+    const base = fixture()
+    const policy = new ApprovalPolicyEngine()
+    const controller = new SessionController(base.manager, undefined, undefined, policy)
+    await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+
+    base.handles[0]!.emit({ type: 'permission-request', requestId: 'inspect-1', toolName: 'InspectResource', operation: 'unknown' })
+    await settle()
+    expect(controller.listPendingApprovals().map((item) => item.requestId)).toEqual(['inspect-1'])
+
+    await controller.approveAndRememberRequest('inspect-1')
+    expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'inspect-1', action: 'allow' }])
+
+    base.handles[0]!.emit({ type: 'permission-request', requestId: 'inspect-2', toolName: 'InspectResource', operation: 'unknown' })
+    await settle()
+    expect(base.handles[0]!.permissionResponses.at(-1)).toEqual({ requestId: 'inspect-2', action: 'allow' })
+    expect(controller.listPendingApprovals()).toEqual([])
   })
 
   it('suggests a read-only command after three manual approvals and accepts the exact rule', async () => {
@@ -469,7 +605,7 @@ describe('SessionController recovery evidence', () => {
     expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.nativeSessionId).toBe('captured-native')
     expect(manager.updateMetadata).toHaveBeenCalledWith('host-1', {
       nativeSessionId: 'captured-native',
-      recovery: { executable: 'codex', args: ['resume', 'captured-native'] },
+      recovery: { executable: 'codex', args: ['--no-alt-screen', 'resume', 'captured-native'] },
     })
   })
 
@@ -481,10 +617,125 @@ describe('SessionController recovery evidence', () => {
     await controller.restartSession(session.sessionId)
 
     expect(starts).toHaveLength(2)
-    expect(starts[1]).toMatchObject({ executable: 'codex', args: ['resume', 'native-1'] })
+    expect(starts[1]).toMatchObject({ executable: 'codex', args: ['--no-alt-screen', 'resume', 'native-1'] })
     expect(handles[1]!.writes).toEqual([])
     expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
     expect(manager.removeArtifacts).toHaveBeenCalledWith('host-1')
+  })
+
+  it('sends Continue once only after a configured keyword remains quiet', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const keywordPolicy = {
+        getSettings: () => ({ enabled: true, quietSeconds: 3, keywords: ['please retry'] }),
+        match: (value: string) => value.toLowerCase().includes('please retry') ? 'please retry' : undefined,
+        maxKeywordLength: () => 12,
+      }
+      const activity = { keywordMatched: vi.fn(), keywordContinued: vi.fn() }
+      const controller = new SessionController(base.manager, undefined, undefined, undefined, undefined, undefined, keywordPolicy, activity)
+      const session = await controller.startSession(request(true))
+      base.handles[0]!.emit({ type: 'output', data: 'Temporary condition: please retry' })
+      await vi.advanceTimersByTimeAsync(2_999)
+      expect(base.handles[0]!.writes).toEqual([])
+      await vi.advanceTimersByTimeAsync(1)
+      expect(base.handles[0]!.writes).toEqual(['continue'])
+      await vi.advanceTimersByTimeAsync(75)
+      expect(base.handles[0]!.writes).toEqual(['continue', '\r'])
+      expect(activity.keywordMatched).toHaveBeenCalledWith(session.sessionId, 'please retry')
+      expect(activity.keywordContinued).toHaveBeenCalledWith(session.sessionId, 'please retry')
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(base.handles[0]!.writes).toEqual(['continue', '\r'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('defers keyword Continue while the Agent keeps producing output', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const keywordPolicy = {
+        getSettings: () => ({ enabled: true, quietSeconds: 3, keywords: ['please retry'] }),
+        match: (value: string) => value.toLowerCase().includes('please retry') ? 'please retry' : undefined,
+        maxKeywordLength: () => 12,
+      }
+      const controller = new SessionController(base.manager, undefined, undefined, undefined, undefined, undefined, keywordPolicy)
+      const session = await controller.startSession(request(true))
+      base.handles[0]!.emit({ type: 'output', data: 'please retry' })
+      await vi.advanceTimersByTimeAsync(2_000)
+      base.handles[0]!.emit({ type: 'output', data: 'Agent is retrying itself' })
+      await vi.advanceTimersByTimeAsync(2_999)
+      expect(base.handles[0]!.writes).toEqual([])
+      await vi.advanceTimersByTimeAsync(1)
+      expect(base.handles[0]!.writes).toEqual(['continue'])
+      expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['\x03', '\x1b'])('cancels keyword Continue after user interrupt %j', async (interrupt) => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const keywordPolicy = {
+        getSettings: () => ({ enabled: true, quietSeconds: 3, keywords: ['please retry'] }),
+        match: (value: string) => value.toLowerCase().includes('please retry') ? 'please retry' : undefined,
+        maxKeywordLength: () => 12,
+      }
+      const controller = new SessionController(base.manager, undefined, undefined, undefined, undefined, undefined, keywordPolicy)
+      const session = await controller.startSession(request(true))
+      base.handles[0]!.emit({ type: 'output', data: 'please retry' })
+      await vi.advanceTimersByTimeAsync(1_000)
+      controller.write(session.sessionId, interrupt)
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(base.handles[0]!.writes).toEqual([interrupt])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('queues input during restart and flushes it only to the replacement Host', async () => {
+    const { controller, handles, starts, manager } = fixture()
+    const session = await controller.startSession(request(true))
+    vi.mocked(manager.readLastExit).mockResolvedValue({ hostId: 'host-1', exitCode: 0, exitedAt: '2026-08-09T00:00:00.000Z' })
+    await controller.stopSession(session.sessionId)
+    let resolveRestart: ((handle: HostHandle) => void) | undefined
+    vi.mocked(manager.start).mockImplementationOnce((options) => {
+      starts.push(options)
+      return new Promise((resolve) => { resolveRestart = resolve })
+    })
+
+    const restarting = controller.restartSession(session.sessionId)
+    await settle()
+    controller.write(session.sessionId, 'queued input')
+    expect(handles[0]!.writes).toEqual([])
+    const replacement = new FakeHandle('replacement-host')
+    resolveRestart?.(replacement)
+    await restarting
+
+    expect(replacement.writes).toEqual(['queued input'])
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
+  })
+
+  it.each(['\x03', '\x1b'])('does not replay queued input after restart is interrupted with %j', async (interrupt) => {
+    const { controller, manager } = fixture()
+    const session = await controller.startSession(request(true))
+    vi.mocked(manager.readLastExit).mockResolvedValue({ hostId: 'host-1', exitCode: 0, exitedAt: '2026-08-09T00:00:00.000Z' })
+    await controller.stopSession(session.sessionId)
+    let resolveRestart: ((handle: HostHandle) => void) | undefined
+    vi.mocked(manager.start).mockImplementationOnce(() => new Promise((resolve) => { resolveRestart = resolve }))
+
+    const restarting = controller.restartSession(session.sessionId)
+    await settle()
+    controller.write(session.sessionId, 'do not replay')
+    controller.write(session.sessionId, interrupt)
+    const replacement = new FakeHandle('replacement-host')
+    resolveRestart?.(replacement)
+    await restarting
+
+    expect(replacement.writes).toEqual([])
   })
 
   it('removes only a completed Manager entry and its host artifacts', async () => {

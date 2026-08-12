@@ -1,10 +1,18 @@
 import { useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 
-import type { SessionSummary, TerminalHistorySnapshot } from './shared/manager-api'
+import type { SessionSummary } from './shared/manager-api'
 
 const STABLE_TERMINAL_COLS = 100
 const STABLE_TERMINAL_ROWS = 30
+
+export function isTerminalProtocolResponse(data: string): boolean {
+  return /^(?:\x1b\[\??\d+;\d+R|\x1b\[\??[\d;]*c|\x1b\[>[\d;]*c|\x1b\[\?[\d;]*u)$/.test(data)
+}
+
+function isClosedPreviousHostError(message: string): boolean {
+  return /Host\s+[0-9a-f-]+\s+connection (?:is )?closed/i.test(message)
+}
 
 const STATUS_LABEL: Record<SessionSummary['status'], string> = {
   starting: '启动中', running: '运行中', needs_approval: '待授权', recovering: '请稍后…',
@@ -15,22 +23,25 @@ const STATUS_LABEL: Record<SessionSummary['status'], string> = {
 interface TerminalTileProps {
   session: SessionSummary
   detail?: boolean
+  embedded?: boolean
   hidden?: boolean
   onOpen?: () => void
+  onEdit?: () => void
+  onFullAuto?: () => void
 }
 
-export default function TerminalTile({ session, detail = false, hidden = false, onOpen }: TerminalTileProps): JSX.Element {
+export default function TerminalTile({ session, detail = false, embedded = false, hidden = false, onOpen, onEdit, onFullAuto }: TerminalTileProps): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
-  const scrollRef = useRef<HTMLDivElement>(null)
   const [actionError, setActionError] = useState('')
-  const [terminalHistory, setTerminalHistory] = useState<TerminalHistorySnapshot>({ entries: [], truncated: false })
+  const [actionBusy, setActionBusy] = useState<'restart' | 'remove'>()
+  const statusRef = useRef(session.status)
+  statusRef.current = session.status
   const terminalEnded = session.status === 'completed' || session.status === 'stopped' || session.status === 'failed'
 
   useEffect(() => {
     if (terminalEnded) return
     const host = hostRef.current
-    const scroll = scrollRef.current
-    if (!host || !scroll) return
+    if (!host) return
     const terminal = new Terminal({
       cols: STABLE_TERMINAL_COLS,
       rows: STABLE_TERMINAL_ROWS,
@@ -38,7 +49,7 @@ export default function TerminalTile({ session, detail = false, hidden = false, 
       convertEol: true,
       fontFamily: 'Cascadia Code, Consolas, monospace',
       fontSize: 12,
-      scrollback: 1_500,
+      scrollback: 10_000,
       theme: { background: '#0b1011', foreground: '#cbd9d7', cursor: '#b9d2cc', selectionBackground: '#315d4e' },
     })
     terminal.open(host)
@@ -60,33 +71,7 @@ export default function TerminalTile({ session, detail = false, hidden = false, 
     let pendingTerminalInput = ''
     let inputFrame = 0
     let disposed = false
-    let historyRequest = 0
-    let lastHistoryRefreshAt = 0
-    const scrollIsAtBottom = (): boolean => scroll.scrollTop + scroll.clientHeight >= scroll.scrollHeight - 4
-    let pinFrames: number[] = []
-    const scrollToLiveTerminal = (): void => {
-      for (const frame of pinFrames) cancelAnimationFrame(frame)
-      pinFrames = []
-      const pin = (remaining: number): void => {
-        scroll.scrollTop = scroll.scrollHeight
-        if (remaining > 0) pinFrames.push(requestAnimationFrame(() => pin(remaining - 1)))
-      }
-      pin(3)
-    }
-    const refreshHistory = (force = false): void => {
-      const now = performance.now()
-      if (!force && now - lastHistoryRefreshAt < 2_000) return
-      lastHistoryRefreshAt = now
-      const request = ++historyRequest
-      const wasAtBottom = scrollIsAtBottom()
-      void window.agentManager.terminalHistory(session.sessionId).then((history) => {
-        if (request !== historyRequest) return
-        setTerminalHistory(history)
-        requestAnimationFrame(() => {
-          if (request === historyRequest && wasAtBottom) scrollToLiveTerminal()
-        })
-      }).catch(() => undefined)
-    }
+    let userScrollLine: number | undefined
     const preserveLatestReplayScrollback = (data: string): string => {
       const standard = data.lastIndexOf('\x1b[3J')
       const padded = data.lastIndexOf('\x1b[03J')
@@ -150,8 +135,11 @@ export default function TerminalTile({ session, detail = false, hidden = false, 
       writeInFlight = true
       terminal.write(synchronizedResizeRedraw ? `\x1b[?2026h${output}\x1b[?2026l` : output, () => {
         writeInFlight = false
+        if (userScrollLine !== undefined) {
+          terminal.scrollToLine(Math.min(userScrollLine, terminal.buffer.active.baseY))
+        }
         if (synchronizedResizeRedraw) {
-          if (resizeWasAtBottom) terminal.scrollToBottom()
+          if (resizeWasAtBottom && userScrollLine === undefined) terminal.scrollToBottom()
           requestAnimationFrame(() => requestAnimationFrame(hideResizeCover))
         }
         if (pendingOutput && !outputFrame) outputFrame = requestAnimationFrame(flushOutput)
@@ -175,7 +163,10 @@ export default function TerminalTile({ session, detail = false, hidden = false, 
           offset = end
         }
       }).catch((reason) => {
-        if (!disposed) setActionError(reason instanceof Error ? reason.message : String(reason))
+        if (disposed) return
+        const message = reason instanceof Error ? reason.message : String(reason)
+        if (isClosedPreviousHostError(message) && (statusRef.current === 'starting' || statusRef.current === 'recovering')) return
+        setActionError(message)
       })
     }
     const queueTerminalInput = (data: string, immediate = false): void => {
@@ -196,6 +187,7 @@ export default function TerminalTile({ session, detail = false, hidden = false, 
       const payload = terminal.modes.bracketedPasteMode
         ? `\x1b[200~${normalized}\x1b[201~`
         : normalized
+      userScrollLine = undefined
       terminal.scrollToBottom()
       queueTerminalInput(payload, true)
     }
@@ -223,23 +215,29 @@ export default function TerminalTile({ session, detail = false, hidden = false, 
       return false
     })
     const input = terminal.onData((data) => {
+      // Codex terminal probes are answered synchronously by its persistent Host. A renderer replay
+      // can parse the same query again; do not deliver that duplicate protocol reply as user input.
+      if (session.agentKind === 'codex' && isTerminalProtocolResponse(data)) return
+      userScrollLine = undefined
       queueTerminalInput(data, /[\r\n\x03\x1b]/.test(data))
     })
-    terminal.attachCustomWheelEventHandler((event) => {
-      if (event.deltaY === 0) return true
-      if (event.deltaY < 0) refreshHistory()
-      if (scroll.scrollHeight > scroll.clientHeight + 1) {
-        scroll.scrollTop += event.deltaY
-        return false
-      }
-      const buffer = terminal.buffer.active
-      if (buffer.type === 'normal' && buffer.baseY > 0) {
-        const lines = Math.max(1, Math.round(Math.abs(event.deltaY) / 36))
-        terminal.scrollLines((event.deltaY < 0 ? -1 : 1) * lines)
-        return false
-      }
-      return true
+    const scroll = terminal.onScroll((line) => {
+      if (writeInFlight && userScrollLine !== undefined) return
+      userScrollLine = line < terminal.buffer.active.baseY ? line : undefined
     })
+    const scrollTerminal = (event: WheelEvent): void => {
+      if (event.deltaY === 0) return
+      const buffer = terminal.buffer.active
+      if (buffer.type !== 'normal' || buffer.baseY <= 0) return
+      const lines = Math.max(1, Math.round(Math.abs(event.deltaY) / 36))
+      const currentLine = userScrollLine ?? buffer.viewportY
+      const targetLine = Math.max(0, Math.min(buffer.baseY, currentLine + (event.deltaY < 0 ? -lines : lines)))
+      userScrollLine = targetLine < buffer.baseY ? targetLine : undefined
+      terminal.scrollToLine(targetLine)
+      event.preventDefault()
+      event.stopPropagation()
+    }
+    host.addEventListener('wheel', scrollTerminal, { capture: true, passive: false })
     let copyFeedbackTimer: ReturnType<typeof setTimeout> | undefined
     const copyButton = document.createElement('button')
     copyButton.type = 'button'
@@ -289,7 +287,6 @@ export default function TerminalTile({ session, detail = false, hidden = false, 
     }
     host.addEventListener('contextmenu', copySelection)
     showResizeCover(true)
-    refreshHistory(true)
     const unsubscribe = window.agentManager.subscribe((event) => {
       if ('sessionId' in event && event.sessionId === session.sessionId && event.type === 'output') {
         if (!replayLoaded) {
@@ -328,15 +325,12 @@ export default function TerminalTile({ session, detail = false, hidden = false, 
     let resizeFrame = 0
     const resizeFontOnly = (): void => {
       if (!host.isConnected || host.clientWidth === 0 || host.clientHeight === 0) return
-      const wasAtBottom = scrollIsAtBottom()
       const availableWidth = Math.max(1, host.clientWidth - 20)
       const availableHeight = Math.max(1, host.clientHeight - 16)
       const fitByWidth = availableWidth / (STABLE_TERMINAL_COLS * .62)
       const fitByHeight = availableHeight / (STABLE_TERMINAL_ROWS * 1.25)
       const fontSize = Math.max(8, Math.min(18, Math.floor(Math.min(fitByWidth, fitByHeight))))
-      scroll.style.setProperty('--terminal-font-size', `${fontSize}px`)
       if (terminal.options.fontSize !== fontSize) terminal.options.fontSize = fontSize
-      if (wasAtBottom) scrollToLiveTerminal()
     }
     const scheduleResize = (): void => {
       cancelAnimationFrame(resizeFrame)
@@ -345,24 +339,23 @@ export default function TerminalTile({ session, detail = false, hidden = false, 
     scheduleResize()
     const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(scheduleResize)
     observer?.observe(host)
-    observer?.observe(scroll)
     return () => {
       disposed = true
       pendingTerminalInput = ''
       if (inputFrame) cancelAnimationFrame(inputFrame)
       cancelAnimationFrame(resizeFrame)
       cancelAnimationFrame(outputFrame)
-      for (const frame of pinFrames) cancelAnimationFrame(frame)
       if (resizeRedrawTimer) clearTimeout(resizeRedrawTimer)
       if (resizeCoverFailsafeTimer) clearTimeout(resizeCoverFailsafeTimer)
       if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer)
-      historyRequest += 1
       resizeCover?.remove()
       pendingOutput = ''
       outputBeforeReplay = []
       observer?.disconnect()
       unsubscribe()
       input.dispose()
+      scroll.dispose()
+      host.removeEventListener('wheel', scrollTerminal, true)
       host.removeEventListener('contextmenu', copySelection)
       host.removeEventListener('paste', pastePlainText, true)
       copyButton.removeEventListener('mousedown', preserveSelection)
@@ -373,31 +366,27 @@ export default function TerminalTile({ session, detail = false, hidden = false, 
   }, [session.sessionId, terminalEnded])
 
   useEffect(() => {
-    if (terminalEnded) return
-    const scroll = scrollRef.current
-    if (!scroll) return
-    const frames: number[] = []
-    const pin = (remaining: number): void => {
-      scroll.scrollTop = scroll.scrollHeight
-      if (remaining > 0) frames.push(requestAnimationFrame(() => pin(remaining - 1)))
+    if (session.status === 'starting' || session.status === 'recovering' || session.status === 'running') {
+      setActionError((message) => isClosedPreviousHostError(message) ? '' : message)
     }
-    frames.push(requestAnimationFrame(() => pin(3)))
-    return () => { for (const frame of frames) cancelAnimationFrame(frame) }
-  }, [detail, terminalEnded])
+  }, [session.status])
 
-  const openDetail = (): void => { if (!detail && !terminalEnded) onOpen?.() }
-  const runAction = (action: () => Promise<void> | void): void => {
+  const openDetail = (): void => { if (!detail && !embedded && !terminalEnded) onOpen?.() }
+  const runAction = (action: () => Promise<void> | void, busy?: 'restart' | 'remove'): void => {
     setActionError('')
-    void Promise.resolve(action()).catch((reason) => setActionError(reason instanceof Error ? reason.message : String(reason)))
+    if (busy) setActionBusy(busy)
+    void Promise.resolve(action())
+      .catch((reason) => setActionError(reason instanceof Error ? reason.message : String(reason)))
+      .finally(() => { if (busy) setActionBusy(undefined) })
   }
 
   return (
     <article
-      className={`terminal-card${detail ? ' terminal-card-detail' : ''}${hidden ? ' terminal-card-hidden' : ''}`}
+      className={`terminal-card${detail ? ' terminal-card-detail' : ''}${embedded ? ' terminal-card-embedded' : ''}${hidden ? ' terminal-card-hidden' : ''}`}
       data-testid={`terminal-tile-${session.sessionId}`}
       onClick={openDetail}
-      onKeyDown={(event) => { if ((event.key === 'Enter' || event.key === ' ') && !detail) openDetail() }}
-      tabIndex={detail || hidden || terminalEnded ? -1 : 0}
+      onKeyDown={(event) => { if ((event.key === 'Enter' || event.key === ' ') && !detail && !embedded) openDetail() }}
+      tabIndex={detail || embedded || hidden || terminalEnded ? -1 : 0}
       aria-hidden={hidden || undefined}
     >
       <header className="terminal-card-header">
@@ -407,32 +396,24 @@ export default function TerminalTile({ session, detail = false, hidden = false, 
         </div>
         <div className="terminal-actions">
           <span className={`status-badge status-${session.status}`}>{STATUS_LABEL[session.status]}</span>
-          {!detail && !terminalEnded && <button className="button-ghost" type="button" onClick={(event) => { event.stopPropagation(); onOpen?.() }} aria-label={`查看 ${session.displayName}`}>⛶</button>}
+          {!terminalEnded && onFullAuto && <button className={'full-auto-tile-button' + (session.fullAutoEnabled ? ' active' : '')} type="button" title={session.fullAutoEnabled ? '关闭全自动模式' : '开启全自动模式'} onClick={(event) => { event.stopPropagation(); onFullAuto() }}>{session.fullAutoEnabled ? '全自动中' : '全自动'}</button>}
+          {onEdit && <button className="button-ghost" type="button" title="编辑 Agent" onClick={(event) => { event.stopPropagation(); onEdit() }} aria-label={`编辑 ${session.displayName}`}>✎</button>}
+          {!detail && !embedded && !terminalEnded && <button className="button-ghost" type="button" onClick={(event) => { event.stopPropagation(); onOpen?.() }} aria-label={`查看 ${session.displayName}`}>⛶</button>}
           {terminalEnded ? <>
-            <button className="button-secondary button-compact" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.restartSession(session.sessionId)) }}>重新启动</button>
-            <button className="button-danger" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.removeSession(session.sessionId)) }}>删除</button>
+            <button className="button-secondary button-compact" type="button" disabled={Boolean(actionBusy)} onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.restartSession(session.sessionId), 'restart') }}>{actionBusy === 'restart' ? '请稍后…' : '重新启动'}</button>
+            <button className="button-danger" type="button" disabled={Boolean(actionBusy)} onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.removeSession(session.sessionId), 'remove') }}>{actionBusy === 'remove' ? '请稍后…' : '删除'}</button>
           </> : <button className="button-danger" type="button" aria-label="停止" title="停止" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.stopSession(session.sessionId)) }}>■</button>}
         </div>
       </header>
       {terminalEnded ? <div className="terminal-ended" onClick={(event) => event.stopPropagation()}>
         <div className="terminal-ended-icon">›_</div>
         <strong>{session.status === 'completed' ? 'Agent 已正常完成' : session.status === 'stopped' ? 'Agent 已停止' : 'Agent 运行失败'}</strong>
-        <span>{session.status === 'failed' && session.lastError ? session.lastError : '终端进程已经关闭，可重新启动或从总览删除。'}</span>
+        <span className={actionError ? 'terminal-ended-error' : undefined}>{actionError || (session.status === 'failed' && session.lastError ? session.lastError : '终端进程已经关闭，可重新启动或从总览删除。')}</span>
       </div> : <div
         className="terminal-surface"
-        ref={scrollRef}
         onClick={(event) => event.stopPropagation()}
         onKeyDown={(event) => event.stopPropagation()}
       >
-        {terminalHistory.entries.length > 0 && <section className="terminal-native-history" aria-label="原生会话历史">
-          {terminalHistory.truncated && <div className="terminal-history-truncated">更早的会话内容已折叠</div>}
-          {terminalHistory.entries.map((entry, index) => (
-            <article className={`terminal-history-entry terminal-history-${entry.role}`} key={`${entry.role}-${index}`}>
-              <div className="terminal-history-title">{entry.title}</div>
-              {entry.text && <pre className="terminal-history-content">{entry.text}</pre>}
-            </article>
-          ))}
-        </section>}
         <div className="terminal-live-host" ref={hostRef} />
       </div>}
       {!terminalEnded && <div className="terminal-status-slot">
@@ -440,7 +421,7 @@ export default function TerminalTile({ session, detail = false, hidden = false, 
           : session.status === 'needs_approval' ? <div className="inline-request"><span>Agent 正在等待本次授权</span><button className="button-approve" type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.approveSession(session.sessionId) }}>批准</button></div>
             : session.status === 'needs_attention' ? <div className="inline-request attention-request"><span title={session.lastError}>检测到异常：{session.lastError ?? '原因未知'}</span><button className="button-secondary button-compact" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.dismissRecoverySuggestion(session.sessionId)) }}>忽略</button><button className="button-secondary button-compact" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.acceptRecoverySuggestion(session.sessionId)) }}>采纳</button><button className="button-approve" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.tryRecoveryOnce(session.sessionId)) }}>尝试一次</button></div>
               : session.status === 'recovering' ? <div className="recovery-bar"><span>↻</span><span>请稍后…</span></div>
-                : session.approvalSuggestion ? <div className="approval-suggestion"><span title={session.approvalSuggestion.command}>已手动批准 {session.approvalSuggestion.approvalCount} 次，加入自动批准？</span><button type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.acceptApprovalSuggestion(session.sessionId) }}>加入</button><button type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.dismissApprovalSuggestion(session.sessionId) }}>暂不</button></div>
+                : session.approvalSuggestion ? <div className="approval-suggestion"><span className="approval-suggestion-summary" tabIndex={0} data-tooltip={`已手动批准 ${session.approvalSuggestion.approvalCount} 次\n命令：${session.approvalSuggestion.command}\n加入后，相同命令将按安全规则自动批准。`}>已手动批准 {session.approvalSuggestion.approvalCount} 次 · {session.approvalSuggestion.command}</span><button type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.acceptApprovalSuggestion(session.sessionId) }}>加入</button><button type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.dismissApprovalSuggestion(session.sessionId) }}>暂不</button></div>
                   : null}
       </div>}
     </article>

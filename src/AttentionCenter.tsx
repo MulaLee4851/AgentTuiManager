@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
 
-import type { ApprovalRisk, SessionSummary } from './shared/manager-api'
+import type { ApprovalRequest, ApprovalRisk, SessionSummary } from './shared/manager-api'
 
 interface AttentionCenterProps {
   sessions: SessionSummary[]
+  approvals: ApprovalRequest[]
   onOpenSession: (sessionId: string) => void
   onReload: () => Promise<void>
 }
@@ -21,47 +22,56 @@ const RISK_DETAILS: Record<ApprovalRisk, {
   unknown: { label: '影响未识别', tone: 'unknown', impact: '需要人工判断', reversibility: '无法确认', learning: '禁止自动学习' },
 }
 
-function approvalTitle(session: SessionSummary): string {
-  if (session.approvalRisk === 'delete') return session.displayName + ' 请求执行删除操作'
-  if (session.approvalRisk === 'write') return session.displayName + ' 请求写入工作区'
-  if (session.approvalRisk === 'read') return session.displayName + ' 请求运行只读操作'
-  return session.displayName + ' 请求执行一个操作'
+type QueueItem =
+  | { key: string; kind: 'approval'; request: ApprovalRequest }
+  | { key: string; kind: 'recovery'; session: SessionSummary }
+
+function approvalTitle(request: ApprovalRequest): string {
+  if (request.risk === 'delete') return request.displayName + ' 请求执行删除操作'
+  if (request.risk === 'write') return request.displayName + ' 请求写入工作区'
+  if (request.risk === 'read') return request.displayName + ' 请求运行只读操作'
+  return request.displayName + ' 请求执行一个操作'
 }
 
-function approvalTargets(session: SessionSummary): string[] {
+function approvalTargets(request: ApprovalRequest): string[] {
   return [
-    ...(session.approvalFilePath ? [session.approvalFilePath] : []),
-    ...(session.approvalTargetPaths ?? []),
+    ...(request.filePath ? [request.filePath] : []),
+    ...(request.targetPaths ?? []),
   ]
 }
 
-function approvalDisplay(session: SessionSummary): string {
-  return session.approvalInputSummary
-    ?? session.pendingApprovalCommand
-    ?? '未能识别具体命令，请打开终端核对原始请求。'
+function approvalDisplay(request: ApprovalRequest): string {
+  return request.inputSummary
+    ?? request.command
+    ?? '工具没有提供可展示的参数，请打开终端核对原始请求。'
 }
 
 export default function AttentionCenter({
   sessions,
+  approvals,
   onOpenSession,
   onReload,
 }: AttentionCenterProps): JSX.Element {
-  const pending = useMemo(
-    () => sessions.filter((session) => session.status === 'needs_approval' || session.status === 'needs_attention'),
-    [sessions],
-  )
-  const [selectedId, setSelectedId] = useState<string>()
+  const queue = useMemo<QueueItem[]>(() => [
+    ...approvals.map((request) => ({ key: 'approval:' + request.requestId, kind: 'approval' as const, request })),
+    ...sessions
+      .filter((session) => session.status === 'needs_attention')
+      .map((session) => ({ key: 'recovery:' + session.sessionId, kind: 'recovery' as const, session })),
+  ], [approvals, sessions])
+  const [selectedKey, setSelectedKey] = useState<string>()
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
-  const selected = pending.find((session) => session.sessionId === selectedId) ?? pending[0]
+  const selected = queue.find((item) => item.key === selectedKey) ?? queue[0]
 
   useEffect(() => {
-    if (selected && selected.sessionId !== selectedId) setSelectedId(selected.sessionId)
-  }, [selected, selectedId])
+    if (selected && selected.key !== selectedKey) setSelectedKey(selected.key)
+  }, [selected, selectedKey])
 
   const run = async (action: () => Promise<void> | void): Promise<void> => {
     setBusy(true)
     setError('')
+    setNotice('')
     try {
       await action()
       await onReload()
@@ -72,84 +82,146 @@ export default function AttentionCenter({
     }
   }
 
-  const approvalCount = pending.filter((session) => session.status === 'needs_approval').length
-  const recoveryCount = pending.length - approvalCount
+  const approveAll = (): void => {
+    void run(async () => {
+      const result = typeof window.agentManager.approveAllPending === 'function'
+        ? await window.agentManager.approveAllPending()
+        : await (async () => {
+          let approved = 0
+          for (const request of approvals.filter((item) => item.canBulkApprove)) {
+            await window.agentManager.approveSession(request.sessionId)
+            approved += 1
+          }
+          return { approved, skipped: approvals.length - approved, failed: 0, skippedRequestIds: [] }
+        })()
+      setNotice('已批准 ' + result.approved + ' 项'
+        + (result.skipped ? '，跳过 ' + result.skipped + ' 项严重指令' : '')
+        + (result.failed ? '，' + result.failed + ' 项处理失败' : ''))
+    })
+  }
+
+  const recoveryCount = queue.length - approvals.length
+  const bulkCount = approvals.filter((request) => request.canBulkApprove).length
 
   return <section className='attention-page attention-page-embedded'>
     <div className='attention-shell attention-shell-embedded'>
       <section className='attention-queue'>
-        <header><div><h1>需要处理</h1><span>{approvalCount} 个授权 · {recoveryCount} 个异常</span></div></header>
+        <header>
+          <div><h1>需要处理</h1><span>{approvals.length} 个授权 · {recoveryCount} 个异常</span></div>
+          <button className='button-primary button-compact' type='button' disabled={busy || bulkCount === 0} onClick={approveAll}>批准全部</button>
+        </header>
         <div className='attention-queue-list'>
-          {pending.length === 0 && <p className='attention-empty'>当前没有待处理项</p>}
-          {pending.map((session) => {
-            const risk = RISK_DETAILS[session.approvalRisk ?? 'unknown']
+          {queue.length === 0 && <p className='attention-empty'>当前没有待处理项</p>}
+          {queue.map((item) => {
+            if (item.kind === 'recovery') {
+              return <button
+                className={'attention-queue-item event' + (selected?.key === item.key ? ' active' : '')}
+                key={item.key}
+                type='button'
+                onClick={() => setSelectedKey(item.key)}
+              >
+                <i className='severity' />
+                <span><span className='queue-top'><strong>{item.session.displayName}</strong><em>异常退出</em></span>
+                  <span className='queue-command'>{item.session.lastError ?? '未记录具体原因'}</span>
+                  <span className='queue-meta'>{item.session.agentKind.toUpperCase()} · {item.session.workspace}</span>
+                </span>
+              </button>
+            }
+            const risk = RISK_DETAILS[item.request.risk]
             return <button
-              className={'attention-queue-item ' + (selected?.sessionId === session.sessionId ? 'active ' : '') + (session.status === 'needs_attention' ? 'event' : risk.tone)}
-              key={session.sessionId}
+              className={'attention-queue-item ' + risk.tone + (selected?.key === item.key ? ' active' : '')}
+              key={item.key}
               type='button'
-              onClick={() => setSelectedId(session.sessionId)}
+              onClick={() => setSelectedKey(item.key)}
             >
               <i className='severity' />
-              <span><span className='queue-top'><strong>{session.displayName}</strong><em>{session.status === 'needs_attention' ? '重试耗尽' : risk.label}</em></span>
-                <span className='queue-command'>{session.status === 'needs_attention' ? session.lastError : session.pendingApprovalCommand ?? '未识别具体命令'}</span>
-                <span className='queue-meta'>{session.agentKind.toUpperCase()} · {session.workspace}</span>
+              <span><span className='queue-top'><strong>{item.request.displayName}</strong><em>{risk.label}</em></span>
+                <span className='queue-command'>{item.request.toolName ? item.request.toolName + ' · ' : ''}{approvalDisplay(item.request)}</span>
+                <span className='queue-meta'>{item.request.agentKind.toUpperCase()} · {item.request.workspace}</span>
               </span>
             </button>
           })}
         </div>
       </section>
       <section className='attention-detail'>
+        {notice && <p className='attention-notice'>{notice}</p>}
         {!selected ? <div className='attention-detail-empty'><strong>所有 Agent 均可继续运行</strong><span>新的授权或恢复异常会出现在这里。</span></div>
-          : selected.status === 'needs_attention'
-            ? <RecoveryDetail session={selected} busy={busy} error={error} onOpen={() => onOpenSession(selected.sessionId)} onContinue={() => run(() => window.agentManager.continueSession(selected.sessionId))} />
-            : <ApprovalDetail session={selected} busy={busy} error={error} onOpen={() => onOpenSession(selected.sessionId)} onApprove={() => run(() => window.agentManager.approveSession(selected.sessionId))} />}
+          : selected.kind === 'recovery'
+            ? <RecoveryDetail session={selected.session} busy={busy} error={error} onOpen={() => onOpenSession(selected.session.sessionId)} onContinue={() => run(() => window.agentManager.continueSession(selected.session.sessionId))} />
+            : <ApprovalDetail
+              request={selected.request}
+              busy={busy}
+              error={error}
+              onOpen={() => onOpenSession(selected.request.sessionId)}
+              onReject={() => run(() => {
+                if (typeof window.agentManager.rejectRequest !== 'function') throw new Error('拒绝功能需要重启 Manager 后启用；当前可打开终端并在原生提示中拒绝')
+                return window.agentManager.rejectRequest(selected.request.requestId)
+              })}
+              onRemember={() => run(async () => {
+                if (typeof window.agentManager.approveAndRememberRequest === 'function') {
+                  await window.agentManager.approveAndRememberRequest(selected.request.requestId)
+                  return
+                }
+                if (!selected.request.command) throw new Error('Agent 没有提供完整命令或工具名称，无法记住')
+                await window.agentManager.addApprovalRule(selected.request.command)
+                await window.agentManager.approveSession(selected.request.sessionId)
+              })}
+              onApprove={() => run(() => typeof window.agentManager.approveRequest === 'function'
+                ? window.agentManager.approveRequest(selected.request.requestId)
+                : window.agentManager.approveSession(selected.request.sessionId))}
+            />}
       </section>
     </div>
   </section>
 }
 
 function ApprovalDetail({
-  session,
+  request,
   busy,
   error,
   onOpen,
+  onReject,
+  onRemember,
   onApprove,
 }: {
-  session: SessionSummary
+  request: ApprovalRequest
   busy: boolean
   error: string
   onOpen: () => void
+  onReject: () => void
+  onRemember: () => void
   onApprove: () => void
 }): JSX.Element {
-  const risk = RISK_DETAILS[session.approvalRisk ?? 'unknown']
-  const highRisk = session.approvalRisk === 'delete' || session.approvalRisk === 'write' || session.approvalRisk === 'unknown'
-  const targets = approvalTargets(session)
-  const structured = Boolean(session.approvalToolName)
+  const risk = RISK_DETAILS[request.risk]
+  const highRisk = request.risk === 'delete' || request.risk === 'write' || request.risk === 'unknown'
+  const targets = approvalTargets(request)
   return <div className='attention-detail-inner'>
     <p className={'detail-kicker ' + risk.tone}>{risk.label} · 需要本次确认</p>
-    <h2>{approvalTitle(session)}</h2>
-    <p className='detail-subtitle'>请求来自“{session.displayName}”会话。Manager 只展示已识别的信息，最终操作仍由原生 Agent 执行。</p>
+    <h2>{approvalTitle(request)}</h2>
+    <p className='detail-subtitle'>请求来自“{request.displayName}”会话 · {request.workspace} · 会话 {request.nativeSessionId ?? request.sessionId}</p>
     <section className='command-card'>
-      <div className='command-label'><span>{structured ? 'Claude Hook 结构化请求' : '终端兼容识别'}</span><span>{session.approvalToolName ?? session.agentKind.toUpperCase()}</span></div>
-      <pre>{approvalDisplay(session)}</pre>
-      <div className='command-path'>{targets.length ? '目标：' + targets.join(' · ') : '工作目录：' + session.workspace}</div>
+      <div className='command-label'><span>{request.source === 'claude-hook' ? 'Claude Hook 结构化请求' : '终端兼容识别'}</span><span>{request.toolName ?? request.agentKind.toUpperCase()}</span></div>
+      <pre>{approvalDisplay(request)}</pre>
+      <div className='command-path'>{targets.length ? '目标：' + targets.join(' · ') : '工作目录：' + request.workspace}</div>
     </section>
     <div className='approval-facts'>
       <div><span>文件影响</span><strong className={risk.tone}>{targets.length ? targets.length + ' 个目标' : risk.impact}</strong></div>
-      <div><span>工具名称</span><strong>{session.approvalToolName ?? '未提供'}</strong></div>
+      <div><span>工具名称</span><strong>{request.toolName ?? '未提供'}</strong></div>
       <div><span>可恢复性</span><strong className={highRisk ? 'delete' : 'read'}>{risk.reversibility}</strong></div>
       <div><span>自动学习</span><strong className={highRisk ? 'delete' : 'read'}>{risk.learning}</strong></div>
     </div>
     <div className={'approval-reason ' + (highRisk ? 'danger' : '')}>
       <strong>{highRisk ? '为什么必须人工确认？' : '为什么这次仍需确认？'}</strong>
-      <p>{session.approvalReason ?? '该操作没有命中现有自动批准规则。'}</p>
+      <p>{request.reason}</p>
     </div>
-    {session.approvalSuggestion && <section className='approval-learning'>
-      <strong>同一操作已手动批准 {session.approvalSuggestion.approvalCount} 次</strong>
-      <p>这条只读规则可以在批准后加入授权列表；风险操作永远不会自动学习。</p>
-    </section>}
     {error && <p className='form-error'>{error}</p>}
-    <div className='detail-actions'><span>本次决定只对当前请求有效</span><button className='button-secondary' type='button' onClick={onOpen}>打开终端</button><button className='button-primary' type='button' disabled={busy} onClick={onApprove}>{busy ? '请稍后…' : '批准这一次'}</button></div>
+    <div className='detail-actions'>
+      <span>请求键：{request.requestId}</span>
+      <button className='button-secondary' type='button' onClick={onOpen}>打开终端</button>
+      <button className='button-danger' type='button' disabled={busy} onClick={onReject}>拒绝</button>
+      {request.command && request.risk !== 'write' && request.risk !== 'delete' && <button className='button-secondary button-safe-command' type='button' disabled={busy} onClick={onRemember}>作为安全命令批准</button>}
+      <button className='button-primary' type='button' disabled={busy} onClick={onApprove}>{busy ? '请稍后…' : '批准这一次'}</button>
+    </div>
     <PolicySummary />
   </div>
 }
@@ -169,8 +241,8 @@ function RecoveryDetail({
 }): JSX.Element {
   return <div className='attention-detail-inner'>
     <p className='detail-kicker recovery'>异常恢复 · 已停止自动重试</p>
-    <h2>{session.displayName} 连续 {session.recoveryAttempts} 次重试失败</h2>
-    <p className='detail-subtitle'>终端和原生会话仍然保留，Manager 不会主动关闭窗口。手动继续会重新计算最多三次自动尝试。</p>
+    <h2>{session.displayName} 需要人工处理</h2>
+    <p className='detail-subtitle'>终端和原生会话仍然保留，Manager 不会主动关闭窗口。</p>
     <section className='command-card'>
       <div className='command-label'><span>最近错误</span><span>{session.agentKind.toUpperCase()}</span></div>
       <pre>{session.lastError ?? '未记录具体错误'}</pre>
@@ -183,7 +255,7 @@ function RecoveryDetail({
       <div><span>正常完成</span><strong className='read'>不会误触发</strong></div>
     </div>
     {error && <p className='form-error'>{error}</p>}
-    <div className='detail-actions'><span>再次继续会重置自动重试预算</span><button className='button-secondary' type='button' onClick={onOpen}>打开终端</button><button className='button-primary' type='button' disabled={busy} onClick={onContinue}>{busy ? '请稍后…' : '再次继续'}</button></div>
+    <div className='detail-actions'><span>本次只尝试恢复一次</span><button className='button-secondary' type='button' onClick={onOpen}>打开终端</button><button className='button-primary' type='button' disabled={busy} onClick={onContinue}>{busy ? '请稍后…' : '尝试恢复'}</button></div>
   </div>
 }
 
@@ -191,7 +263,7 @@ function PolicySummary(): JSX.Element {
   return <section className='policy-summary'>
     <h3>当前安全边界</h3>
     <div><i /><strong>内置只读命令</strong><span>直接批准</span></div>
-    <div><i /><strong>低风险重复命令</strong><span>第 3 次后询问是否记住</span></div>
-    <div><i className='danger' /><strong>删除、覆盖、提权和外部写入</strong><span>永远人工确认</span></div>
+    <div><i /><strong>普通低风险请求</strong><span>可使用批准全部</span></div>
+    <div><i className='danger' /><strong>严重破坏性指令</strong><span>批量批准会跳过</span></div>
   </section>
 }

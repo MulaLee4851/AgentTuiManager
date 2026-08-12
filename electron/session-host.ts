@@ -9,6 +9,7 @@ import * as pty from 'node-pty'
 import type { HostCommand, HostEvent, HostExitFact } from '../src/shared/protocol'
 import { environmentForAgent } from './agent-environment'
 import { TerminalReplayBuffer } from './terminal-replay-buffer'
+import { TerminalStateReplay } from './terminal-state-replay'
 
 function argument(name: string): string {
   const index = process.argv.indexOf(name)
@@ -26,6 +27,7 @@ const permissionHookToken = randomBytes(24).toString('hex')
 const permissionHookSockets = new Map<string, Socket>()
 let terminal: pty.IPty | undefined
 const terminalReplay = new TerminalReplayBuffer()
+let terminalStateReplay: TerminalStateReplay | undefined
 let shuttingDown = false
 let finalizing = false
 
@@ -75,6 +77,8 @@ async function finalizeExit(exitCode: number, signal?: number): Promise<void> {
   } finally {
     await unlink(claudeSettingsPath).catch(() => undefined)
     terminal = undefined
+    terminalStateReplay?.dispose()
+    terminalStateReplay = undefined
     shutdown(exitCode === 0 ? 0 : 1)
   }
 }
@@ -155,13 +159,21 @@ function startTerminal(socket: Socket, command: Extract<HostCommand, { type: 'st
       rows: command.rows,
       env: {
         ...environmentForAgent(command.agentKind),
+        ...command.environment,
         AGENT_TUI_MANAGER_HOOK_ENDPOINT: endpoint,
         AGENT_TUI_MANAGER_HOOK_TOKEN: permissionHookToken,
       },
       name: 'xterm-256color',
+      // Codex's Windows inline viewport needs ConPTY to inherit the cursor anchor;
+      // without this it falls back to a 30-row repaint with no terminal scrollback.
+      ...(command.agentKind === 'codex' ? { conptyInheritCursor: true } : {}),
     })
+    terminalStateReplay = command.agentKind === 'codex'
+      ? new TerminalStateReplay(command.cols, command.rows, 10_000, (data) => terminal?.write(data))
+      : undefined
     terminal.onData((data) => {
       terminalReplay.append(data)
+      terminalStateReplay?.append(data)
       if (ready) broadcast({ type: 'output', data })
       else pendingOutput.push(data)
     })
@@ -182,7 +194,10 @@ function handleCommand(socket: Socket, command: HostCommand): void {
   switch (command.type) {
     case 'start': startTerminal(socket, command); break
     case 'write': terminal?.write(command.data); break
-    case 'resize': terminal?.resize(command.cols, command.rows); break
+    case 'resize':
+      terminal?.resize(command.cols, command.rows)
+      terminalStateReplay?.resize(command.cols, command.rows)
+      break
     case 'permission-hook':
       if (command.token !== permissionHookToken || !/^[a-f0-9-]{16,64}$/i.test(command.requestId)) {
         socket.end()
@@ -199,6 +214,7 @@ function handleCommand(socket: Socket, command: HostCommand): void {
         ...(command.filePath ? { filePath: command.filePath } : {}),
         ...(command.targetPaths ? { targetPaths: command.targetPaths } : {}),
         ...(command.toolInputSummary ? { toolInputSummary: command.toolInputSummary } : {}),
+        ...(command.reason ? { reason: command.reason } : {}),
       })
       break
     case 'permission-response': {
@@ -211,7 +227,11 @@ function handleCommand(socket: Socket, command: HostCommand): void {
       break
     }
     case 'replay':
-      send(socket, { type: 'replay', data: terminalReplay.snapshot() })
+      void (terminalStateReplay
+        ? terminalStateReplay.snapshot().catch(() => terminalReplay.snapshot())
+        : Promise.resolve(terminalReplay.snapshot()))
+        .then((data) => send(socket, { type: 'replay', data }))
+        .catch((error) => send(socket, { type: 'error', message: error instanceof Error ? error.message : String(error) }))
       break
     case 'stop':
       terminal?.kill()

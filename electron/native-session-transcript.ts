@@ -3,12 +3,21 @@ import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import { createInterface } from 'node:readline'
 
-import type { AgentKind, TerminalHistoryEntry, TerminalHistorySnapshot } from '../src/shared/manager-api'
+import type { AgentKind } from '../src/shared/manager-api'
 
 const MAX_FILES = 20_000
 const MAX_HISTORY_CHARACTERS = 160_000
 
-export type TranscriptEntry = TerminalHistoryEntry
+export interface TranscriptEntry {
+  role: 'user' | 'agent' | 'tool' | 'tool_result' | 'error' | 'system'
+  text: string
+  title?: string
+}
+
+export interface TranscriptSnapshot {
+  entries: TranscriptEntry[]
+  truncated: boolean
+}
 
 function cleanText(value: unknown): string {
   if (typeof value !== 'string') return ''
@@ -140,7 +149,7 @@ async function parseTranscript(file: string, agentKind: 'codex' | 'claude'): Pro
   return entries
 }
 
-export function formatTranscript(entries: TranscriptEntry[], agentKind: 'codex' | 'claude'): TerminalHistorySnapshot {
+export function formatTranscript(entries: TranscriptEntry[], agentKind: 'codex' | 'claude'): TranscriptSnapshot {
   const labels: Partial<Record<TranscriptEntry['role'], string>> = {
     user: '你', agent: agentKind === 'codex' ? 'Codex' : 'Claude Code', tool: '工具调用', tool_result: '工具结果',
   }
@@ -158,8 +167,8 @@ export function formatTranscript(entries: TranscriptEntry[], agentKind: 'codex' 
   return { entries: titledEntries.slice(firstSelected), truncated: firstSelected > 0 }
 }
 
-export async function readNativeSessionTranscript(agentKind: AgentKind, sessionId: string | undefined): Promise<TerminalHistorySnapshot> {
-  const empty: TerminalHistorySnapshot = { entries: [], truncated: false }
+export async function readNativeSessionTranscript(agentKind: AgentKind, sessionId: string | undefined): Promise<TranscriptSnapshot> {
+  const empty: TranscriptSnapshot = { entries: [], truncated: false }
   if (!sessionId || !/^[a-zA-Z0-9-]{8,128}$/.test(sessionId)) return empty
   if (agentKind !== 'codex' && agentKind !== 'claude') return empty
   const root = agentKind === 'codex'

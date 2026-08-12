@@ -37,6 +37,11 @@ function sameExecutable(left: string, right: string): boolean {
   return (normalizedAbsolute(left) ?? left.toLocaleLowerCase('en-US')) === (normalizedAbsolute(right) ?? right.toLocaleLowerCase('en-US'))
 }
 
+export function terminalScrollbackArgs(agentKind: AgentKind, args: string[]): string[] {
+  if (agentKind !== 'codex' || args.includes('--no-alt-screen')) return [...args]
+  return ['--no-alt-screen', ...args]
+}
+
 export function canonicalNativeRecovery(
   agentKind: AgentKind,
   nativeSessionId: string,
@@ -45,7 +50,7 @@ export function canonicalNativeRecovery(
   suppliedRecovery: RecoveryRecipe | undefined,
 ): RecoveryRecipe {
   const resumeArgs = agentKind === 'codex'
-    ? ['resume', nativeSessionId]
+    ? ['--no-alt-screen', 'resume', nativeSessionId]
     : agentKind === 'claude'
       ? ['--resume', nativeSessionId]
       : undefined

@@ -1,22 +1,32 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, Tray, type IpcMainInvokeEvent } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, safeStorage, Tray, type IpcMainInvokeEvent } from 'electron'
 import { statSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 
 import { SessionController } from './session-controller'
 import { SessionHostManager } from './session-host-manager'
 import { discoverNativeSessions } from './native-session-discovery'
-import { readNativeSessionTranscript } from './native-session-transcript'
-import { canonicalNativeRecovery, validateExecutable } from './start-request-policy'
+import { canonicalNativeRecovery, terminalScrollbackArgs, validateExecutable } from './start-request-policy'
 import { ApprovalPolicyStore } from './approval-policy-store'
 import { resolveExecutableForPty } from './executable-resolution'
 import { ActivityAuditStore, type NewAuditEntry } from './activity-audit-store'
 import { RecoveryPolicyStore } from './recovery-policy-store'
-import { IPC_CHANNELS, type AgentKind, type ManagerEvent, type NativeSessionSummary, type RecoveryRecipe, type SessionSummary, type StartSessionRequest } from '../src/shared/manager-api'
+import { AgentConfigurationStore } from './agent-configuration-store'
+import { applyAgentLaunchProfile } from './agent-launch-profile'
+import { CCSwitchProviderReader } from './ccswitch-provider-reader'
+import { readCodexGlobalProvider } from './codex-global-config'
+import { AgentProxyStore, environmentForAgentProxy } from './agent-proxy-store'
+import { ContinueKeywordStore } from './continue-keyword-store'
+import { migrateCodexProviderOfficial, migrateCodexSessionProvider } from './codex-session-provider-migrator'
+import { IPC_CHANNELS, type AgentConfigInput, type AgentKind, type AgentProxyInput, type ApprovalRequest, type ContinueKeywordSettings, type ManagerEvent, type NativeSessionSummary, type RecoveryRecipe, type SessionSummary, type StartSessionRequest } from '../src/shared/manager-api'
 
 let mainWindow: BrowserWindow | undefined
 let tray: Tray | undefined
 let controller: SessionController
 let auditStore: ActivityAuditStore
+let agentConfigurationStore: AgentConfigurationStore
+let agentProxyStore: AgentProxyStore
+let continueKeywordStore: ContinueKeywordStore
+const ccSwitchProviderReader = new CCSwitchProviderReader()
 let quitting = false
 const discoveryInFlight = new Map<string, Promise<NativeSessionSummary[]>>()
 const sessionSnapshots = new Map<string, SessionSummary>()
@@ -81,11 +91,15 @@ function startRequest(value: unknown): StartSessionRequest {
   const input = value as Record<string, unknown>
   const agentKind = validatedAgentKind(input.agentKind)
   const initialExecutable = executable(agentKind, input.executable)
-  const initialArgs = stringArray(input.args, 'args')
+  const initialArgs = terminalScrollbackArgs(agentKind, stringArray(input.args, 'args'))
   const nativeSessionId = input.nativeSessionId === undefined
     ? undefined
     : text(input.nativeSessionId, 'nativeSessionId', 512)
-  const suppliedRecovery = recovery(agentKind, input.recovery)
+  const suppliedRecoveryInput = recovery(agentKind, input.recovery)
+  const suppliedRecovery = suppliedRecoveryInput ? {
+    ...suppliedRecoveryInput,
+    args: terminalScrollbackArgs(agentKind, suppliedRecoveryInput.args),
+  } : undefined
   const canonicalRecovery = nativeSessionId
     ? canonicalNativeRecovery(agentKind, nativeSessionId, initialExecutable, initialArgs, suppliedRecovery)
     : suppliedRecovery
@@ -99,7 +113,94 @@ function startRequest(value: unknown): StartSessionRequest {
     maxContinueRetries: maxContinueRetries(input.maxContinueRetries),
     ...(nativeSessionId ? { nativeSessionId } : {}),
     ...(canonicalRecovery ? { recovery: canonicalRecovery } : {}),
+    ...(input.agentConfig === undefined ? {} : { agentConfig: agentConfigInput(input.agentConfig) }),
+    ...(input.agentProxy === undefined ? {} : { agentProxy: agentProxyInput(input.agentProxy) }),
   }
+}
+
+function agentProxyInput(value: unknown): AgentProxyInput {
+  if (!value || typeof value !== 'object') throw new Error('代理配置格式无效')
+  const input = value as Record<string, unknown>
+  if (input.enabled !== true) return { enabled: false, host: '127.0.0.1', port: 7897 }
+  if (input.protocol !== undefined && input.protocol !== 'http') throw new Error('当前只支持 HTTP 代理')
+  const host = optionalConfigText(input.host, 'proxy host', 253) ?? '127.0.0.1'
+  if (!/^(?:localhost|\[[0-9a-f:]+\]|[a-z0-9.-]+)$/i.test(host)) throw new Error('代理主机格式无效')
+  if (!Number.isInteger(input.port) || (input.port as number) < 1 || (input.port as number) > 65_535) throw new Error('代理端口必须是 1 到 65535 的整数')
+  const username = optionalConfigText(input.username, 'proxy username', 512)
+  const password = optionalConfigText(input.password, 'proxy password', 4_096)
+  if (password && !username) throw new Error('填写代理密码时也需要填写用户名')
+  return {
+    enabled: true, protocol: 'http', host, port: input.port as number,
+    ...(username ? { username } : {}), ...(password ? { password } : {}),
+    ...(input.clearPassword === true ? { clearPassword: true } : {}),
+  }
+}
+
+function continueKeywordSettings(value: unknown): ContinueKeywordSettings {
+  if (!value || typeof value !== 'object') throw new Error('Continue 关键词设置格式无效')
+  const input = value as Record<string, unknown>
+  if (!Number.isInteger(input.quietSeconds) || Number(input.quietSeconds) < 3 || Number(input.quietSeconds) > 60) {
+    throw new Error('静默等待时间必须是 3 到 60 秒的整数')
+  }
+  if (!Array.isArray(input.keywords) || input.keywords.length > 50) throw new Error('Continue 关键词最多保存 50 条')
+  return {
+    enabled: input.enabled === true,
+    quietSeconds: Number(input.quietSeconds),
+    keywords: input.keywords.map((keyword, index) => text(keyword, 'keywords[' + index + ']', 200)),
+  }
+}
+
+function optionalConfigText(value: unknown, name: string, max: number): string | undefined {
+  if (value === undefined || value === '') return undefined
+  const result = text(value, name, max).trim()
+  if (!result || /[\r\n]/.test(result)) throw new Error(`Invalid ${name}`)
+  return result
+}
+
+function agentConfigInput(value: unknown): AgentConfigInput {
+  if (!value || typeof value !== 'object') throw new Error('独立配置格式无效')
+  const input = value as Record<string, unknown>
+  if (input.enabled !== true) return { enabled: false, source: 'local' }
+  const source = String(input.source)
+  if (source !== 'custom' && source !== 'ccswitch') throw new Error('独立配置来源无效')
+  const providerId = optionalConfigText(input.providerId, 'providerId', 256)
+  const providerName = optionalConfigText(input.providerName, 'providerName', 256)
+  if (source === 'ccswitch') {
+    if (!providerId) throw new Error('请选择一个 CCSwitch Provider')
+    return {
+      enabled: true,
+      source,
+      providerId,
+      ...(providerName ? { providerName } : {}),
+    }
+  }
+  const baseUrl = optionalConfigText(input.baseUrl, 'baseUrl', 2_048)
+  if (baseUrl) {
+    let parsed: URL
+    try { parsed = new URL(baseUrl) } catch { throw new Error('Base URL 不是有效地址') }
+    if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Base URL 只支持 http 或 https')
+  }
+  const apiKey = optionalConfigText(input.apiKey, 'apiKey', 8_192)
+  const model = optionalConfigText(input.model, 'model', 256)
+  const extraArgs = input.extraArgs === undefined ? [] : stringArray(input.extraArgs, 'extraArgs')
+  return {
+    enabled: true,
+    source,
+    ...(baseUrl ? { baseUrl } : {}),
+    ...(apiKey ? { apiKey } : {}),
+    ...(model ? { model } : {}),
+    extraArgs,
+    ...(input.clearApiKey === true ? { clearApiKey: true } : {}),
+    ...(providerId ? { providerId } : {}),
+    ...(providerName ? { providerName } : {}),
+  }
+}
+
+async function resolvedAgentConfig(agentKind: AgentKind, input: AgentConfigInput): Promise<AgentConfigInput> {
+  if (!input.enabled || input.source !== 'ccswitch') return input
+  if (agentKind !== 'codex' && agentKind !== 'claude') throw new Error('CCSwitch 当前仅支持 Codex 和 Claude Code')
+  if (!input.providerId) throw new Error('请选择一个 CCSwitch Provider')
+  return ccSwitchProviderReader.import(agentKind, input.providerId)
 }
 
 function validatedAgentKind(value: unknown): AgentKind {
@@ -176,9 +277,6 @@ function auditSessionTransition(sessionId: string): void {
     recordAudit({ level: 'error', category: 'session', action: 'session_failed', message: `${current.displayName} 运行失败`, sessionId })
   } else if (current.status === 'stopped' && !current.userStopRequested) {
     recordAudit({ level: 'info', category: 'session', action: 'session_interrupted', message: `${current.displayName} 已由用户中断`, sessionId })
-  } else if (previous.status === 'needs_approval' && current.status === 'running') {
-    const subject = approvalSubject(previous.pendingApprovalCommand)
-    recordAudit({ level: 'info', category: 'approval', action: 'approval_manual', message: `已人工批准 ${subject}`, sessionId, details: { subject } })
   }
 }
 
@@ -192,6 +290,12 @@ function flushOutputEvents(): void {
       if (!window.isDestroyed()) window.webContents.send(IPC_CHANNELS.event, { type: 'output', ...event })
     }
   }
+}
+
+function approvalRequestId(value: unknown): string {
+  const candidate = text(value, 'approval request id', 160)
+  if (!/^(?:terminal:)?[a-zA-Z0-9-]+$/.test(candidate)) throw new Error('授权请求标识无效，请刷新后重试')
+  return candidate
 }
 
 function broadcast(event: ManagerEvent): void {
@@ -212,8 +316,31 @@ function broadcast(event: ManagerEvent): void {
 }
 
 function recordAudit(entry: NewAuditEntry): void {
-  auditStore.append(entry)
+  const session = entry.sessionId
+    ? sessionSnapshots.get(entry.sessionId) ?? controller.listSessions().find((item) => item.sessionId === entry.sessionId)
+    : undefined
+  const details = session
+    ? { ...entry.details, displayName: session.displayName, agentKind: session.agentKind, workspace: session.workspace }
+    : entry.details
+  auditStore.append({ ...entry, ...(details ? { details } : {}) })
   broadcast({ type: 'audit-changed' })
+}
+
+async function restoreNativeSessionProvider(session: SessionSummary | undefined): Promise<boolean> {
+  if (!session || session.agentKind !== 'codex' || !session.nativeSessionId) return true
+  try {
+    const provider = await readCodexGlobalProvider()
+    const executable = resolveExecutableForPty('codex')
+    const fallback = await migrateCodexSessionProvider(session.nativeSessionId, provider.id)
+    if (fallback.changed) await migrateCodexProviderOfficial({ executable, sessionId: session.nativeSessionId, providerId: provider.id, cwd: session.workspace })
+    if (fallback.changed) {
+      recordAudit({ level: 'info', category: 'session', action: 'native_provider_restored', message: '已将 Codex 历史会话恢复为本机全局 Provider', sessionId: session.sessionId, details: { provider: provider.id } })
+    }
+    return true
+  } catch (error) {
+    recordAudit({ level: 'error', category: 'session', action: 'native_provider_restore_failed', message: 'Codex 历史会话 Provider 恢复失败，已保留 Manager 会话以便重试', sessionId: session.sessionId, details: { error: error instanceof Error ? error.message : String(error) } })
+    return false
+  }
 }
 
 function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
@@ -225,13 +352,6 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
     trustedRenderer(event)
     return controller.terminalReplay(sessionId(id))
   })
-  ipcMain.handle(IPC_CHANNELS.terminalHistory, async (event, id: unknown) => {
-    trustedRenderer(event)
-    const requestedId = sessionId(id)
-    const session = controller.listSessions().find((candidate) => candidate.sessionId === requestedId)
-    if (!session) throw new Error('Agent 会话不存在')
-    return readNativeSessionTranscript(session.agentKind, session.nativeSessionId)
-  })
   ipcMain.handle(IPC_CHANNELS.listAuditEntries, (event) => {
     trustedRenderer(event)
     return auditStore.list()
@@ -239,19 +359,50 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
   ipcMain.handle(IPC_CHANNELS.startSession, async (event, request: unknown) => {
     trustedRenderer(event)
     const validated = startRequest(request)
-    recordAudit({ level: 'info', category: 'session', action: 'session_start_requested', message: `正在启动 ${validated.displayName}`, details: { agentKind: validated.agentKind, workspace: validated.workspace } })
+    recordAudit({ level: 'info', category: 'session', action: 'session_start_requested', message: `正在启动 ${validated.displayName}`, details: { displayName: validated.displayName, agentKind: validated.agentKind, workspace: validated.workspace } })
+    let createdProfileId: string | undefined
+    let createdProxyId: string | undefined
     try {
-      const session = await controller.startSession(validated)
+      const agentConfig = validated.agentConfig && !('hasApiKey' in validated.agentConfig)
+        ? await agentConfigurationStore.save(await resolvedAgentConfig(validated.agentKind, validated.agentConfig))
+        : AgentConfigurationStore.localSummary()
+      createdProfileId = agentConfig.profileId
+      const agentProxy = validated.agentProxy && !('hasPassword' in validated.agentProxy)
+        ? await agentProxyStore.save(validated.agentProxy)
+        : undefined
+      createdProxyId = agentProxy?.proxyId
+      const session = await controller.startSession({ ...validated, agentConfig, ...(agentProxy ? { agentProxy } : {}) })
       recordAudit({ level: 'info', category: 'session', action: 'session_started', message: `${session.displayName} 已启动`, sessionId: session.sessionId })
       return session
     } catch (error) {
-      recordAudit({ level: 'error', category: 'session', action: 'session_start_failed', message: `${validated.displayName} 启动失败`, details: { error: error instanceof Error ? error.message : String(error) } })
+      if (createdProfileId) await agentConfigurationStore.remove(createdProfileId).catch(() => undefined)
+      if (createdProxyId) await agentProxyStore.remove(createdProxyId).catch(() => undefined)
+      recordAudit({ level: 'error', category: 'session', action: 'session_start_failed', message: `${validated.displayName} 启动失败`, details: { displayName: validated.displayName, agentKind: validated.agentKind, workspace: validated.workspace, error: error instanceof Error ? error.message : String(error) } })
       throw error
     }
   })
   ipcMain.handle(IPC_CHANNELS.write, (event, id: unknown, data: unknown) => {
     trustedRenderer(event)
-    return controller.write(sessionId(id), terminalInput(data))
+    const target = sessionId(id)
+    const input = terminalInput(data)
+    const before = controller.listPendingApprovals().filter((request) => request.sessionId === target)
+    const result = controller.write(target, input)
+    const afterIds = new Set(controller.listPendingApprovals().filter((request) => request.sessionId === target).map((request) => request.requestId))
+    const handled = before.find((request) => !afterIds.has(request.requestId))
+    if (handled) {
+      recordAudit({
+        level: 'info', category: 'approval', action: 'approval_manual_terminal',
+        message: '已在原生终端批准 ' + (handled.toolName ?? approvalSubject(handled.command)),
+        sessionId: target,
+        details: {
+          requestId: handled.requestId,
+          toolName: handled.toolName ?? approvalSubject(handled.command),
+          ...(handled.command ? { command: handled.command } : {}),
+          risk: handled.risk,
+        },
+      })
+    }
+    return result
   })
   ipcMain.handle(IPC_CHANNELS.resize, (event, id: unknown, cols: unknown, rows: unknown) => {
     trustedRenderer(event)
@@ -263,6 +414,7 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
     const target = sessionId(id)
     recordAudit({ level: 'info', category: 'session', action: 'session_stop_requested', message: '正在停止 Agent', sessionId: target })
     await controller.stopSession(target)
+    await restoreNativeSessionProvider(controller.listSessions().find((session) => session.sessionId === target))
     recordAudit({ level: 'info', category: 'session', action: 'session_stopped', message: 'Agent 已停止', sessionId: target })
   })
   ipcMain.handle(IPC_CHANNELS.restartSession, async (event, id: unknown) => {
@@ -299,13 +451,183 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
   ipcMain.handle(IPC_CHANNELS.removeSession, async (event, id: unknown) => {
     trustedRenderer(event)
     const target = sessionId(id)
+    const removed = controller.listSessions().find((session) => session.sessionId === target)
+    if (!await restoreNativeSessionProvider(removed)) throw new Error('Codex 历史会话尚未恢复，暂不删除 Manager 条目，请稍后重试')
     await controller.removeSession(target)
-    recordAudit({ level: 'info', category: 'session', action: 'session_removed', message: 'Agent 已从总览删除', sessionId: target })
+    if (removed?.agentConfig?.profileId) await agentConfigurationStore.remove(removed.agentConfig.profileId)
+    if (removed?.agentProxy?.proxyId) await agentProxyStore.remove(removed.agentProxy.proxyId)
+    recordAudit({
+      level: 'info', category: 'session', action: 'session_removed', message: 'Agent 已从总览删除', sessionId: target,
+      ...(removed ? { details: { displayName: removed.displayName, agentKind: removed.agentKind, workspace: removed.workspace } } : {}),
+    })
   })
   ipcMain.handle(IPC_CHANNELS.approveSession, async (event, id: unknown) => {
     trustedRenderer(event)
     const target = sessionId(id)
+    const request = controller.listPendingApprovals().find((item) => item.sessionId === target)
     await controller.approveSession(target)
+    recordAudit({
+      level: 'info', category: 'approval', action: 'approval_manual',
+      message: '已人工批准 ' + (request?.toolName ?? approvalSubject(request?.command)),
+      sessionId: target,
+      details: {
+        requestId: request?.requestId ?? 'legacy',
+        toolName: request?.toolName ?? approvalSubject(request?.command),
+        ...(request?.command ? { command: request.command } : {}),
+        ...(request?.agentReason ? { reason: request.agentReason } : {}),
+        ...(request?.risk ? { risk: request.risk } : {}),
+      },
+    })
+  })
+  ipcMain.handle(IPC_CHANNELS.renameSession, async (event, id: unknown, name: unknown) => {
+    trustedRenderer(event)
+    const target = sessionId(id)
+    const before = controller.listSessions().find((session) => session.sessionId === target)?.displayName ?? 'Agent'
+    const displayName = text(name, 'displayName', 120).trim()
+    if (!displayName || /[\r\n]/.test(displayName)) throw new Error('Agent 名称应为 1 到 120 个字符')
+    await controller.renameSession(target, displayName)
+    recordAudit({ level: 'info', category: 'session', action: 'session_renamed', message: `${before} 已重命名为 ${displayName}`, sessionId: target, details: { before, after: displayName } })
+  })
+  ipcMain.handle(IPC_CHANNELS.updateSessionConfig, async (event, id: unknown, value: unknown) => {
+    trustedRenderer(event)
+    const target = sessionId(id)
+    const input = agentConfigInput(value)
+    const session = controller.listSessions().find((item) => item.sessionId === target)
+    if (!session) throw new Error('Agent 不存在或已删除')
+    const existingProfileId = session.agentConfig?.profileId
+    const summary = input.enabled
+      ? await agentConfigurationStore.save(await resolvedAgentConfig(session.agentKind, input), existingProfileId)
+      : AgentConfigurationStore.localSummary()
+    await controller.updateSessionConfig(target, summary)
+    if (!summary.enabled && existingProfileId) await agentConfigurationStore.remove(existingProfileId)
+    recordAudit({
+      level: 'info', category: 'session', action: 'session_config_updated',
+      message: summary.enabled ? `${session.displayName} 已保存独立配置，将在下次启动时生效` : `${session.displayName} 已恢复继承本机配置`,
+      sessionId: target,
+      details: { source: summary.source, model: summary.model ?? 'inherit', hasApiKey: summary.hasApiKey, ...(summary.providerId ? { providerId: summary.providerId } : {}), ...(summary.providerName ? { providerName: summary.providerName } : {}) },
+    })
+  })
+  ipcMain.handle(IPC_CHANNELS.updateSessionProxy, async (event, id: unknown, value: unknown) => {
+    trustedRenderer(event)
+    const target = sessionId(id)
+    const input = agentProxyInput(value)
+    const session = controller.listSessions().find((item) => item.sessionId === target)
+    if (!session) throw new Error('Agent 不存在或已删除')
+    const existingProxyId = session.agentProxy?.proxyId
+    const summary = input.enabled ? await agentProxyStore.save(input, existingProxyId) : undefined
+    await controller.updateSessionProxy(target, summary)
+    if (!summary && existingProxyId) await agentProxyStore.remove(existingProxyId)
+    recordAudit({
+      level: 'info', category: 'session', action: 'session_proxy_updated',
+      message: summary ? `${session.displayName} 已保存 HTTP 代理，将在下次启动时生效` : `${session.displayName} 已关闭代理`,
+      sessionId: target,
+      details: summary ? { protocol: summary.protocol, host: summary.host, port: summary.port, authenticated: Boolean(summary.username || summary.hasPassword) } : { enabled: false },
+    })
+  })
+  ipcMain.handle(IPC_CHANNELS.setFullAutoMode, async (event, id: unknown, value: unknown) => {
+    trustedRenderer(event)
+    const target = sessionId(id)
+    if (typeof value !== 'boolean') throw new Error('全自动模式状态无效')
+    const session = controller.listSessions().find((item) => item.sessionId === target)
+    if (!session) throw new Error('Agent 不存在或已删除')
+    await controller.setFullAutoMode(target, value)
+    recordAudit({
+      level: value ? 'warning' : 'info',
+      category: 'approval',
+      action: value ? 'full_auto_enabled' : 'full_auto_disabled',
+      message: value ? session.displayName + ' 已开启全自动模式' : session.displayName + ' 已关闭全自动模式',
+      sessionId: target,
+      details: { enabled: value, deletionAllowed: false, workspaceEscapeAllowed: false },
+    })
+  })
+  ipcMain.handle(IPC_CHANNELS.listCCSwitchProviders, (event, kind: unknown) => {
+    trustedRenderer(event)
+    const agentKind = validatedAgentKind(kind)
+    if (agentKind !== 'codex' && agentKind !== 'claude') throw new Error('CCSwitch 当前仅支持 Codex 和 Claude Code')
+    return ccSwitchProviderReader.list(agentKind)
+  })
+  ipcMain.handle(IPC_CHANNELS.getContinueKeywordSettings, (event) => {
+    trustedRenderer(event)
+    return continueKeywordStore.getSettings()
+  })
+  ipcMain.handle(IPC_CHANNELS.updateContinueKeywordSettings, async (event, value: unknown) => {
+    trustedRenderer(event)
+    const settings = await continueKeywordStore.update(continueKeywordSettings(value))
+    recordAudit({
+      level: settings.enabled ? 'warning' : 'info',
+      category: 'rule',
+      action: 'continue_keyword_settings_updated',
+      message: settings.enabled ? '已开启关键词 Continue（' + settings.keywords.length + ' 条规则）' : '已关闭关键词 Continue',
+      details: { enabled: settings.enabled, keywordCount: settings.keywords.length, quietSeconds: settings.quietSeconds },
+    })
+    return settings
+  })
+  ipcMain.handle(IPC_CHANNELS.listPendingApprovals, (event) => {
+    trustedRenderer(event)
+    return controller.listPendingApprovals()
+  })
+  ipcMain.handle(IPC_CHANNELS.approveRequest, async (event, id: unknown) => {
+    trustedRenderer(event)
+    const requestId = approvalRequestId(id)
+    const request = controller.listPendingApprovals().find((item) => item.requestId === requestId)
+    await controller.approveRequest(requestId)
+    recordAudit({
+      level: 'info', category: 'approval', action: 'approval_manual',
+      message: '已人工批准 ' + (request?.toolName ?? approvalSubject(request?.command)),
+      sessionId: request?.sessionId,
+      details: {
+        requestId,
+        toolName: request?.toolName ?? approvalSubject(request?.command),
+        ...(request?.command ? { command: request.command } : {}),
+        ...(request?.risk ? { risk: request.risk } : {}),
+      },
+    })
+  })
+  ipcMain.handle(IPC_CHANNELS.approveAndRememberRequest, async (event, id: unknown) => {
+    trustedRenderer(event)
+    const requestId = approvalRequestId(id)
+    const request = controller.listPendingApprovals().find((item) => item.requestId === requestId)
+    await controller.approveAndRememberRequest(requestId)
+    recordAudit({
+      level: 'info', category: 'approval', action: 'approval_remembered',
+      message: '已批准并记为安全命令：' + (request?.toolName ?? approvalSubject(request?.command)),
+      sessionId: request?.sessionId,
+      details: {
+        requestId,
+        toolName: request?.toolName ?? approvalSubject(request?.command),
+        ...(request?.command ? { command: request.command } : {}),
+        ...(request?.agentReason ? { reason: request.agentReason } : {}),
+        ...(request?.risk ? { originalRisk: request.risk } : {}),
+      },
+    })
+  })
+  ipcMain.handle(IPC_CHANNELS.rejectRequest, async (event, id: unknown) => {
+    trustedRenderer(event)
+    const requestId = approvalRequestId(id)
+    const request = controller.listPendingApprovals().find((item) => item.requestId === requestId)
+    await controller.rejectRequest(requestId)
+    recordAudit({
+      level: 'warning', category: 'approval', action: 'approval_rejected',
+      message: '已拒绝 ' + (request?.toolName ?? approvalSubject(request?.command)),
+      sessionId: request?.sessionId,
+      details: {
+        requestId,
+        toolName: request?.toolName ?? approvalSubject(request?.command),
+        ...(request?.command ? { command: request.command } : {}),
+        ...(request?.agentReason ? { reason: request.agentReason } : {}),
+        ...(request?.risk ? { risk: request.risk } : {}),
+      },
+    })
+  })
+  ipcMain.handle(IPC_CHANNELS.approveAllPending, (event) => {
+    trustedRenderer(event)
+    const result = controller.approveAllPending()
+    recordAudit({
+      level: result.failed > 0 ? 'warning' : 'info', category: 'approval', action: 'approval_bulk',
+      message: '批量审批完成：批准 ' + result.approved + ' 项，跳过 ' + result.skipped + ' 项，失败 ' + result.failed + ' 项',
+      details: { approved: result.approved, skipped: result.skipped, failed: result.failed },
+    })
+    return result
   })
   ipcMain.handle(IPC_CHANNELS.acceptApprovalSuggestion, (event, id: unknown) => {
     trustedRenderer(event)
@@ -355,9 +677,10 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
 
 function createWindow(): BrowserWindow {
   const window = new BrowserWindow({
-    width: 1280, height: 820, minWidth: 860, minHeight: 600, backgroundColor: '#0b1020',
+    width: 1280, height: 820, minWidth: 860, minHeight: 600, backgroundColor: '#111719', autoHideMenuBar: true,
     webPreferences: { preload: join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   })
+  window.setMenuBarVisibility(false)
   window.on('close', (event) => {
     if (!quitting) { event.preventDefault(); window.hide() }
   })
@@ -408,7 +731,24 @@ function createTray(): void {
 }
 
 void app.whenReady().then(async () => {
-  const manager = new SessionHostManager({ runtimeDir: join(app.getPath('userData'), 'runtime', 'session-hosts'), hostEntry: join(__dirname, 'session-host.js') })
+  agentConfigurationStore = await AgentConfigurationStore.load(join(app.getPath('userData'), 'agent-configurations.json'), safeStorage)
+  agentProxyStore = await AgentProxyStore.load(join(app.getPath('userData'), 'agent-proxies.json'), safeStorage)
+  continueKeywordStore = await ContinueKeywordStore.load(join(app.getPath('userData'), 'continue-keywords.json'))
+  const manager = new SessionHostManager({
+    runtimeDir: join(app.getPath('userData'), 'runtime', 'session-hosts'),
+    hostEntry: join(__dirname, 'session-host.js'),
+    resolveAgentConfig: async (profileId, agentKind, args) => {
+      const profile = agentConfigurationStore.get(profileId)
+      if (!profile) throw new Error('找不到该 Agent 的独立配置，请重新保存配置')
+      const codexProvider = agentKind === 'codex' ? await readCodexGlobalProvider() : undefined
+      return applyAgentLaunchProfile(agentKind, args, profile, codexProvider)
+    },
+    resolveAgentProxy: async (proxyId) => {
+      const proxy = agentProxyStore.get(proxyId)
+      if (!proxy) throw new Error('找不到该 Agent 的代理配置，请重新保存代理')
+      return environmentForAgentProxy(proxy)
+    },
+  })
   const approvalPolicy = await ApprovalPolicyStore.load(join(app.getPath('userData'), 'approval-policy.json'))
   const recoveryPolicy = await RecoveryPolicyStore.load(join(app.getPath('userData'), 'recovery-policy.json'))
   auditStore = await ActivityAuditStore.load(join(app.getPath('userData'), 'activity-audit.json'))
@@ -428,7 +768,47 @@ void app.whenReady().then(async () => {
       recordAudit({ level: 'info', category: 'rule', action: 'learned_rule_accepted', message: '已接受学习建议并添加自动批准规则' })
     },
   }
-  controller = new SessionController(manager, broadcast, { discover: discoverNativeSessions }, auditedApprovalPolicy, recoveryPolicy)
+  const fullAutoActivity = {
+    approved(request: ApprovalRequest) {
+      recordAudit({
+        level: 'warning', category: 'approval', action: 'full_auto_approved',
+        message: '全自动模式已批准 ' + (request.toolName ?? approvalSubject(request.command)),
+        sessionId: request.sessionId,
+        details: {
+          requestId: request.requestId,
+          toolName: request.toolName ?? approvalSubject(request.command),
+          ...(request.command ? { command: request.command } : {}),
+          ...(request.agentReason ? { reason: request.agentReason } : {}),
+          risk: request.risk,
+          decision: 'full-auto',
+        },
+      })
+    },
+    blocked(request: ApprovalRequest, reason: string) {
+      recordAudit({
+        level: 'warning', category: 'approval', action: 'full_auto_blocked',
+        message: '全自动模式已拦截高风险操作：' + (request.toolName ?? approvalSubject(request.command)),
+        sessionId: request.sessionId,
+        details: {
+          requestId: request.requestId,
+          toolName: request.toolName ?? approvalSubject(request.command),
+          ...(request.command ? { command: request.command } : {}),
+          reason,
+          risk: request.risk,
+          decision: 'blocked',
+        },
+      })
+    },
+  }
+  const recoveryActivity = {
+    keywordMatched(sessionId: string, keyword: string) {
+      recordAudit({ level: 'warning', category: 'recovery', action: 'continue_keyword_matched', message: '命中 Continue 关键词，正在等待输出静默', sessionId, details: { keyword, quietSeconds: continueKeywordStore.getSettings().quietSeconds } })
+    },
+    keywordContinued(sessionId: string, keyword: string) {
+      recordAudit({ level: 'warning', category: 'recovery', action: 'continue_keyword_sent', message: '输出持续静默，已按关键词规则尝试 Continue 一次', sessionId, details: { keyword, attempt: 1 } })
+    },
+  }
+  controller = new SessionController(manager, broadcast, { discover: discoverNativeSessions }, auditedApprovalPolicy, recoveryPolicy, fullAutoActivity, continueKeywordStore, recoveryActivity)
   registerIpc(approvalPolicy)
   await controller.restoreLiveHosts()
   createWindow(); createTray()

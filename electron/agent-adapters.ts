@@ -1,8 +1,10 @@
 import type { AgentKind, RecoveryRecipe } from '../src/shared/manager-api'
+import { terminalScrollbackArgs } from './start-request-policy'
 
 export interface AgentObservation {
   approvalRequired: boolean
   approvalCommand?: string
+  approvalReason?: string
   ready: boolean
   recoverableError?: {
     code: 'model-capacity'
@@ -17,6 +19,7 @@ export interface AgentAdapter {
   acknowledgeUserInput(handledApproval?: boolean): void
   resetForRecovery(): void
   approvalInput(): string
+  rejectionInput(): string
   recoveryRecipe(executable: string, nativeSessionId: string): RecoveryRecipe | undefined
 }
 
@@ -96,6 +99,7 @@ abstract class EvidenceAdapter implements AgentAdapter {
   }
 
   approvalInput(): string { return '\r' }
+  rejectionInput(): string { return '\x1b' }
 
   private hasClassificationSignal(value: string): boolean {
     if (this.kind === 'generic' || this.kind === 'pi') return value.trim().length > 0
@@ -173,12 +177,17 @@ export function extractApprovalCommand(evidence: string): string | undefined {
   return execNotification >= 0 ? 'tool:Shell' : undefined
 }
 
+export function extractApprovalReason(evidence: string): string | undefined {
+  const matches = [...evidence.matchAll(/(?:^|\n)\s*(?:Reason|原因)\s*[:：]\s*([^\n]{1,2048})/gi)]
+  return matches.at(-1)?.[1]?.trim()
+}
+
 class CodexAdapter extends EvidenceAdapter {
   readonly kind = 'codex' as const
   readonly supportsNativeSessions = true
 
   recoveryRecipe(executable: string, nativeSessionId: string): RecoveryRecipe {
-    return { executable, args: ['resume', nativeSessionId] }
+    return { executable, args: terminalScrollbackArgs('codex', ['resume', nativeSessionId]) }
   }
 
   protected classify(evidence: string): AgentObservation {
@@ -194,6 +203,7 @@ class CodexAdapter extends EvidenceAdapter {
       /allow command execution/i,
     ])
     const approvalCommand = approvalPhrase ? extractApprovalCommand(evidence) : undefined
+    const approvalReason = approvalPhrase ? extractApprovalReason(evidence) : undefined
     const approvalRequired = approvalPhrase
       && ((approvalCommand !== undefined && approvalCommand !== 'tool:Shell') || hasApprovalInteraction(evidence))
     const hasIdentity = /(?:openai\s+)?codex/i.test(evidence)
@@ -202,6 +212,7 @@ class CodexAdapter extends EvidenceAdapter {
     return {
       approvalRequired,
       ...(approvalCommand ? { approvalCommand } : {}),
+      ...(approvalReason ? { approvalReason } : {}),
       ready: !approvalRequired && hasIdentity && hasPrompt,
     }
   }
@@ -224,6 +235,7 @@ class ClaudeAdapter extends EvidenceAdapter {
       /do you want to allow (?:this|the) (?:tool|command)/i,
     ])
     const approvalCommand = approvalPhrase ? extractApprovalCommand(evidence) : undefined
+    const approvalReason = approvalPhrase ? extractApprovalReason(evidence) : undefined
     const approvalRequired = approvalPhrase && (approvalCommand !== undefined || hasApprovalInteraction(evidence))
     const hasIdentity = /claude\s+code/i.test(evidence)
     const hasPrompt = /(?:^|[\r\n])\s*[❯›]\s*(?:$|[\r\n])/m.test(evidence)
@@ -231,6 +243,7 @@ class ClaudeAdapter extends EvidenceAdapter {
     return {
       approvalRequired,
       ...(approvalCommand ? { approvalCommand } : {}),
+      ...(approvalReason ? { approvalReason } : {}),
       ready: !approvalRequired && hasIdentity && hasPrompt,
     }
   }
