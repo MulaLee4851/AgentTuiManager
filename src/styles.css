@@ -122,8 +122,7 @@ button:disabled { cursor: default; opacity: .55; }
 .workspace-scope-toggle[aria-checked='true'] i { background: #286b53; }
 .workspace-scope-toggle[aria-checked='true'] i::after { background: var(--green); transform: translateX(11px); }
 
-.terminal-grid { min-height: 0; display: grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); grid-template-rows: repeat(2, minmax(190px, 1fr)); gap: 8px; padding: 8px; overflow: auto; }
-.terminal-grid-count-5, .terminal-grid-count-6 { grid-template-columns: repeat(3, minmax(240px, 1fr)); }
+.terminal-grid { min-height: 0; display: grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); grid-auto-rows: minmax(220px, 1fr); gap: 8px; padding: 8px; overflow-y: auto; overflow-x: hidden; }
 .terminal-grid-detail { display: flex; flex: 1; width: 100%; height: 100%; min-height: 0; padding: 0; overflow: hidden; }
 .terminal-card { position: relative; min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); border: 1px solid var(--line); border-radius: 7px; }
 .terminal-card.terminal-card-hidden { display: none; }
