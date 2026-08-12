@@ -30,6 +30,12 @@ const terminalReplay = new TerminalReplayBuffer()
 let terminalStateReplay: TerminalStateReplay | undefined
 let shuttingDown = false
 let finalizing = false
+let managerSocket: Socket | undefined
+let managerId: string | undefined
+let managerLeaseMs = 15_000
+let managerLastHeartbeat = 0
+let preserveOnManagerDisconnect = false
+let managerLeaseTimer: ReturnType<typeof setInterval> | undefined
 
 async function atomicWriteJson(path: string, value: unknown): Promise<void> {
   const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`
@@ -60,13 +66,14 @@ function shutdown(exitCode: number): void {
   }, 50).unref()
 }
 
-async function finalizeExit(exitCode: number, signal?: number): Promise<void> {
+async function finalizeExit(exitCode: number, signal?: number, reason: HostExitFact['reason'] = 'process-exit'): Promise<void> {
   if (finalizing) return
   finalizing = true
   const fact: HostExitFact = {
     hostId,
     exitCode,
     ...(signal === undefined ? {} : { signal }),
+    reason,
     exitedAt: new Date().toISOString(),
   }
   try {
@@ -81,6 +88,22 @@ async function finalizeExit(exitCode: number, signal?: number): Promise<void> {
     terminalStateReplay = undefined
     shutdown(exitCode === 0 ? 0 : 1)
   }
+}
+
+function ensureManagerLeaseTimer(): void {
+  if (managerLeaseTimer) return
+  managerLeaseTimer = setInterval(() => {
+    if (!terminal || shuttingDown || preserveOnManagerDisconnect || !managerId) return
+    if (Date.now() - managerLastHeartbeat <= managerLeaseMs) return
+    const ownedTerminal = terminal
+    managerId = undefined
+    managerSocket = undefined
+    ownedTerminal.kill()
+    setTimeout(() => {
+      if (terminal === ownedTerminal && !finalizing) void finalizeExit(1, undefined, 'manager-lease-expired')
+    }, 2_000).unref()
+  }, 1_000)
+  managerLeaseTimer.unref()
 }
 
 function hookCommand(): string {
@@ -139,6 +162,26 @@ function codexArgs(args: string[]): string[] {
   ]
 }
 
+// Codex builds its scrollback by scrolling a DECSTBM region above the inline composer
+// (--no-alt-screen). The ConPTY built into Windows drops scroll regions and repaints the
+// screen in place, so those lines never reach the consumer as scrollback and the terminal
+// has nothing to scroll. node-pty's bundled conpty.dll forwards scroll regions intact and
+// also emits far less repaint traffic. It is marked experimental, so fall back to the
+// system ConPTY if it cannot be loaded rather than failing the session start.
+function spawnAgentTerminal(
+  agentKind: Extract<HostCommand, { type: 'start' }>['agentKind'],
+  executable: string,
+  args: string[],
+  options: pty.IWindowsPtyForkOptions,
+): pty.IPty {
+  if (agentKind !== 'codex') return pty.spawn(executable, args, options)
+  try {
+    return pty.spawn(executable, args, { ...options, useConptyDll: true })
+  } catch {
+    return pty.spawn(executable, args, options)
+  }
+}
+
 function startTerminal(socket: Socket, command: Extract<HostCommand, { type: 'start' }>): void {
   if (terminal) {
     send(socket, { type: 'error', message: 'Host already owns a PTY' })
@@ -153,7 +196,7 @@ function startTerminal(socket: Socket, command: Extract<HostCommand, { type: 'st
       : command.agentKind === 'codex'
         ? codexArgs(command.args)
         : command.args
-    terminal = pty.spawn(command.executable, args, {
+    const spawnOptions: pty.IWindowsPtyForkOptions = {
       cwd: command.cwd,
       cols: command.cols,
       rows: command.rows,
@@ -167,7 +210,8 @@ function startTerminal(socket: Socket, command: Extract<HostCommand, { type: 'st
       // Codex's Windows inline viewport needs ConPTY to inherit the cursor anchor;
       // without this it falls back to a 30-row repaint with no terminal scrollback.
       ...(command.agentKind === 'codex' ? { conptyInheritCursor: true } : {}),
-    })
+    }
+    terminal = spawnAgentTerminal(command.agentKind, command.executable, args, spawnOptions)
     terminalStateReplay = command.agentKind === 'codex'
       ? new TerminalStateReplay(command.cols, command.rows, 10_000, (data) => terminal?.write(data))
       : undefined
@@ -237,7 +281,28 @@ function handleCommand(socket: Socket, command: HostCommand): void {
       terminal?.kill()
       if (!terminal) shutdown(0)
       break
-    case 'ping': send(socket, { type: 'pong' }); break
+    case 'claim-manager':
+      managerSocket = socket
+      managerId = command.managerId
+      managerLeaseMs = Math.max(5_000, Math.min(60_000, command.leaseMs))
+      managerLastHeartbeat = Date.now()
+      preserveOnManagerDisconnect = false
+      ensureManagerLeaseTimer()
+      break
+    case 'manager-heartbeat':
+      if (socket === managerSocket && command.managerId === managerId) managerLastHeartbeat = Date.now()
+      break
+    case 'preserve-on-disconnect':
+      if (socket === managerSocket && command.managerId === managerId) {
+        preserveOnManagerDisconnect = true
+        managerId = undefined
+        managerSocket = undefined
+      }
+      break
+    case 'ping': send(socket, {
+      type: 'pong',
+      ownership: preserveOnManagerDisconnect ? 'preserved' : managerId ? 'managed' : 'unclaimed',
+    }); break
   }
 }
 
@@ -263,6 +328,7 @@ const server = net.createServer((socket) => {
   socket.on('error', () => undefined)
   socket.on('close', () => {
     clients.delete(socket)
+    if (socket === managerSocket) managerSocket = undefined
     for (const [requestId, candidate] of permissionHookSockets) {
       if (candidate === socket) permissionHookSockets.delete(requestId)
     }
