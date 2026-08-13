@@ -49,6 +49,13 @@ abstract class EvidenceAdapter implements AgentAdapter {
   private classificationTail = ''
   private handledApprovalSubject: string | undefined
   private lastApprovalSubject: string | undefined
+  // The command reported for the approval that is currently on screen. Candidate
+  // extraction picks whichever match sits last in the evidence, and the evidence keeps
+  // growing as the TUI repaints, so the same prompt can yield a different command from
+  // one frame to the next. The controller treats a changed command as a brand new
+  // request, which is how one approval turned into several. Hold the first reading
+  // until the prompt is answered or goes away.
+  private pendingApprovalCommand: string | undefined
 
   observeOutput(data: string): AgentObservation {
     const output = terminalText(data)
@@ -58,11 +65,20 @@ abstract class EvidenceAdapter implements AgentAdapter {
     this.evidence = `${this.evidence}${output}`.slice(-MAX_EVIDENCE_CHARACTERS)
     const classificationWindow = `${this.classificationTail}${output}`
     this.classificationTail = classificationWindow.slice(-512)
-    const observation = this.hasClassificationSignal(classificationWindow)
+    let observation = this.hasClassificationSignal(classificationWindow)
       ? this.classify(this.evidence)
       : { ready: false, approvalRequired: false }
-    const subject = observation.approvalCommand ?? (observation.approvalRequired ? 'approval:unknown' : undefined)
     const freshApprovalSignal = /\x1b\]9;(?:Approval requested:|Codex wants to edit|Approval requested by)/i.test(data)
+    if (!observation.approvalRequired) {
+      this.pendingApprovalCommand = undefined
+    } else if (freshApprovalSignal) {
+      this.pendingApprovalCommand = observation.approvalCommand
+    } else if (this.pendingApprovalCommand !== undefined) {
+      observation = { ...observation, approvalCommand: this.pendingApprovalCommand }
+    } else if (observation.approvalCommand !== undefined) {
+      this.pendingApprovalCommand = observation.approvalCommand
+    }
+    const subject = observation.approvalCommand ?? (observation.approvalRequired ? 'approval:unknown' : undefined)
     if (this.handledApprovalSubject && observation.approvalRequired
       && subject === this.handledApprovalSubject && !freshApprovalSignal) {
       // Ignore one redraw of the prompt that was just answered. Clear the
@@ -88,6 +104,7 @@ abstract class EvidenceAdapter implements AgentAdapter {
     this.recoverableTail = ''
     this.classificationTail = ''
     this.lastApprovalSubject = undefined
+    this.pendingApprovalCommand = undefined
   }
 
   resetForRecovery(): void {
@@ -96,6 +113,7 @@ abstract class EvidenceAdapter implements AgentAdapter {
     this.classificationTail = ''
     this.handledApprovalSubject = undefined
     this.lastApprovalSubject = undefined
+    this.pendingApprovalCommand = undefined
   }
 
   approvalInput(): string { return '\r' }

@@ -157,4 +157,25 @@ describe('native agent adapters', () => {
       approvalCommand: 'cd "F:/x" && rm -f out.txt',
     })
   })
+
+  it('keeps one pending approval on a single command while the TUI repaints', () => {
+    const adapter = createAgentAdapter('claude')
+    const first = adapter.observeOutput(
+      'Claude Code\r\nDo you want to proceed?\r\nBash command\r\n rm -rf build\r\n1. Yes\r\n2. No',
+    )
+    expect(first).toMatchObject({ approvalRequired: true, approvalCommand: 'rm -rf build' })
+
+    // A repaint appends more text, which moves a different candidate to the end of the
+    // evidence. The reported command must not drift, or the controller raises a second
+    // approval request for what is still the same prompt.
+    const repaint = adapter.observeOutput('\r\nWrite file src/x.ts\r\ntool: write\r\n')
+    expect(repaint).toMatchObject({ approvalRequired: true, approvalCommand: 'rm -rf build' })
+
+    // Answering it releases the lock so the next prompt is classified from scratch.
+    adapter.acknowledgeUserInput(true)
+    const next = adapter.observeOutput(
+      'Claude Code\r\nDo you want to proceed?\r\nBash command\r\n git status\r\n1. Yes\r\n2. No',
+    )
+    expect(next).toMatchObject({ approvalRequired: true, approvalCommand: 'git status' })
+  })
 })
