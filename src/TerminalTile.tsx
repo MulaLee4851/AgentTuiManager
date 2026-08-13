@@ -54,9 +54,14 @@ interface TerminalTileProps {
   onOpen?: () => void
   onEdit?: () => void
   onFullAuto?: () => void
+  draggable?: boolean
+  dragging?: boolean
+  onDragStart?: () => void
+  onDragEnd?: () => void
+  onDragOver?: () => void
 }
 
-export default function TerminalTile({ session, detail = false, embedded = false, hidden = false, onOpen, onEdit, onFullAuto }: TerminalTileProps): JSX.Element {
+export default function TerminalTile({ session, detail = false, embedded = false, hidden = false, onOpen, onEdit, onFullAuto, draggable = false, dragging = false, onDragStart, onDragEnd, onDragOver }: TerminalTileProps): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
   const [actionError, setActionError] = useState('')
   const [actionBusy, setActionBusy] = useState<'restart' | 'remove'>()
@@ -475,7 +480,11 @@ export default function TerminalTile({ session, detail = false, embedded = false
 
   return (
     <article
-      className={`terminal-card${detail ? ' terminal-card-detail' : ''}${embedded ? ' terminal-card-embedded' : ''}${hidden ? ' terminal-card-hidden' : ''}`}
+      className={`terminal-card${detail ? ' terminal-card-detail' : ''}${embedded ? ' terminal-card-embedded' : ''}${hidden ? ' terminal-card-hidden' : ''}${dragging ? ' terminal-card-dragging' : ''}`}
+      draggable={draggable}
+      onDragStart={(event) => { event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('application/x-agent-session', session.sessionId); onDragStart?.() }}
+      onDragEnd={onDragEnd}
+      onDragOver={(event) => { if (!draggable) return; event.preventDefault(); onDragOver?.() }}
       data-testid={`terminal-tile-${session.sessionId}`}
       onClick={openDetail}
       onKeyDown={(event) => { if ((event.key === 'Enter' || event.key === ' ') && !detail && !embedded) openDetail() }}
