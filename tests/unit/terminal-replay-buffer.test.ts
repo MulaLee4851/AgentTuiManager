@@ -5,9 +5,18 @@ import { TerminalReplayBuffer } from '../../electron/terminal-replay-buffer'
 describe('TerminalReplayBuffer', () => {
   it('bounds the default replay retained for each xterm renderer', () => {
     const replay = new TerminalReplayBuffer()
-    replay.append('x'.repeat(600 * 1024))
+    replay.append('x'.repeat(5 * 1024 * 1024))
 
-    expect(replay.length).toBe(512 * 1024)
+    expect(replay.length).toBe(4 * 1024 * 1024)
+  })
+
+  it('keeps a long styled session that used to overflow the old 512 KiB bound', () => {
+    const replay = new TerminalReplayBuffer()
+    // ~772 KiB, the measured size of a 6,000 message Claude Code session.
+    replay.append('first-message')
+    replay.append('y'.repeat(772 * 1024))
+
+    expect(replay.snapshot().startsWith('first-message')).toBe(true)
   })
 
   it('keeps bounded output across many small appends', () => {

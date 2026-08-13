@@ -1,4 +1,10 @@
-const DEFAULT_MAX_CHARACTERS = 512 * 1024
+// The renderer keeps 10,000 lines of xterm scrollback, but this buffer bounds raw PTY
+// bytes, and heavily styled agent output costs far more per line than plain text: a
+// measured 6,000 message Claude Code session is ~772 KiB of ANSI. At the previous 512 KiB
+// the renderer was handed only the tail of a long session — roughly the last 2,000 of
+// those 6,000 messages — so reconnecting or remounting silently dropped older history.
+// 4 MiB comfortably covers the scrollback the renderer can actually display.
+const DEFAULT_MAX_CHARACTERS = 4 * 1024 * 1024
 const CHECKPOINTS = ['\x1b[3J', '\x1b[03J'] as const
 const CHECKPOINT_OVERLAP = Math.max(...CHECKPOINTS.map((value) => value.length)) - 1
 
