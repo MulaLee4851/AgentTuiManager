@@ -80,7 +80,14 @@ export default function TerminalTile({ session, detail = false, embedded = false
       convertEol: true,
       fontFamily: 'Cascadia Code, Consolas, monospace',
       fontSize: 12,
-      scrollback: 10_000,
+      // Counted in visual rows, not messages. Narrowing the tile re-wraps every long line,
+      // so the same history costs ~1.75x more rows at the grid width than at fullscreen
+      // width. At 10,000 the trip fullscreen -> overview overflowed the limit and xterm
+      // discarded the oldest rows for good, which read as "Claude Code lost its history"
+      // (its prose and code lines wrap far more than Codex's compact inline output).
+      // xterm grows the scrollback lazily, so a higher ceiling costs nothing until a
+      // session really is that long.
+      scrollback: 30_000,
       theme: { background: '#0b1011', foreground: '#cbd9d7', cursor: '#b9d2cc', selectionBackground: '#315d4e' },
     })
     terminal.open(host)
@@ -481,9 +488,6 @@ export default function TerminalTile({ session, detail = false, embedded = false
   return (
     <article
       className={`terminal-card${detail ? ' terminal-card-detail' : ''}${embedded ? ' terminal-card-embedded' : ''}${hidden ? ' terminal-card-hidden' : ''}${dragging ? ' terminal-card-dragging' : ''}`}
-      draggable={draggable}
-      onDragStart={(event) => { event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('application/x-agent-session', session.sessionId); onDragStart?.() }}
-      onDragEnd={onDragEnd}
       onDragOver={(event) => { if (!draggable) return; event.preventDefault(); onDragOver?.() }}
       data-testid={`terminal-tile-${session.sessionId}`}
       onClick={openDetail}
@@ -491,7 +495,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
       tabIndex={detail || embedded || hidden || terminalEnded ? -1 : 0}
       aria-hidden={hidden || undefined}
     >
-      <header className="terminal-card-header">
+      <header className="terminal-card-header" draggable={draggable} onDragStart={() => onDragStart?.()} onDragEnd={() => onDragEnd?.()}>
         <div className="agent-identity">
           <span className={`agent-dot agent-${session.agentKind}`}>{session.agentKind === 'claude' ? 'CL' : session.agentKind === 'pi' ? 'Pi' : session.agentKind === 'generic' ? '›_' : 'C'}</span>
           <div><h2>{session.displayName}</h2><p title={session.workspace}>{session.workspace}</p></div>
