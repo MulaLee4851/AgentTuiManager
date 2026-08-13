@@ -142,4 +142,19 @@ describe('native agent adapters', () => {
       'Do you want to approve network access to github.com?\r\n$ git fetch\r\n1. Yes, proceed\r\n2. No',
     )).toMatchObject({ approvalRequired: true, approvalCommand: 'git fetch' })
   })
+
+  it('ignores a half-painted command line and reports it once complete', () => {
+    const adapter = createAgentAdapter('codex')
+    // The approval box is still being painted: the command line has no terminator yet.
+    expect(adapter.observeOutput(
+      'Would you like to run the following command?\r\n$ cd',
+    )).toMatchObject({ approvalRequired: false })
+    // The rest of the line arrives; the full command must be reported, not the "cd" head.
+    expect(adapter.observeOutput(
+      ' "F:/x" && rm -f out.txt\r\n1. Yes, proceed\r\n2. No',
+    )).toMatchObject({
+      approvalRequired: true,
+      approvalCommand: 'cd "F:/x" && rm -f out.txt',
+    })
+  })
 })

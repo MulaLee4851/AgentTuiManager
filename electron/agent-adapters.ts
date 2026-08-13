@@ -153,11 +153,15 @@ export function extractApprovalCommand(evidence: string): string | undefined {
 
   const commandEvidence = execNotification >= 0 ? evidence.slice(execNotification) : evidence
   const candidates: Array<{ index: number; value: string }> = []
-  for (const match of commandEvidence.matchAll(/(?:^|\n)\s*\$\s+([^\n]+)/g)) {
+  // Only accept a command line that is already terminated. A TUI paints its approval box
+  // progressively, so an unterminated line can hold just the head of the command ("cd" out
+  // of `cd ... && rm -f ...`). Taking it both showed the wrong command in the approval UI
+  // and made the completed line arrive later as a second, different approval request.
+  for (const match of commandEvidence.matchAll(/(?:^|\n)\s*\$\s+([^\n]+)(?=\n)/g)) {
     const value = match[1]?.trim()
     if (value) candidates.push({ index: match.index, value })
   }
-  for (const match of commandEvidence.matchAll(/(?:^|\n)\s*Bash command\s*\n\s*([^\n]+)/gi)) {
+  for (const match of commandEvidence.matchAll(/(?:^|\n)\s*Bash command\s*\n\s*([^\n]+)(?=\n)/gi)) {
     const value = match[1]?.trim()
     if (value) candidates.push({ index: match.index, value })
   }
