@@ -9,6 +9,17 @@ const CODEX_PARENT_MARKERS = [
   'CODEX_SANDBOX_NETWORK_DISABLED',
 ] as const
 
+const COLOR_DISABLE_VARS = ['NO_COLOR', 'NODE_DISABLE_COLORS'] as const
+
+// Capability hints only. Do not invent WT_SESSION / TERM_PROGRAM — Claude treats those
+// as emulator identity and changes its input and approval profile. Do not set
+// FORCE_COLOR: truecolor-on-every-cell inflates the text-classifier window.
+export const MANAGED_TERMINAL_CAPABILITIES = {
+  TERM: 'xterm-256color',
+  COLORTERM: 'truecolor',
+  COLORFGBG: '15;0',
+} as const
+
 function keyOf(environment: NodeJS.ProcessEnv, name: string): string | undefined {
   return Object.keys(environment).find((key) => key.toLocaleLowerCase('en-US') === name.toLocaleLowerCase('en-US'))
 }
@@ -16,6 +27,17 @@ function keyOf(environment: NodeJS.ProcessEnv, name: string): string | undefined
 function remove(environment: NodeJS.ProcessEnv, name: string): void {
   const key = keyOf(environment, name)
   if (key) delete environment[key]
+}
+
+function applyManagedTerminalCapabilities(environment: NodeJS.ProcessEnv): void {
+  for (const name of COLOR_DISABLE_VARS) remove(environment, name)
+  // start.cmd inherits Windows Terminal. Leave that env byte-identical so the
+  // already-working approval hook path does not change. Packaged Explorer
+  // launches have no WT_SESSION and no TERM; fill only the missing keys.
+  if (keyOf(environment, 'WT_SESSION')) return
+  for (const [name, value] of Object.entries(MANAGED_TERMINAL_CAPABILITIES)) {
+    if (!keyOf(environment, name)) environment[name] = value
+  }
 }
 
 export function environmentForAgent(
@@ -38,5 +60,6 @@ export function environmentForAgent(
     // containing terminal scrollback instead of an alternate-screen viewport.
     environment.CLAUDE_CODE_NO_FLICKER = '0'
   }
+  applyManagedTerminalCapabilities(environment)
   return Object.fromEntries(Object.entries(environment).filter((entry): entry is [string, string] => entry[1] !== undefined))
 }

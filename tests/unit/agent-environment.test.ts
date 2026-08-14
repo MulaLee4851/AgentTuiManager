@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { environmentForAgent } from '../../electron/agent-environment'
+import { environmentForAgent, MANAGED_TERMINAL_CAPABILITIES } from '../../electron/agent-environment'
 
 describe('environmentForAgent', () => {
   it('removes parent Codex credentials and orchestration state while preserving user config discovery', () => {
@@ -19,16 +19,16 @@ describe('environmentForAgent', () => {
   })
 
   it('keeps normal user credentials when Manager was not launched by a parent Codex', () => {
-    expect(environmentForAgent('codex', { CODEX_API_KEY: 'user-key', USERPROFILE: 'C:\\Users\\me' }))
-      .toEqual({ CODEX_API_KEY: 'user-key', USERPROFILE: 'C:\\Users\\me' })
+    expect(environmentForAgent('codex', { CODEX_API_KEY: 'user-key', USERPROFILE: 'C:\\Users\\me', WT_SESSION: 'dev-wt' }))
+      .toEqual({ CODEX_API_KEY: 'user-key', USERPROFILE: 'C:\\Users\\me', WT_SESSION: 'dev-wt' })
   })
 
   it('enables Claude inline scrollback without changing other inherited settings', () => {
-    const source = { CODEX_API_KEY: 'unrelated', CODEX_THREAD_ID: 'parent' }
+    const source = { CODEX_API_KEY: 'unrelated', CODEX_THREAD_ID: 'parent', WT_SESSION: 'dev-wt' }
     expect(environmentForAgent('claude', source))
       .toEqual({ ...source, CLAUDE_CODE_NO_FLICKER: '0' })
-    expect(environmentForAgent('claude', { CLAUDE_CODE_NO_FLICKER: '1', ANTHROPIC_BASE_URL: 'https://gateway.example' }))
-      .toEqual({ CLAUDE_CODE_NO_FLICKER: '0', ANTHROPIC_BASE_URL: 'https://gateway.example' })
+    expect(environmentForAgent('claude', { CLAUDE_CODE_NO_FLICKER: '1', ANTHROPIC_BASE_URL: 'https://gateway.example', WT_SESSION: 'dev-wt' }))
+      .toEqual({ CLAUDE_CODE_NO_FLICKER: '0', ANTHROPIC_BASE_URL: 'https://gateway.example', WT_SESSION: 'dev-wt' })
     expect(environmentForAgent('generic', source)).toEqual(source)
   })
 
@@ -42,5 +42,47 @@ describe('environmentForAgent', () => {
       .toBe('C:\\old-bin;C:\\shared;C:\\Users\\me\\new-bin;D:\\machine-bin')
     expect(environmentForAgent('codex', source, options).Path).toBe(source.Path)
     expect(environmentForAgent('claude', source, options).Path).toBe(source.Path)
+  })
+
+  it('fills terminal capabilities for packaged Explorer launches without inventing WT identity', () => {
+    const result = environmentForAgent('claude', {
+      ELECTRON_RUN_AS_NODE: '1',
+      ELECTRON_NO_ASAR: '1',
+      USERPROFILE: 'C:\\Users\\me',
+    })
+    expect(result).toMatchObject({
+      ...MANAGED_TERMINAL_CAPABILITIES,
+      ELECTRON_RUN_AS_NODE: '1',
+      ELECTRON_NO_ASAR: '1',
+      USERPROFILE: 'C:\\Users\\me',
+      CLAUDE_CODE_NO_FLICKER: '0',
+    })
+    expect(result).not.toHaveProperty('WT_SESSION')
+    expect(result).not.toHaveProperty('TERM_PROGRAM')
+    expect(result).not.toHaveProperty('FORCE_COLOR')
+    expect(result).not.toHaveProperty('CLICOLOR_FORCE')
+  })
+
+  it('does not override an already-set TERM and never strips Electron-as-node', () => {
+    const result = environmentForAgent('generic', {
+      TERM: 'xterm-256color',
+      ELECTRON_RUN_AS_NODE: '1',
+      USERPROFILE: 'C:\\Users\\me',
+    })
+    expect(result.TERM).toBe('xterm-256color')
+    expect(result.ELECTRON_RUN_AS_NODE).toBe('1')
+    expect(result.COLORTERM).toBe(MANAGED_TERMINAL_CAPABILITIES.COLORTERM)
+    expect(result.COLORFGBG).toBe(MANAGED_TERMINAL_CAPABILITIES.COLORFGBG)
+  })
+
+  it('strips color-disable flags that would force a monochrome TUI', () => {
+    const result = environmentForAgent('codex', {
+      NO_COLOR: '1',
+      NODE_DISABLE_COLORS: '1',
+      USERPROFILE: 'C:\\Users\\me',
+    })
+    expect(result).not.toHaveProperty('NO_COLOR')
+    expect(result).not.toHaveProperty('NODE_DISABLE_COLORS')
+    expect(result).toMatchObject(MANAGED_TERMINAL_CAPABILITIES)
   })
 })
