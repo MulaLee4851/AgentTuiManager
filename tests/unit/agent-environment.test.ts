@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { environmentForAgent, MANAGED_TERMINAL_CAPABILITIES } from '../../electron/agent-environment'
+import {
+  CLAUDE_WINDOWS_VT_IDENTITY,
+  CODEX_TERMINAL_CAPABILITIES,
+  environmentForAgent,
+  MANAGED_TERMINAL_CAPABILITIES,
+} from '../../electron/agent-environment'
 
 describe('environmentForAgent', () => {
   it('removes parent Codex credentials and orchestration state while preserving user config discovery', () => {
@@ -52,17 +57,35 @@ describe('environmentForAgent', () => {
     })
     expect(result).toMatchObject({
       ...MANAGED_TERMINAL_CAPABILITIES,
+      ...CLAUDE_WINDOWS_VT_IDENTITY,
       ELECTRON_RUN_AS_NODE: '1',
       ELECTRON_NO_ASAR: '1',
       USERPROFILE: 'C:\\Users\\me',
       CLAUDE_CODE_NO_FLICKER: '0',
     })
-    expect(result.TERM_PROGRAM).toBe('vscode')
-    expect(result.TERM_PROGRAM_VERSION).toBe('1.110.0')
     expect(result).not.toHaveProperty('WT_SESSION')
     expect(result).not.toHaveProperty('FORCE_COLOR')
     expect(result).not.toHaveProperty('CLICOLOR_FORCE')
     expect(result).not.toHaveProperty('MSYSTEM')
+    expect(result).not.toHaveProperty('CLICOLOR')
+  })
+
+  it('gives Codex color capabilities without a vscode file-opener identity', () => {
+    const result = environmentForAgent('codex', {
+      ELECTRON_RUN_AS_NODE: '1',
+      USERPROFILE: 'C:\\Users\\me',
+    })
+    expect(result).toMatchObject({
+      ...MANAGED_TERMINAL_CAPABILITIES,
+      ...CODEX_TERMINAL_CAPABILITIES,
+      ELECTRON_RUN_AS_NODE: '1',
+      USERPROFILE: 'C:\\Users\\me',
+    })
+    expect(result).not.toHaveProperty('TERM_PROGRAM')
+    expect(result).not.toHaveProperty('TERM_PROGRAM_VERSION')
+    expect(result).not.toHaveProperty('WT_SESSION')
+    expect(result).not.toHaveProperty('FORCE_COLOR')
+    expect(result).not.toHaveProperty('CLICOLOR_FORCE')
   })
 
   it('does not override an already-set TERM and never strips Electron-as-node', () => {
@@ -85,6 +108,10 @@ describe('environmentForAgent', () => {
     })
     expect(result).not.toHaveProperty('NO_COLOR')
     expect(result).not.toHaveProperty('NODE_DISABLE_COLORS')
-    expect(result).toMatchObject(MANAGED_TERMINAL_CAPABILITIES)
+    expect(result).toMatchObject({
+      ...MANAGED_TERMINAL_CAPABILITIES,
+      ...CODEX_TERMINAL_CAPABILITIES,
+    })
+    expect(result).not.toHaveProperty('TERM_PROGRAM')
   })
 })

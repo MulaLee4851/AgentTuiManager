@@ -11,24 +11,26 @@ const CODEX_PARENT_MARKERS = [
 
 const COLOR_DISABLE_VARS = ['NO_COLOR', 'NODE_DISABLE_COLORS'] as const
 
-// Capability + the one emulator identity Claude's Windows VT allowlist accepts
-// that is not Windows Terminal. Claude.exe:
-//   windowsConsoleSupportsVirtualTerminalSequences()
-//     WT_SESSION → true
-//     TERM_PROGRAM=vscode && TERM_PROGRAM_VERSION → true
-//     mintty / MSYSTEM → true
-//     else → false
-// Without that, it keeps a dark COLORFGBG theme but emits no color/rich SGR.
-// Do not invent WT_SESSION (approval/input profile). Do not set MSYSTEM (path
-// translation). Do not set FORCE_COLOR (truecolor-on-every-cell).
-// vscode 1.110.0 is outside Claude's known-bad version windows
-// (1.92–1.104 and 1.123–1.124).
+// Shared capability hints. Do not invent WT_SESSION (approval/input profile)
+// and do not set FORCE_COLOR (truecolor-on-every-cell).
 export const MANAGED_TERMINAL_CAPABILITIES = {
   TERM: 'xterm-256color',
   COLORTERM: 'truecolor',
   COLORFGBG: '15;0',
+} as const
+
+// Claude.exe windowsConsoleSupportsVirtualTerminalSequences() only returns
+// true for WT_SESSION, mintty/MSYSTEM, or TERM_PROGRAM=vscode + a version.
+// vscode 1.110.0 is outside its known-bad windows (1.92–1.104, 1.123–1.124).
+// Codex must not get this: it treats vscode as a file-opener (vscode://).
+export const CLAUDE_WINDOWS_VT_IDENTITY = {
   TERM_PROGRAM: 'vscode',
   TERM_PROGRAM_VERSION: '1.110.0',
+} as const
+
+// Codex (Rust supports-color / crossterm) keys off CLICOLOR when TTY is real.
+export const CODEX_TERMINAL_CAPABILITIES = {
+  CLICOLOR: '1',
 } as const
 
 function keyOf(environment: NodeJS.ProcessEnv, name: string): string | undefined {
@@ -40,15 +42,21 @@ function remove(environment: NodeJS.ProcessEnv, name: string): void {
   if (key) delete environment[key]
 }
 
-function applyManagedTerminalCapabilities(environment: NodeJS.ProcessEnv): void {
+function fillMissing(environment: NodeJS.ProcessEnv, values: Record<string, string>): void {
+  for (const [name, value] of Object.entries(values)) {
+    if (!keyOf(environment, name)) environment[name] = value
+  }
+}
+
+function applyManagedTerminalCapabilities(environment: NodeJS.ProcessEnv, agentKind: AgentKind): void {
   for (const name of COLOR_DISABLE_VARS) remove(environment, name)
   // start.cmd inherits Windows Terminal. Leave that env byte-identical so the
   // already-working approval hook path does not change. Packaged Explorer
   // launches have no WT_SESSION and no TERM; fill only the missing keys.
   if (keyOf(environment, 'WT_SESSION')) return
-  for (const [name, value] of Object.entries(MANAGED_TERMINAL_CAPABILITIES)) {
-    if (!keyOf(environment, name)) environment[name] = value
-  }
+  fillMissing(environment, MANAGED_TERMINAL_CAPABILITIES)
+  if (agentKind === 'claude') fillMissing(environment, CLAUDE_WINDOWS_VT_IDENTITY)
+  if (agentKind === 'codex') fillMissing(environment, CODEX_TERMINAL_CAPABILITIES)
 }
 
 export function environmentForAgent(
@@ -71,6 +79,6 @@ export function environmentForAgent(
     // containing terminal scrollback instead of an alternate-screen viewport.
     environment.CLAUDE_CODE_NO_FLICKER = '0'
   }
-  applyManagedTerminalCapabilities(environment)
+  applyManagedTerminalCapabilities(environment, agentKind)
   return Object.fromEntries(Object.entries(environment).filter((entry): entry is [string, string] => entry[1] !== undefined))
 }
