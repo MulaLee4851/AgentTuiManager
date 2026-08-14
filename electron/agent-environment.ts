@@ -11,13 +11,24 @@ const CODEX_PARENT_MARKERS = [
 
 const COLOR_DISABLE_VARS = ['NO_COLOR', 'NODE_DISABLE_COLORS'] as const
 
-// Capability hints only. Do not invent WT_SESSION / TERM_PROGRAM — Claude treats those
-// as emulator identity and changes its input and approval profile. Do not set
-// FORCE_COLOR: truecolor-on-every-cell inflates the text-classifier window.
+// Capability + the one emulator identity Claude's Windows VT allowlist accepts
+// that is not Windows Terminal. Claude.exe:
+//   windowsConsoleSupportsVirtualTerminalSequences()
+//     WT_SESSION → true
+//     TERM_PROGRAM=vscode && TERM_PROGRAM_VERSION → true
+//     mintty / MSYSTEM → true
+//     else → false
+// Without that, it keeps a dark COLORFGBG theme but emits no color/rich SGR.
+// Do not invent WT_SESSION (approval/input profile). Do not set MSYSTEM (path
+// translation). Do not set FORCE_COLOR (truecolor-on-every-cell).
+// vscode 1.110.0 is outside Claude's known-bad version windows
+// (1.92–1.104 and 1.123–1.124).
 export const MANAGED_TERMINAL_CAPABILITIES = {
   TERM: 'xterm-256color',
   COLORTERM: 'truecolor',
   COLORFGBG: '15;0',
+  TERM_PROGRAM: 'vscode',
+  TERM_PROGRAM_VERSION: '1.110.0',
 } as const
 
 function keyOf(environment: NodeJS.ProcessEnv, name: string): string | undefined {

@@ -57,10 +57,12 @@ describe('environmentForAgent', () => {
       USERPROFILE: 'C:\\Users\\me',
       CLAUDE_CODE_NO_FLICKER: '0',
     })
+    expect(result.TERM_PROGRAM).toBe('vscode')
+    expect(result.TERM_PROGRAM_VERSION).toBe('1.110.0')
     expect(result).not.toHaveProperty('WT_SESSION')
-    expect(result).not.toHaveProperty('TERM_PROGRAM')
     expect(result).not.toHaveProperty('FORCE_COLOR')
     expect(result).not.toHaveProperty('CLICOLOR_FORCE')
+    expect(result).not.toHaveProperty('MSYSTEM')
   })
 
   it('does not override an already-set TERM and never strips Electron-as-node', () => {
