@@ -11,11 +11,13 @@ import type { AgentConfigSource, AgentEnvironmentSummary, AgentInstallProgress, 
 import managerLogoUrl from '../logo/AgentTuiManager.png'
 import codexLogoUrl from '../logo/codex.png'
 import claudeLogoUrl from '../logo/claudecode.png'
+import deepseekLogoUrl from '../logo/deepseek.svg'
 
-const AGENT_LOGO_URLS: Partial<Record<AgentKind, string>> = { codex: codexLogoUrl, claude: claudeLogoUrl }
+const AGENT_LOGO_URLS: Partial<Record<AgentKind, string>> = { codex: codexLogoUrl, claude: claudeLogoUrl, deepseek: deepseekLogoUrl }
+const DEEPSEEK_WEB_ARGS = ['web', '--host', '127.0.0.1', '--port', '0']
 function AgentLogo({ kind, className = '', label }: { kind: AgentKind; className?: string; label?: string }): JSX.Element {
   const source = AGENT_LOGO_URLS[kind]
-  return source ? <img className={className} src={source} alt={label ?? (kind === 'claude' ? 'Claude Code' : 'Codex')} /> : <span className={className}>{kind === 'pi' ? 'Pi' : kind === 'generic' ? '›_' : 'C'}</span>
+  return source ? <img className={className} src={source} alt={label ?? (kind === 'claude' ? 'Claude Code' : kind === 'deepseek' ? 'DeepSeek Harness' : 'Codex')} /> : <span className={className}>{kind === 'pi' ? 'Pi' : kind === 'generic' ? '›_' : 'C'}</span>
 }
 
 function FullAutoDialog({ session, onClose, onChanged }: { session: SessionSummary; onClose: () => void; onChanged: () => void }): JSX.Element {
@@ -220,7 +222,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
     setNativeSessionId('')
     setNativeSessions([])
     setDiscoveryError('')
-    if (kind === 'pi' || kind === 'generic') {
+    if (kind === 'pi' || kind === 'generic' || kind === 'deepseek') {
       setDiscoveryState('unsupported')
       return
     }
@@ -240,6 +242,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
   const loadCCSwitchProviders = async (kind = agentKind): Promise<void> => {
     setCCSwitchLoading(true); setCCSwitchError('')
     if (kind !== 'codex' && kind !== 'claude') {
+      setConfigSource('custom')
       setCCSwitchProviders([]); setCCSwitchProviderId(''); setCCSwitchLoading(false)
       setCCSwitchError('CCSwitch 当前仅支持 Codex 和 Claude Code')
       return
@@ -259,7 +262,8 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
 
   const changeKind = (kind: AgentKind): void => {
     setAgentKind(kind)
-    setExecutable(kind === 'generic' ? 'cmd.exe' : kind)
+    setExecutable(kind === 'generic' ? 'cmd.exe' : kind === 'deepseek' ? 'dsh' : kind)
+    setArgs(kind === 'deepseek' ? DEEPSEEK_WEB_ARGS.join('\n') : '')
     setInstallProgress(undefined); setInstallMessages([])
     if (workspace) void loadNativeSessions(kind, workspace)
     if (configSource === 'ccswitch') void loadCCSwitchProviders(kind)
@@ -361,7 +365,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
         setEnvironmentState('error'); setEnvironmentError(message); setError('环境检测失败：' + message); setBusy(false); return
       }
     }
-    const parsedArgs = args.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
+    const parsedArgs = agentKind === 'deepseek' && !args.trim() ? DEEPSEEK_WEB_ARGS : args.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
     const resumeArgs = nativeSessionId
       ? agentKind === 'codex' ? ['resume', nativeSessionId] : agentKind === 'claude' ? ['--resume', nativeSessionId] : undefined
       : undefined
@@ -379,7 +383,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
         source: 'custom',
         ...(configBaseUrl.trim() ? { baseUrl: configBaseUrl.trim() } : {}),
         ...(configApiKey.trim() ? { apiKey: configApiKey.trim() } : {}),
-        ...(configModel.trim() ? { model: configModel.trim() } : {}),
+        ...(agentKind !== 'deepseek' && configModel.trim() ? { model: configModel.trim() } : {}),
         extraArgs: configArgs.split(/\r?\n/).map((item) => item.trim()).filter(Boolean),
       } : { enabled: false, source: 'local' },
       agentProxy: proxyEnabled ? {
@@ -389,7 +393,8 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
       } : { enabled: false, host: '127.0.0.1', port: 7897 },
     }
     if (resumeArgs) request.recovery = { executable, args: resumeArgs }
-    try { await window.agentManager.startSession(request); onCreated(workspace) }
+    else if (agentKind === 'deepseek') request.recovery = { executable, args: parsedArgs }
+    try { const created = await window.agentManager.startSession(request); onCreated(created.workspace) }
     catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); setBusy(false) }
   }
 
@@ -410,10 +415,11 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
       || nativeSession.id.toLocaleLowerCase('en-US').includes(query)
       || Boolean(nativeSession.subtitle?.toLocaleLowerCase('zh-CN').includes(query))
   })
-  const agentOptions: Array<{ kind: AgentKind; logo: string; title: string; subtitle: string }> = [
+  const agentOptions: Array<{ kind: AgentKind; logo: string; title: string; subtitle: string; disabled?: boolean }> = [
     { kind: 'codex', logo: 'C', title: 'Codex', subtitle: '深度适配 · 已安装' },
     { kind: 'claude', logo: 'CL', title: 'Claude Code', subtitle: '深度适配 · 已安装' },
-    { kind: 'pi', logo: 'Pi', title: 'Pi', subtitle: '基础终端' },
+    { kind: 'deepseek', logo: 'DS', title: 'DeepSeek Harness', subtitle: '官方 Web · 生命周期托管' },
+    { kind: 'pi', logo: 'Pi', title: 'Pi', subtitle: '暂不可用 · 接入优化中', disabled: true },
     { kind: 'generic', logo: '+', title: '自定义命令', subtitle: '配置任意 CLI Agent' },
   ]
 
@@ -429,12 +435,13 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
     >
     <form className='agent-launcher' onMouseDown={resetBackdropClose} onSubmit={(event) => { void submit(event) }}>
       <header className='launcher-head'><h1>添加 Agent</h1><button type='button' className='icon-button' onClick={onClose} aria-label='关闭'>×</button></header>
-      <div className='launcher-workspace-row'><label htmlFor='workspace'>工作区</label><div className='workspace-picker'><input id='workspace' className='launcher-field' required readOnly placeholder='请选择工作区' value={workspace} /><button type='button' className='button-secondary' disabled={busy} onClick={() => { void chooseWorkspace() }}>选择文件夹</button></div></div>
+      <div className='launcher-workspace-row'><label htmlFor='workspace'>工作区</label><div className='workspace-picker'><input id='workspace' className='launcher-field' required={agentKind !== 'deepseek'} disabled={agentKind === 'deepseek'} readOnly placeholder='请选择工作区' value={agentKind === 'deepseek' ? '在 Harness Web 内选择' : workspace} /><button type='button' className='button-secondary' disabled={busy || agentKind === 'deepseek'} onClick={() => { void chooseWorkspace() }}>选择文件夹</button></div></div>
       <div className='launcher-content'>
         <nav className='launcher-tabs' aria-label='会话方式'><button type='button' className={`launcher-tab${launcherTab === 'new' ? ' active' : ''}`} onClick={() => setLauncherTab('new')}>新会话</button><button type='button' className={`launcher-tab${launcherTab === 'history' ? ' active' : ''}`} onClick={() => setLauncherTab('history')}>恢复历史</button><button type='button' className={`launcher-tab${launcherTab === 'external' ? ' active' : ''}`} onClick={() => setLauncherTab('external')}>迁移外部会话</button><button type='button' className={`launcher-tab${launcherTab === 'config' ? ' active' : ''}`} onClick={() => setLauncherTab('config')}>独立配置</button></nav>
-        <label className='sr-only' htmlFor='agent-kind'>Agent 类型</label><select className='sr-only' id='agent-kind' value={agentKind} onChange={(event) => changeKind(event.target.value as AgentKind)}><option value='codex'>Codex</option><option value='claude'>Claude Code</option><option value='pi'>Pi</option><option value='generic'>通用终端</option></select>
+        <label className='sr-only' htmlFor='agent-kind'>Agent 类型</label><select className='sr-only' id='agent-kind' value={agentKind} onChange={(event) => changeKind(event.target.value as AgentKind)}><option value='codex'>Codex</option><option value='claude'>Claude Code</option><option value='deepseek'>DeepSeek Harness</option><option value='pi'>Pi</option><option value='generic'>通用终端</option></select>
         <label className='sr-only' htmlFor='native-session'>历史会话</label><select className='sr-only' id='native-session' value={nativeSessionId} disabled={!workspace || discoveryState === 'loading' || discoveryState === 'unsupported'} onChange={(event) => setNativeSessionId(event.target.value)}><option value=''>新建会话</option>{nativeSessions.map((item) => <option key={item.id} value={item.id}>{item.title} · {new Date(item.updatedAt).toLocaleString()}</option>)}</select>
-        {launcherTab === 'new' && <section className='launcher-panel'><div className='launcher-section-title'><h2>选择 Agent</h2><span>选择本机 CLI</span></div><div className='launcher-agent-options'>{agentOptions.map((option) => <button type='button' key={option.kind} className={`launcher-agent-option${agentKind === option.kind ? ' active' : ''}`} onClick={() => changeKind(option.kind)}><AgentLogo kind={option.kind} className={`launcher-option-logo option-${option.kind}`} label={option.title} /><span><strong>{option.title}</strong><span>{option.subtitle}</span></span></button>)}</div>
+        {launcherTab === 'new' && <section className='launcher-panel'><div className='launcher-section-title'><h2>选择 Agent</h2><span>选择本机 CLI</span></div><div className='launcher-agent-options'>{agentOptions.map((option) => <button type='button' key={option.kind} disabled={option.disabled} className={`launcher-agent-option${agentKind === option.kind ? ' active' : ''}`} onClick={() => changeKind(option.kind)}><AgentLogo kind={option.kind} className={`launcher-option-logo option-${option.kind}`} label={option.title} /><span><strong>{option.title}</strong><span>{option.subtitle}</span></span></button>)}</div>
+           {agentKind === 'deepseek' && <div className='launcher-agent-capability-note' role='note'><strong>DeepSeek Harness 官方当前没有交互式 TUI</strong><span>Manager 会启动并托管官方 Web 界面，负责配置、停止、重启和重连。工作区、工具审批、自动批准及会话操作仍在 Harness Web 内完成，暂不进入 Manager 处理中心或全自动模式。</span></div>}
            {discoveryState === 'unsupported' && <p className='launcher-state'>该 Agent 暂不支持自动读取历史会话</p>}
            {discoveryState === 'error' && <p className='launcher-state error'>读取失败：{discoveryError}，仍可新建会话。</p>}
            {agentKind !== 'generic' && <div className='launcher-environment' aria-live='polite'>
@@ -447,7 +454,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
                <span className={environment.agentInstalled ? 'ok' : 'bad'}>● Agent CLI　{environment.executableVersion ?? '未安装'}</span>
                {agentKind === 'pi' && <span className={environment.ripgrepAvailable ? 'ok' : 'bad'}>● ripgrep　{environment.ripgrepVersion ?? '未安装'}</span>}
              </div>}
-             {environmentState === 'ready' && environment && (!environment.nodeAvailable || !environment.npmAvailable) && <div className='launcher-environment-install'><span>需要先安装 Node.js/npm。</span><button type='button' className='button-secondary mini-button' disabled={environmentBusy} onClick={() => { void installNode() }}>{environmentBusy ? '安装中…' : '一键安装 Node.js/npm'}</button></div>}
+             {environmentState === 'ready' && environment && (!environment.nodeAvailable || !environment.npmAvailable) && <div className='launcher-environment-install'><span>{agentKind === 'deepseek' && environment.nodeVersion ? 'DeepSeek Harness 需要 Node.js 22.19+ 或 24+，请升级 Node.js/npm。' : '需要先安装 Node.js/npm。'}</span><button type='button' className='button-secondary mini-button' disabled={environmentBusy} onClick={() => { void installNode() }}>{environmentBusy ? '安装中…' : '一键安装 Node.js/npm'}</button></div>}
              {environmentState === 'ready' && environment?.npmAvailable && !environment.agentInstalled && <div className='launcher-environment-install launcher-environment-install-agent'><span>未检测到 Agent CLI，暂时不能创建。</span><label>安装源<select className='launcher-field' aria-label='npm 安装源' disabled={environmentBusy} value={npmRegistry} onChange={(event) => setNpmRegistry(event.target.value as NpmRegistryChoice)}><option value='configured'>跟随本机 npm 配置</option><option value='npmmirror'>npmmirror（国内）</option><option value='tencent'>腾讯云（国内）</option><option value='huawei'>华为云（国内）</option><option value='official'>npm 官方源</option></select></label><button type='button' className='button-secondary mini-button' disabled={environmentBusy} onClick={() => { void installSelectedAgent() }}>{environmentBusy ? '安装中…' : '一键安装 Agent CLI'}</button></div>}
              {agentKind === 'pi' && environmentState === 'ready' && environment?.agentInstalled && !environment.ripgrepAvailable && <div className='launcher-environment-install'><span>Pi 缺少 ripgrep，启动时会重复尝试从 GitHub 下载。</span><button type='button' className='button-secondary mini-button' disabled={environmentBusy} onClick={() => { void installPiRipgrep() }}>{environmentBusy ? '安装中…' : '一键安装 ripgrep'}</button></div>}
              {(environmentBusy || installProgress) && <div className={`launcher-install-progress phase-${installProgress?.phase ?? 'starting'}`}>
@@ -459,7 +466,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
            </div>}
           <div className='launcher-form-grid'><label htmlFor='session-name'>显示名称</label><input id='session-name' className='launcher-field' required value={displayName} onChange={(event) => setDisplayName(event.target.value)} /><label htmlFor='approval-mode'>审批策略</label><select id='approval-mode' className='launcher-field' defaultValue='workspace'><option value='workspace'>使用工作区默认策略</option><option value='manual'>全部手动确认</option><option value='builtin'>仅使用内置安全规则</option></select></div><div className='launcher-command-preview'>{executable || '<custom-command>'}<small>cwd: {workspace || '请选择工作区'}</small></div>
            <details className='advanced-settings'><summary>高级设置</summary><div><label>Executable<div className='workspace-picker'><input required value={executable} onChange={(event) => setExecutable(event.target.value)} /><button type='button' className='button-secondary' onClick={() => { void chooseExecutable() }}>选择文件</button></div></label><small>如果 CLI 没有加入全局 PATH，可选择完整的 .exe 或 .cmd 路径；修改后会自动重新检测。</small><label>参数（每行一个）<textarea rows={3} value={args} onChange={(event) => setArgs(event.target.value)} /></label><label>自动 continue 最大次数<input type='number' min={1} max={10} required value={maxContinueRetries} onChange={(event) => setMaxContinueRetries(Number(event.target.value))} /></label><small>遇到明确的临时错误时，每隔 3 秒重试一次。正常结束或手动中断不会重试。</small></div></details></section>}
-        {launcherTab === 'history' && <section className='launcher-panel'><div className='launcher-filter-row'><input className='launcher-field' value={historyQuery} onChange={(event) => setHistoryQuery(event.target.value)} placeholder='搜索标题或会话 ID' /><select className='launcher-field' value={agentKind} onChange={(event) => changeKind(event.target.value as AgentKind)}><option value='codex'>Codex</option><option value='claude'>Claude Code</option><option value='pi'>Pi</option><option value='generic'>通用终端</option></select></div><div className='launcher-section-title'><h2>该工作区的历史会话</h2><span>按最近活动排序</span></div>
+        {launcherTab === 'history' && <section className='launcher-panel'><div className='launcher-filter-row'><input className='launcher-field' value={historyQuery} onChange={(event) => setHistoryQuery(event.target.value)} placeholder='搜索标题或会话 ID' /><select className='launcher-field' value={agentKind} onChange={(event) => changeKind(event.target.value as AgentKind)}><option value='codex'>Codex</option><option value='claude'>Claude Code</option><option value='deepseek'>DeepSeek Harness</option><option value='pi'>Pi</option><option value='generic'>通用终端</option></select></div><div className='launcher-section-title'><h2>该工作区的历史会话</h2><span>按最近活动排序</span></div>
           {discoveryState === 'loading' && <p className='launcher-state'>正在读取历史会话…</p>}{discoveryState === 'unsupported' && <p className='launcher-state'>该 Agent 暂不支持自动读取历史会话</p>}{discoveryState === 'error' && <p className='launcher-state error'>读取失败：{discoveryError}，仍可新建会话。</p>}{discoveryState === 'ready' && filteredSessions.length === 0 && <p className='launcher-state'>该工作区没有可恢复的历史会话</p>}<div className='launcher-session-list'>{filteredSessions.map((item) => <button type='button' aria-pressed={nativeSessionId === item.id} key={item.id} className={`launcher-session-item${nativeSessionId === item.id ? ' active' : ''}`} onClick={() => setNativeSessionId((current) => current === item.id ? '' : item.id)}><AgentLogo kind={agentKind} className={`launcher-option-logo option-${agentKind}`} label={agentKind} /><span><strong>{item.title}</strong><span>{item.subtitle || item.id}</span><small>{agentKind === 'claude' ? 'Claude Code' : agentKind.toUpperCase()} · {item.id}</small></span><time>{new Date(item.updatedAt).toLocaleString()}</time></button>)}</div></section>}
         {launcherTab === 'external' && <section className='launcher-panel'><div className='launcher-external-note'>{initialImport?.issue ?? '先在外部终端正常退出当前 Agent，再从下方选择原生会话。Manager 会通过 Agent 自带的 resume 接管；不会复制终端画面或改变原生会话数据。'}</div><div className='launcher-section-title'><h2>可迁入的原生会话</h2><span>{discoveryState === 'ready' ? filteredSessions.length + ' 个' : '请先选择工作区'}</span></div>
           {discoveryState === 'loading' && <p className='launcher-state'>正在检测原生会话…</p>}{discoveryState === 'unsupported' && <p className='launcher-state'>当前 Agent 暂不支持原生会话迁入</p>}{discoveryState === 'error' && <p className='launcher-state error'>检测失败：{discoveryError}</p>}{discoveryState === 'ready' && filteredSessions.length === 0 && <p className='launcher-state'>该工作区没有可迁入的原生会话</p>}
@@ -467,15 +474,15 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
           {nativeSessionId && <div className='external-migration-steps'><strong>准备迁入</strong><span>1. 确认外部 Agent 已正常退出　2. 点击底部“迁入 Manager”　3. 若原会话仍被占用，Manager 会保留当前表单并提示重试</span></div>}
         </section>}
         {launcherTab === 'config' && <section className='launcher-panel launcher-config-panel'>
-          <div className='launcher-config-intro'><strong>默认继承本机配置</strong><span>关闭时与普通终端启动方式完全一致，不读取或修改本机 Codex、Claude Code 配置文件。</span></div>
+          <div className='launcher-config-intro'><strong>默认继承本机配置</strong><span>关闭时与普通终端启动方式完全一致，不读取或修改任何 Agent 的本机配置文件。</span></div>
           <label className='launcher-config-toggle'><span><strong>为这个 Agent 使用独立配置</strong><small>仅注入这个 Agent 的进程环境；当前工作区和其他 Agent 不受影响。</small></span><input type='checkbox' role='switch' aria-label='启用独立配置' checked={configEnabled} onChange={(event) => setConfigEnabled(event.target.checked)} /></label>
           <div className={`launcher-config-fields${configEnabled ? '' : ' disabled'}`}>
             <div className='launcher-section-title'><h2>配置来源</h2><span>只影响当前 Agent</span></div>
             <div className='launcher-config-sources'><button type='button' className={configSource === 'custom' ? 'active' : ''} disabled={!configEnabled} onClick={() => setConfigSource('custom')}><strong>手动配置</strong><small>Base URL、API Key 与 Model</small></button><button type='button' className={configSource === 'ccswitch' ? 'active' : ''} disabled={!configEnabled} onClick={() => { setConfigSource('ccswitch'); void loadCCSwitchProviders() }}><strong>CCSwitch</strong><small>只读选择本机 Provider</small></button></div>
             {configSource === 'custom' ? <><div className='launcher-config-form'>
-              <label>Base URL<input className='launcher-field' disabled={!configEnabled} value={configBaseUrl} onChange={(event) => setConfigBaseUrl(event.target.value)} placeholder={agentKind === 'claude' ? 'https://api.anthropic.com' : 'https://api.openai.com/v1'} /></label>
+              <label>Base URL<input className='launcher-field' disabled={!configEnabled} value={configBaseUrl} onChange={(event) => setConfigBaseUrl(event.target.value)} placeholder={agentKind === 'claude' ? 'https://api.anthropic.com' : agentKind === 'deepseek' ? 'https://api.deepseek.com' : 'https://api.openai.com/v1'} /></label>
               <label>API Key<input className='launcher-field' disabled={!configEnabled} type='password' autoComplete='off' value={configApiKey} onChange={(event) => setConfigApiKey(event.target.value)} placeholder='仅加密保存在本机' /></label>
-              <label>Model<input className='launcher-field' disabled={!configEnabled} value={configModel} onChange={(event) => setConfigModel(event.target.value)} placeholder='留空时继承本机默认模型' /></label>
+              <label>Model<input className='launcher-field' disabled={!configEnabled || agentKind === 'deepseek'} value={configModel} onChange={(event) => setConfigModel(event.target.value)} placeholder={agentKind === 'deepseek' ? '请在 DeepSeek Harness Web 设置中配置' : '留空时继承本机默认模型'} /></label>
               <label>启动参数（每行一个）<textarea className='launcher-field' disabled={!configEnabled} rows={4} value={configArgs} onChange={(event) => setConfigArgs(event.target.value)} placeholder={'--feature\nvalue'} /></label>
             </div>
             <div className='launcher-config-security'><strong>安全边界</strong><span>API Key 不写入 Host 注册表、审计正文或终端回放；Manager 启动 Agent 时才临时解密。</span></div></> : <CCSwitchProviderList providers={ccSwitchProviders} selectedId={ccSwitchProviderId} loading={ccSwitchLoading} error={ccSwitchError} disabled={!configEnabled} onSelect={(provider) => setCCSwitchProviderId(provider.id)} onRefresh={() => { void loadCCSwitchProviders() }} />}
@@ -495,7 +502,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
       </div>
       {closeArmed && <p className='launcher-dismiss-hint'>再点击一次空白处关闭，已填写内容会保留</p>}
       {error && <p className='launcher-error'>{error}</p>}
-      <footer className='launcher-foot'><span>{nativeSessionId ? launcherTab === 'external' ? '将通过原生 resume 迁入所选会话' : '将在新终端中恢复已选择的历史会话' : launcherTab === 'external' ? '选择一个已正常退出的原生会话' : launcherTab === 'config' ? configEnabled ? '独立配置只应用于这个 Agent' : '当前继续继承本机配置' : `将启动新的 ${agentOptions.find((option) => option.kind === agentKind)?.title ?? 'Agent'} 会话`}</span><button type='button' className='button-secondary' onClick={onClose}>取消</button>{(launcherTab !== 'external' || nativeSessionId) && <button type='submit' className='button-primary' disabled={busy || environmentBusy || !workspace || (launcherTab === 'external' && !nativeSessionId) || (configEnabled && configSource === 'ccswitch' && !ccSwitchProviderId)}>{busy ? '请稍后…' : launcherTab === 'external' ? '迁入 Manager' : nativeSessionId ? '恢复会话' : '启动 Agent'}</button>}</footer>
+      <footer className='launcher-foot'><span>{nativeSessionId ? launcherTab === 'external' ? '将通过原生 resume 迁入所选会话' : '将在新终端中恢复已选择的历史会话' : launcherTab === 'external' ? '选择一个已正常退出的原生会话' : launcherTab === 'config' ? configEnabled ? '独立配置只应用于这个 Agent' : '当前继续继承本机配置' : `将启动新的 ${agentOptions.find((option) => option.kind === agentKind)?.title ?? 'Agent'} 会话`}</span><button type='button' className='button-secondary' onClick={onClose}>取消</button>{(launcherTab !== 'external' || nativeSessionId) && <button type='submit' className='button-primary' disabled={busy || environmentBusy || (agentKind !== 'deepseek' && !workspace) || (launcherTab === 'external' && !nativeSessionId) || (configEnabled && configSource === 'ccswitch' && !ccSwitchProviderId)}>{busy ? '请稍后…' : launcherTab === 'external' ? '迁入 Manager' : nativeSessionId ? '恢复会话' : '启动 Agent'}</button>}</footer>
     </form>
   </div>
 }
@@ -526,6 +533,7 @@ function EditAgentForm({ open, session, onClose, onSaved }: { open: boolean; ses
   const closeTimer = useRef<ReturnType<typeof setTimeout>>()
   const options: Array<{ kind: AgentKind; logo: string; title: string }> = [
     { kind: 'codex', logo: 'C', title: 'Codex' }, { kind: 'claude', logo: 'CL', title: 'Claude Code' },
+    { kind: 'deepseek', logo: 'DS', title: 'DeepSeek Harness' },
     { kind: 'pi', logo: 'Pi', title: 'Pi' }, { kind: 'generic', logo: '+', title: '自定义命令' },
   ]
 
@@ -563,6 +571,7 @@ function EditAgentForm({ open, session, onClose, onSaved }: { open: boolean; ses
   const loadCCSwitchProviders = async (): Promise<void> => {
     setCCSwitchLoading(true); setCCSwitchError('')
     if (session.agentKind !== 'codex' && session.agentKind !== 'claude') {
+      setConfigSource('custom')
       setCCSwitchProviders([]); setCCSwitchLoading(false)
       setCCSwitchError('CCSwitch 当前仅支持 Codex 和 Claude Code')
       return
@@ -596,7 +605,7 @@ function EditAgentForm({ open, session, onClose, onSaved }: { open: boolean; ses
         source: 'custom',
         ...(configBaseUrl.trim() ? { baseUrl: configBaseUrl.trim() } : {}),
         ...(configApiKey.trim() ? { apiKey: configApiKey.trim() } : {}),
-        ...(configModel.trim() ? { model: configModel.trim() } : {}),
+        ...(session.agentKind !== 'deepseek' && configModel.trim() ? { model: configModel.trim() } : {}),
         extraArgs: configArgs.split(/\r?\n/).map((item) => item.trim()).filter(Boolean),
         ...(clearApiKey ? { clearApiKey: true } : {}),
       } : { enabled: false, source: 'local' })
@@ -636,7 +645,7 @@ function EditAgentForm({ open, session, onClose, onSaved }: { open: boolean; ses
               <label>Base URL<input className='launcher-field' disabled={!configEnabled} value={configBaseUrl} onChange={(event) => setConfigBaseUrl(event.target.value)} /></label>
               <label>API Key<input className='launcher-field' disabled={!configEnabled} type='password' autoComplete='off' value={configApiKey} onChange={(event) => { setConfigApiKey(event.target.value); if (event.target.value) setClearApiKey(false) }} placeholder={session.agentConfig?.hasApiKey ? '已安全保存，留空保持不变' : '仅加密保存在本机'} /></label>
               {session.agentConfig?.hasApiKey && <label className='launcher-clear-secret'><input type='checkbox' disabled={!configEnabled} checked={clearApiKey} onChange={(event) => { setClearApiKey(event.target.checked); if (event.target.checked) setConfigApiKey('') }} />清除已保存的 API Key</label>}
-              <label>Model<input className='launcher-field' disabled={!configEnabled} value={configModel} onChange={(event) => setConfigModel(event.target.value)} placeholder='留空时继承本机默认模型' /></label>
+              <label>Model<input className='launcher-field' disabled={!configEnabled || session.agentKind === 'deepseek'} value={configModel} onChange={(event) => setConfigModel(event.target.value)} placeholder={session.agentKind === 'deepseek' ? '请在 DeepSeek Harness Web 设置中配置' : '留空时继承本机默认模型'} /></label>
               <label>启动参数（每行一个）<textarea className='launcher-field' disabled={!configEnabled} rows={4} value={configArgs} onChange={(event) => setConfigArgs(event.target.value)} /></label>
             </div>
             <div className='launcher-config-security'><strong>安全边界</strong><span>API Key 只保存在 Manager 的加密配置中，不修改 Agent 本机配置。</span></div></> : <CCSwitchProviderList providers={ccSwitchProviders} selectedId={ccSwitchProviderId} loading={ccSwitchLoading} error={ccSwitchError} disabled={!configEnabled} onSelect={(provider) => setCCSwitchProviderId(provider.id)} onRefresh={() => { void loadCCSwitchProviders() }} />}

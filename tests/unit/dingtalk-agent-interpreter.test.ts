@@ -6,6 +6,8 @@ describe('DingTalkAgentInterpreter output policy', () => {
   it('maps structured actions to the existing fixed command router', () => {
     expect(commandFromAgentResponse({ action: 'agents' })).toBe('/agents')
     expect(commandFromAgentResponse({ action: 'approve', requestId: 'approval-1' })).toBe('/approve approval-1')
+    expect(commandFromAgentResponse({ action: 'auto_on', target: 'Code Agent' })).toBe('/auto Code Agent on')
+    expect(commandFromAgentResponse({ action: 'auto_off', target: 'session-1' })).toBe('/auto session-1 off')
     expect(commandFromAgentResponse({ action: 'send', target: 'Agent A', content: '继续检查登录问题' })).toBe('/send Agent A 继续检查登录问题')
   })
 

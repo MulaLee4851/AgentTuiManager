@@ -118,6 +118,19 @@ describe('native agent adapters', () => {
     })
   })
 
+  it('uses only the official DeepSeek Harness readiness URL and never guesses approvals', () => {
+    const adapter = createAgentAdapter('deepseek')
+    expect(adapter.observeOutput('starting web server…\r\n')).toEqual({ approvalRequired: false, ready: false })
+    expect(adapter.observeOutput('dsh web: http://127.0.0.1:43127\r\n')).toEqual({
+      approvalRequired: false,
+      ready: true,
+      webUrl: 'http://127.0.0.1:43127',
+    })
+    expect(adapter.observeOutput('Allow this tool use? rm -rf /')).toMatchObject({ approvalRequired: false })
+    expect(adapter.observeOutput('Selected model is at capacity. Please try a different model.').recoverableError).toBeUndefined()
+    expect(adapter.recoveryRecipe('dsh', 'not-used')).toBeUndefined()
+  })
+
   it('uses Exec OSC only as a signal and waits for the full modal command', () => {
     const adapter = createAgentAdapter('codex')
     expect(adapter.observeOutput('\x1b]9;Approval requested: Remove-Item -Recurse very-lon\x07')).toMatchObject({

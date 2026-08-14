@@ -106,6 +106,11 @@ export function applyAgentLaunchProfile(
     if (profile.apiKey) {
       environment[codexProvider.id === 'openai' && !codexProvider.configurable ? 'OPENAI_API_KEY' : CODEX_API_KEY_ENV] = profile.apiKey
     }
+  } else if (agentKind === 'deepseek') {
+    // DeepSeek Harness resolves these official variables per request. Model
+    // selection remains in its own Web settings because dsh has no model CLI flag.
+    if (profile.baseUrl) environment.DEEPSEEK_BASE_URL = profile.baseUrl
+    if (profile.apiKey) environment.DEEPSEEK_API_KEY = profile.apiKey
   } else {
     if (profile.baseUrl) environment.OPENAI_BASE_URL = profile.baseUrl
     if (profile.apiKey) environment.OPENAI_API_KEY = profile.apiKey

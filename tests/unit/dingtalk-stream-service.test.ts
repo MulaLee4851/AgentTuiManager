@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const sdk = vi.hoisted(() => ({
   callback: undefined as ((message: unknown) => void) | undefined,
@@ -24,6 +24,7 @@ import { DingTalkStreamService } from '../../electron/dingtalk-stream-service'
 
 describe('DingTalkStreamService', () => {
   beforeEach(() => { vi.clearAllMocks(); sdk.callback = undefined })
+  afterEach(() => { vi.unstubAllGlobals() })
 
   it('subscribes robot messages as CALLBACK before connecting', async () => {
     const router = { execute: vi.fn(async () => 'ok') }
@@ -33,5 +34,24 @@ describe('DingTalkStreamService', () => {
     expect(sdk.registerCallbackListener).toHaveBeenCalledWith('/v1.0/im/bot/messages/get', expect.any(Function))
     expect(sdk.registerAllEventListener).not.toHaveBeenCalled()
     expect(sdk.registerCallbackListener.mock.invocationCallOrder[0]).toBeLessThan(sdk.connect.mock.invocationCallOrder[0]!)
+  })
+
+  it('pushes each allowed approval to the bound DingTalk account only once', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ accessToken: 'token-1', expireIn: 7200 }) })
+      .mockResolvedValueOnce({ ok: true, status: 200 })
+    vi.stubGlobal('fetch', fetchMock)
+    const service = new DingTalkStreamService({ execute: vi.fn() } as never)
+    const settings = { enabled: true, clientId: 'app-key', clientSecret: 'secret', allowedWorkspaces: ['B:/work'], commandsPerMinute: 20, boundStaffId: 'staff-1', agentModeEnabled: false, agentRetryCount: 3, agentProxyEnabled: false, agentProxyHost: '127.0.0.1', agentProxyPort: 7897 }
+    const request = { requestId: 'approval-1', sessionId: 'session-12345678', displayName: 'Code Agent', agentKind: 'codex', workspace: 'B:/work', source: 'terminal', risk: 'write', toolName: 'Edit', reason: '需要修改文件', command: 'Set-Content app.ts value', createdAt: 1, canBulkApprove: true }
+
+    await expect(service.notifyApproval(request as never, settings)).resolves.toBe(true)
+    await expect(service.notifyApproval(request as never, settings)).resolves.toBe(false)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock).toHaveBeenNthCalledWith(1, 'https://api.dingtalk.com/v1.0/oauth2/accessToken', expect.any(Object))
+    const sendOptions = fetchMock.mock.calls[1]![1] as { body: string }
+    const payload = JSON.parse(sendOptions.body)
+    expect(payload).toMatchObject({ robotCode: 'app-key', userIds: ['staff-1'], msgKey: 'sampleText' })
+    expect(JSON.parse(payload.msgParam).content).toContain('/approve approval-1')
   })
 })

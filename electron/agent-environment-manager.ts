@@ -30,6 +30,7 @@ async function executeFile(candidate: string, args: string[], options: ExecOptio
 const AGENT_PACKAGES: Partial<Record<AgentKind, string>> = {
   codex: '@openai/codex',
   claude: '@anthropic-ai/claude-code',
+  deepseek: '@deepseek-ai/dsh',
   // The original @mariozechner scope is deprecated. legacy-node20 is the
   // maintained package's official compatibility tag for Node 20 and early
   // Node 22 releases; its CLI entry is still `pi`.
@@ -144,11 +145,12 @@ async function version(
   command: string,
   args: string[] = ['--version'],
   environment: NodeJS.ProcessEnv = process.env,
+  timeout = 5_000,
 ): Promise<string | undefined> {
   for (const candidate of commandCandidates(command)) {
     try {
       const result = await executeFile(candidate, args, {
-        timeout: 5_000, windowsHide: true, maxBuffer: 64 * 1024, env: environment,
+        timeout, windowsHide: true, maxBuffer: 64 * 1024, env: environment,
       })
       return (result.stdout || result.stderr).trim().split(/\r?\n/)[0]?.slice(0, 160) || '已安装'
     } catch {
@@ -162,6 +164,18 @@ function existingFile(candidate: string): boolean {
   try { return statSync(candidate).isFile() } catch { return false }
 }
 
+export function installedExecutableVersion(versionResult: string | undefined, executableExists: boolean): string | undefined {
+  return versionResult ?? (executableExists ? '已检测到可执行文件（版本查询未结束）' : undefined)
+}
+
+export function supportsDeepSeekNode(versionResult: string | undefined): boolean {
+  const match = versionResult?.match(/^v?(\d+)\.(\d+)/)
+  if (!match) return false
+  const major = Number(match[1])
+  const minor = Number(match[2])
+  return major >= 24 || (major === 22 && minor >= 19)
+}
+
 export function packageForAgent(agentKind: AgentKind): string | undefined {
   return AGENT_PACKAGES[agentKind]
 }
@@ -172,21 +186,27 @@ export function installCommandForAgent(agentKind: AgentKind): string | undefined
 }
 
 export async function detectAgentEnvironment(agentKind: AgentKind, executable: string): Promise<AgentEnvironmentSummary> {
-  const environment = agentKind === 'pi' ? environmentWithFreshWindowsPath() : process.env
+  const environment = agentKind === 'generic' ? process.env : environmentWithFreshWindowsPath()
   const nodeVersion = await version('node', ['--version'], environment)
   const npmVersion = await version('npm', ['--version'], environment)
   const ripgrepVersion = agentKind === 'pi' ? await version('rg', ['--version'], environment) : undefined
   let executableVersion: string | undefined
+  let resolvedExecutable: string | undefined
   try {
-    if (existingFile(executable)) executableVersion = await version(executable, ['--version'], environment)
-    else executableVersion = await version(
-      resolveExecutableForPty(executable, { path: pathFromEnvironment(environment) }), ['--version'], environment,
-    )
+    resolvedExecutable = existingFile(executable)
+      ? executable
+      : resolveExecutableForPty(executable, { path: pathFromEnvironment(environment) })
+    executableVersion = await version(resolvedExecutable, ['--version'], environment, agentKind === 'pi' ? 8_000 : 5_000)
+    // Some Pi releases print their version and then keep a Node handle alive.
+    // PATH resolution still proves that the npm shim exists; a slow/hanging
+    // version probe must not turn an installed CLI into a false negative.
+    if (agentKind === 'pi') executableVersion = installedExecutableVersion(executableVersion, existingFile(resolvedExecutable))
   } catch {
     executableVersion = undefined
   }
   return {
-    agentKind, executable, packageName: packageForAgent(agentKind), nodeAvailable: Boolean(nodeVersion),
+    agentKind, executable, packageName: packageForAgent(agentKind),
+    nodeAvailable: Boolean(nodeVersion) && (agentKind !== 'deepseek' || supportsDeepSeekNode(nodeVersion)),
     npmAvailable: Boolean(npmVersion), nodeVersion, npmVersion,
     agentInstalled: Boolean(executableVersion), executableVersion,
     ...(agentKind === 'pi' ? { ripgrepAvailable: Boolean(ripgrepVersion), ripgrepVersion, ripgrepInstallCommand: 'winget install --id BurntSushi.ripgrep.MSVC --exact' } : {}),

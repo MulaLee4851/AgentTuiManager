@@ -5,7 +5,7 @@ import type { StoredDingTalkSettings } from './dingtalk-settings-store'
 
 export interface DingTalkAgentSnapshot { sessions: SessionSummary[]; approvals: ApprovalRequest[] }
 
-const ACTIONS = new Set(['help', 'agents', 'pending', 'approve', 'approve_all', 'status', 'tail', 'workspace', 'send', 'stop', 'restart', 'audit'])
+const ACTIONS = new Set(['help', 'agents', 'pending', 'approve', 'approve_all', 'status', 'tail', 'workspace', 'send', 'stop', 'restart', 'auto_on', 'auto_off', 'audit'])
 const BASE_RETRY_DELAY_MS = 500
 
 function wait(milliseconds: number): Promise<void> {
@@ -58,6 +58,8 @@ export function commandFromAgentResponse(value: unknown): string {
     case 'approve_all': return '/approve-all'
     case 'status': case 'tail': case 'workspace': case 'stop': case 'restart':
       if (!target) throw new Error('模型未指定目标'); return `/${action} ${target}`
+    case 'auto_on': case 'auto_off':
+      if (!target) throw new Error('模型未指定目标'); return `/auto ${target} ${action === 'auto_on' ? 'on' : 'off'}`
     case 'send':
       if (!target || !content) throw new Error('模型未指定 Agent 或消息内容')
       if (content.includes('\r') || content.includes('\n') || content.includes('\0') || content.length > 4_000) throw new Error('模型生成的消息不符合发送限制')
@@ -75,7 +77,7 @@ export class DingTalkAgentInterpreter {
       temperature: 0,
       response_format: { type: 'json_object' },
       messages: [
-        { role: 'system', content: '你是 Agent TUI Manager 的远程操作转换器。只返回一个 JSON 对象，不要解释。字段：action（help|agents|pending|approve|approve_all|status|tail|workspace|send|stop|restart|audit），可选 target、content、requestId。只能选择一个动作，禁止生成 shell 命令、路径写入或未列出的动作。用户意图不明确时返回 {"action":"help"}。' },
+        { role: 'system', content: '你是 Agent TUI Manager 的远程操作转换器。只返回一个 JSON 对象，不要解释。字段：action（help|agents|pending|approve|approve_all|status|tail|workspace|send|stop|restart|auto_on|auto_off|audit），可选 target、content、requestId。auto_on/auto_off 用于开启或关闭指定 Agent 的全自动审批模式。只能选择一个动作，禁止生成 shell 命令、路径写入或未列出的动作。用户意图不明确时返回 {"action":"help"}。' },
         { role: 'user', content: JSON.stringify({ request: input, agents: snapshot.sessions.map((item) => ({ id: item.sessionId.slice(0, 8), name: item.displayName, status: item.status, workspace: item.workspace })), pending: snapshot.approvals.map((item) => ({ requestId: item.requestId, agent: item.displayName, tool: item.toolName, risk: item.risk })) }) },
       ],
     }, {

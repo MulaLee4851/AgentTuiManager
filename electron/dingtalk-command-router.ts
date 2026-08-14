@@ -16,6 +16,7 @@ export interface DingTalkManagerPort {
   write(sessionId: string, data: string): void | Promise<void>
   stopSession(sessionId: string): Promise<void>
   restartSession(sessionId: string): Promise<void>
+  setFullAutoMode(sessionId: string, enabled: boolean): Promise<void>
 }
 
 export interface DingTalkAuditPort {
@@ -34,6 +35,7 @@ const HELP = [
   '/send <Agent> <内容> - 向终端提交消息',
   '/stop <Agent> - 停止 Agent',
   '/restart <Agent> - 重新启动 Agent',
+  '/auto <Agent> on|off - 开启或关闭指定 Agent 的全自动模式',
   '/audit - 查看最近审计记录',
 ].join('\n')
 const TERMINAL_SUBMIT_DELAY_MS = 100
@@ -165,6 +167,7 @@ export class DingTalkCommandRouter {
         await this.manager.restartSession(session.sessionId)
         return `已重新启动 ${session.displayName}。`
       }
+      case '/auto': return this.setFullAutoMode(args, sessions)
       case '/audit': return this.recentAudit(settings)
       default: return `未知命令：${verb}\n\n${HELP}`
     }
@@ -215,6 +218,18 @@ export class DingTalkCommandRouter {
     if (allPending.some((request) => !allowedIds.has(request.sessionId))) throw new Error('存在工作区白名单外的审批，不能远程执行一键批准；请使用 /approve 指定请求')
     const result = this.manager.approveAllPending()
     return `批准完成：${result.approved} 个批准，${result.skipped} 个高风险跳过，${result.failed} 个失败。`
+  }
+
+  private async setFullAutoMode(args: string, sessions: SessionSummary[]): Promise<string> {
+    const match = args.trim().match(/^(.*?)\s+(on|off|enable|disable|开启|关闭)$/i)
+    if (!match?.[1] || !match[2]) throw new Error('用法：/auto <Agent> on|off')
+    const session = this.resolveSession(match[1], sessions)
+    if (session.agentKind === 'deepseek') throw new Error('DeepSeek Harness 的审批由官方 Web 管理，不能在 Manager 中开启全自动模式')
+    const enabled = /^(?:on|enable|开启)$/i.test(match[2])
+    await this.manager.setFullAutoMode(session.sessionId, enabled)
+    return enabled
+      ? `已为 ${session.displayName} 开启全自动模式。高风险操作仍会等待人工审批。`
+      : `已为 ${session.displayName} 关闭全自动模式。`
   }
 
   private workspaceActivity(selector: string, settings: StoredDingTalkSettings): string {

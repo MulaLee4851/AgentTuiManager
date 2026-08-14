@@ -28,6 +28,7 @@ import { openNativeResumeTerminal } from './native-terminal'
 import { safeAuditExport } from './audit-export'
 import { NativeDragBridge, type NativeDragEvent } from './native-drag-bridge'
 import { detectAgentEnvironment, installAgent, installNodeAndNpm, installRipgrep } from './agent-environment-manager'
+import { environmentWithFreshWindowsPath, pathFromEnvironment } from './windows-environment'
 import { IPC_CHANNELS, type AgentConfigInput, type AgentKind, type AgentProxyInput, type ApprovalRequest, type AuditEntry, type ContinueKeywordSettings, type DingTalkSettingsInput, type ExternalTerminalDragProjection, type ManagerEvent, type NativeSessionSummary, type NpmRegistryChoice, type RecoveryRecipe, type SessionSafetySettings, type SessionSummary, type StartSessionRequest } from '../src/shared/manager-api'
 
 let mainWindow: BrowserWindow | undefined
@@ -93,7 +94,8 @@ function executable(agentKind: AgentKind, value: unknown): string {
   const candidate = text(value, 'executable', 1_024)
   const configured = [process.env.AGENT_TUI_ALLOWED_EXECUTABLES ?? '', ...userSelectedExecutables].filter(Boolean).join(delimiter)
   const validated = validateExecutable(agentKind, candidate, configured)
-  return resolveExecutableForPty(validated)
+  const environment = agentKind === 'generic' ? process.env : environmentWithFreshWindowsPath()
+  return resolveExecutableForPty(validated, { path: pathFromEnvironment(environment) })
 }
 
 function workspace(value: unknown): string {
@@ -130,10 +132,11 @@ function startRequest(value: unknown): StartSessionRequest {
   const canonicalRecovery = nativeSessionId
     ? canonicalNativeRecovery(agentKind, nativeSessionId, initialExecutable, initialArgs, suppliedRecovery)
     : suppliedRecovery
+  const sessionWorkspace = agentKind === 'deepseek' ? workspace(app.getPath('home')) : workspace(input.workspace)
   return {
     displayName: text(input.displayName, 'displayName', 120),
     agentKind,
-    workspace: workspace(input.workspace),
+    workspace: sessionWorkspace,
     executable: initialExecutable,
     args: initialArgs,
     ...dimensions(input.cols, input.rows),
@@ -280,7 +283,7 @@ async function resolvedAgentConfig(agentKind: AgentKind, input: AgentConfigInput
 }
 
 function validatedAgentKind(value: unknown): AgentKind {
-  if (!['generic', 'codex', 'claude', 'pi'].includes(String(value))) throw new Error('Invalid agent kind')
+  if (!['generic', 'codex', 'claude', 'pi', 'deepseek'].includes(String(value))) throw new Error('Invalid agent kind')
   return value as AgentKind
 }
 
@@ -1155,6 +1158,24 @@ void app.whenReady().then(async () => {
     },
   }
   const fullAutoActivity = {
+    pending(request: ApprovalRequest) {
+      void dingTalkStreamService?.notifyApproval(request, dingTalkSettingsStore.getRuntimeSettings()).then((sent) => {
+        if (!sent) return
+        recordAudit({
+          level: 'info', category: 'remote', action: 'remote_approval_notified',
+          message: '已向钉钉发送待审批提醒',
+          sessionId: request.sessionId,
+          details: { requestId: request.requestId, workspace: request.workspace, toolName: request.toolName ?? approvalSubject(request.command) },
+        })
+      }).catch((error) => {
+        recordAudit({
+          level: 'error', category: 'remote', action: 'remote_approval_notification_failed',
+          message: '钉钉待审批提醒发送失败',
+          sessionId: request.sessionId,
+          details: { requestId: request.requestId, workspace: request.workspace, error: error instanceof Error ? error.message : String(error) },
+        })
+      })
+    },
     approved(request: ApprovalRequest) {
       recordAudit({
         level: 'warning', category: 'approval', action: 'full_auto_approved',
@@ -1213,6 +1234,19 @@ void app.whenReady().then(async () => {
       await restoreNativeSessionProvider(controller.listSessions().find((session) => session.sessionId === id))
     },
     restartSession: (id: string) => controller.restartSession(id),
+    setFullAutoMode: async (id: string, enabled: boolean) => {
+      const session = controller.listSessions().find((item) => item.sessionId === id)
+      if (!session) throw new Error('Agent 不存在或已删除')
+      await controller.setFullAutoMode(id, enabled)
+      recordAudit({
+        level: enabled ? 'warning' : 'info',
+        category: 'approval',
+        action: enabled ? 'full_auto_enabled' : 'full_auto_disabled',
+        message: enabled ? session.displayName + ' 已通过钉钉开启全自动模式' : session.displayName + ' 已通过钉钉关闭全自动模式',
+        sessionId: id,
+        details: { enabled, source: 'dingtalk', deletionAllowed: false, workspaceEscapeAllowed: false },
+      })
+    },
   }
   const dingTalkRouter = new DingTalkCommandRouter(
     remoteManager,

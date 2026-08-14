@@ -1,7 +1,7 @@
 import type { HostEvent } from './protocol'
 import type { SessionState } from './session-state'
 
-export type AgentKind = 'generic' | 'codex' | 'claude' | 'pi'
+export type AgentKind = 'generic' | 'codex' | 'claude' | 'pi' | 'deepseek'
 export type NpmRegistryChoice = 'configured' | 'official' | 'npmmirror' | 'tencent' | 'huawei'
 
 export interface AgentEnvironmentSummary {
@@ -225,6 +225,8 @@ export interface SessionSummary extends SessionState {
   agentConfig?: AgentConfigSummary
   agentProxy?: AgentProxySummary
   fullAutoEnabled?: boolean
+  /** Local browser surface exposed by a managed Web Agent such as DeepSeek Harness. */
+  webUrl?: string
 }
 
 export type AuditLevel = 'info' | 'warning' | 'error'

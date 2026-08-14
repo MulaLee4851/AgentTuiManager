@@ -251,7 +251,7 @@ describe('SessionHostManager integration', () => {
     const runtimeDir = join(root, 'runtime')
     const workspace = join(root, 'workspace')
     await mkdir(workspace, { recursive: true })
-    const resolveAgentConfig = vi.fn(async (_profileId: string, _agentKind: 'generic' | 'codex' | 'claude' | 'pi', args: string[]) => ({
+    const resolveAgentConfig = vi.fn(async (_profileId: string, _agentKind: 'generic' | 'codex' | 'claude' | 'pi' | 'deepseek', args: string[]) => ({
       environment: { MANAGER_PRIVATE_TOKEN: 'target-only-secret' },
       args: [...args, '--print-env', 'MANAGER_PRIVATE_TOKEN'],
     }))

@@ -10,6 +10,7 @@ export interface AgentObservation {
     code: 'model-capacity'
     message: string
   }
+  webUrl?: string
 }
 
 export interface AgentAdapter {
@@ -60,7 +61,7 @@ abstract class EvidenceAdapter implements AgentAdapter {
   observeOutput(data: string): AgentObservation {
     const output = terminalText(data)
     const recoverableWindow = `${this.recoverableTail}${output}`
-    const transientError = recoverableError(recoverableWindow)
+    const transientError = this.kind === 'deepseek' ? undefined : recoverableError(recoverableWindow)
     this.recoverableTail = recoverableWindow.slice(-(MODEL_CAPACITY_ERROR.length - 1))
     this.evidence = `${this.evidence}${output}`.slice(-MAX_EVIDENCE_CHARACTERS)
     const classificationWindow = `${this.classificationTail}${output}`
@@ -120,7 +121,7 @@ abstract class EvidenceAdapter implements AgentAdapter {
   rejectionInput(): string { return '\x1b' }
 
   private hasClassificationSignal(value: string): boolean {
-    if (this.kind === 'generic' || this.kind === 'pi') return value.trim().length > 0
+    if (this.kind === 'generic' || this.kind === 'pi' || this.kind === 'deepseek') return value.trim().length > 0
     if (/approval|permission|would you|do you want|allow|proceed|press enter|\[[yY](?:\/[nN])?\]/i.test(value)) return true
     if (this.kind === 'codex') {
       return /AGENT_MANAGER_CODEX_APPROVAL_|(?:openai\s+)?codex|type \/ to select a command|[›❯]/i.test(value)
@@ -285,8 +286,26 @@ class GenericAdapter extends EvidenceAdapter {
   }
 }
 
+class DeepSeekAdapter extends EvidenceAdapter {
+  readonly kind = 'deepseek' as const
+  readonly supportsNativeSessions = false
+
+  recoveryRecipe(): undefined { return undefined }
+
+  protected classify(evidence: string): AgentObservation {
+    const matches = [...evidence.matchAll(/(?:^|\n)dsh web:\s+(http:\/\/127\.0\.0\.1:\d+)(?:\s|$)/gi)]
+    const webUrl = matches.at(-1)?.[1]
+    return {
+      approvalRequired: false,
+      ready: Boolean(webUrl),
+      ...(webUrl ? { webUrl } : {}),
+    }
+  }
+}
+
 export function createAgentAdapter(kind: AgentKind): AgentAdapter {
   if (kind === 'codex') return new CodexAdapter()
   if (kind === 'claude') return new ClaudeAdapter()
+  if (kind === 'deepseek') return new DeepSeekAdapter()
   return new GenericAdapter(kind)
 }

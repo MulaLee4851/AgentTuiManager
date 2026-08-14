@@ -135,6 +135,7 @@ button:disabled { cursor: default; opacity: .55; }
 .agent-dot { width: 22px; height: 22px; flex: 0 0 auto; display: grid; place-items: center; color: #092219; background: var(--green); border-radius: 4px; font-size: 9px; font-weight: 900; }
 .agent-dot[src] { display: block; object-fit: cover; }
 .agent-claude { color: #2b1b00; background: #e7ad4f; }
+.agent-deepseek { color: #071b14; background: #4dcc99; }
 .agent-pi { color: #0b1c2d; background: var(--blue); }
 .agent-generic { color: #d1dbda; background: #3b494d; }
 .agent-identity h2, .agent-identity p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -155,6 +156,14 @@ button:disabled { cursor: default; opacity: .55; }
 .terminal-live-host .xterm-viewport::-webkit-scrollbar { width: 9px; height: 9px; }
 .terminal-live-host .xterm-viewport::-webkit-scrollbar-track { background: #111719; }
 .terminal-live-host .xterm-viewport::-webkit-scrollbar-thumb { background: #526367; border: 2px solid #111719; border-radius: 5px; }
+.terminal-card:has(.agent-deepseek) .full-auto-tile-button { display: none; }
+.deepseek-web-surface { display: flex; min-width: 0; min-height: 0; background: #111719; }
+.deepseek-web-surface iframe { width: 100%; height: 100%; min-width: 0; min-height: 0; border: 0; background: #111719; }
+.deepseek-service-overview { width: 100%; min-height: 0; display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; align-items: center; align-content: center; gap: 12px; padding: 18px; color: var(--text); background: #111719; }
+.deepseek-service-logo { width: 44px; height: 44px; padding: 7px; object-fit: contain; background: #182124; border: 1px solid #344145; border-radius: 6px; }
+.deepseek-service-overview strong, .deepseek-service-overview span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.deepseek-service-overview strong { margin-bottom: 5px; font-size: 12px; }
+.deepseek-service-overview span { color: #91a0a4; font: 9px/1.4 'Cascadia Mono', Consolas, monospace; }
 .terminal-copy-button { position: absolute; z-index: 4; top: 9px; right: 11px; height: 26px; min-width: 42px; padding: 0 7px; color: #c9d5d4; background: rgba(32,42,45,.9); border: 1px solid #46555a; border-radius: 4px; opacity: .78; font: 9px/1 Inter, 'Segoe UI', 'Microsoft YaHei', sans-serif; cursor: pointer; }
 .terminal-copy-button:hover, .terminal-copy-button:focus-visible { color: #e7eeee; background: #2b383c; border-color: #607176; opacity: 1; outline: none; }
 .terminal-resize-cover { position: absolute; z-index: 5; inset: 0; overflow: hidden; display: grid; place-items: center; color: var(--muted); background: var(--terminal); font: 10px 'Cascadia Mono', Consolas, monospace; pointer-events: none; }
@@ -233,11 +242,16 @@ button:disabled { cursor: default; opacity: .55; }
 .launcher-agent-options { display: grid; grid-template-columns: repeat(2, minmax(160px, 1fr)); gap: 8px; }
 .launcher-agent-option { min-height: 78px; display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 10px; align-items: center; padding: 10px; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; text-align: left; }
 .launcher-agent-option.active { padding: 9px; background: var(--green-soft); border: 2px solid var(--green); }
+.launcher-agent-option:disabled { color: var(--muted); opacity: .48; cursor: not-allowed; }
 .launcher-option-logo { width: 34px; height: 34px; display: grid; place-items: center; color: #092219; background: var(--green); border-radius: 5px; font-size: 10px; font-weight: 900; }
 .launcher-option-logo[src] { display: block; object-fit: cover; }
 .launcher-option-logo.option-claude { color: #291a00; background: #e7ad4f; }
+.launcher-option-logo.option-deepseek { color: #071b14; background: #4dcc99; }
 .launcher-option-logo.option-pi { color: #0a1b2b; background: var(--blue); }
 .launcher-option-logo.option-generic { color: #d1dbda; background: #3b494d; }
+.launcher-agent-capability-note { display: grid; gap: 4px; margin-top: 10px; padding: 10px 12px; color: #b7c9c5; background: var(--blue-soft); border-left: 3px solid var(--blue); border-radius: 4px; }
+.launcher-agent-capability-note strong { color: var(--text); font-size: 10px; }
+.launcher-agent-capability-note span { color: #aebfc3; font-size: 9px; line-height: 1.55; }
 .launcher-agent-option strong, .launcher-agent-option > span:last-child > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .launcher-agent-option strong { margin-bottom: 3px; font-size: 11px; }
 .launcher-agent-option > span:last-child > span { color: var(--muted); font-size: 8px; }

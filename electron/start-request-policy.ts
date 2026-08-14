@@ -6,6 +6,7 @@ const BUILT_INS: Record<AgentKind, ReadonlySet<string>> = {
   codex: new Set(['codex', 'codex.exe', 'codex.cmd']),
   claude: new Set(['claude', 'claude.exe', 'claude.cmd']),
   pi: new Set(['pi', 'pi.exe', 'pi.cmd']),
+  deepseek: new Set(['dsh', 'dsh.exe', 'dsh.cmd']),
   generic: new Set(['cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe']),
 }
 

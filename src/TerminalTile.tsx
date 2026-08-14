@@ -4,12 +4,13 @@ import { Terminal } from '@xterm/xterm'
 import type { SessionSummary } from './shared/manager-api'
 import codexLogoUrl from '../logo/codex.png'
 import claudeLogoUrl from '../logo/claudecode.png'
+import deepseekLogoUrl from '../logo/deepseek.svg'
 
-const AGENT_LOGO_URLS: Partial<Record<SessionSummary['agentKind'], string>> = { codex: codexLogoUrl, claude: claudeLogoUrl }
+const AGENT_LOGO_URLS: Partial<Record<SessionSummary['agentKind'], string>> = { codex: codexLogoUrl, claude: claudeLogoUrl, deepseek: deepseekLogoUrl }
 
 function AgentLogo({ kind, className = '' }: { kind: SessionSummary['agentKind']; className?: string }): JSX.Element {
   const source = AGENT_LOGO_URLS[kind]
-  return source ? <img className={className} src={source} alt={kind === 'claude' ? 'Claude Code' : 'Codex'} /> : <span className={className}>{kind === 'pi' ? 'Pi' : kind === 'generic' ? '›_' : 'C'}</span>
+  return source ? <img className={className} src={source} alt={kind === 'claude' ? 'Claude Code' : kind === 'deepseek' ? 'DeepSeek Harness' : 'Codex'} /> : <span className={className}>{kind === 'pi' ? 'Pi' : kind === 'generic' ? '›_' : 'C'}</span>
 }
 
 const STABLE_TERMINAL_COLS = 100
@@ -65,7 +66,7 @@ export function terminalCellSize(terminal: Terminal): { width: number; height: n
 }
 
 export function isTerminalProtocolResponse(data: string): boolean {
-  return /^(?:\x1b\[\??\d+;\d+R|\x1b\[\??[\d;]*c|\x1b\[>[\d;]*c|\x1b\[\?[\d;]*u)$/.test(data)
+  return /^(?:(?:\x1b\[\??\d+;\d+R|\x1b\[\??[\d;]*c|\x1b\[>[\d;]*c|\x1b\[\?[\d;]*u)|(?:\x1b\](?:10|11|12);rgb:[\da-f]{1,4}\/[\da-f]{1,4}\/[\da-f]{1,4}(?:\x07|\x1b\\)))+$/i.test(data)
 }
 
 function isClosedPreviousHostError(message: string): boolean {
@@ -100,9 +101,11 @@ export default function TerminalTile({ session, detail = false, embedded = false
   const statusRef = useRef(session.status)
   statusRef.current = session.status
   const terminalEnded = session.status === 'completed' || session.status === 'stopped' || session.status === 'failed'
+  const deepSeekWeb = session.agentKind === 'deepseek'
+  const deepSeekWebUrl = session.webUrl && /^http:\/\/127\.0\.0\.1:\d+\/?$/.test(session.webUrl) ? session.webUrl : undefined
 
   useEffect(() => {
-    if (terminalEnded) return
+    if (terminalEnded || deepSeekWeb) return
     const host = hostRef.current
     if (!host) return
     const terminal = new Terminal({
@@ -127,6 +130,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
     terminal.open(host)
     let pendingOutput = ''
     let replayLoaded = false
+    let replayProtocolResponsesBlocked = false
     let outputBeforeReplay: Array<{ data: string; sequence?: number }> = []
     let outputFrame = 0
     let writeInFlight = false
@@ -223,11 +227,13 @@ export default function TerminalTile({ session, detail = false, embedded = false
       pendingOutput = ''
       if (!output) return
       const synchronizedResizeRedraw = resizeRedrawActive || initialReplayLoading
+      replayProtocolResponsesBlocked = initialReplayLoading
       resizeRedrawActive = false
       initialReplayLoading = false
       writeInFlight = true
       terminal.write(synchronizedResizeRedraw ? `\x1b[?2026h${output}\x1b[?2026l` : output, () => {
         writeInFlight = false
+        replayProtocolResponsesBlocked = false
         restoreUserScroll()
         if (synchronizedResizeRedraw) {
           if (resizeWasAtBottom && userScrollOffset === undefined) programmaticScroll(() => terminal.scrollToBottom())
@@ -305,9 +311,10 @@ export default function TerminalTile({ session, detail = false, embedded = false
       return false
     })
     const input = terminal.onData((data) => {
-      // Codex terminal probes are answered synchronously by its persistent Host. A renderer replay
-      // can parse the same query again; do not deliver that duplicate protocol reply as user input.
-      if (session.agentKind === 'codex' && isTerminalProtocolResponse(data)) return
+      // Replaying an old query makes a new xterm instance answer it again. The original live query
+      // was already handled, so never deliver that duplicate reply as user input. Codex Host also
+      // answers live probes itself; preserve the existing all-time Codex guard.
+      if (isTerminalProtocolResponse(data) && (session.agentKind === 'codex' || replayProtocolResponsesBlocked)) return
       userScrollOffset = undefined
       queueTerminalInput(data, /[\r\n\x03\x1b]/.test(data))
     })
@@ -502,7 +509,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
       copyButton.remove()
       terminal.dispose()
     }
-  }, [session.sessionId, terminalEnded])
+  }, [session.sessionId, terminalEnded, deepSeekWeb])
 
   useEffect(() => {
     if (session.status === 'starting' || session.status === 'recovering' || session.status === 'running') {
@@ -536,7 +543,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
         </div>
         <div className="terminal-actions">
           <span className={`status-badge status-${session.status}`}>{STATUS_LABEL[session.status]}</span>
-          {!terminalEnded && onFullAuto && <button className={'full-auto-tile-button' + (session.fullAutoEnabled ? ' active' : '')} type="button" title={session.fullAutoEnabled ? '关闭全自动模式' : '开启全自动模式'} onClick={(event) => { event.stopPropagation(); onFullAuto() }}>{session.fullAutoEnabled ? '全自动中' : '全自动'}</button>}
+          {!terminalEnded && !deepSeekWeb && onFullAuto && <button className={'full-auto-tile-button' + (session.fullAutoEnabled ? ' active' : '')} type="button" title={session.fullAutoEnabled ? '关闭全自动模式' : '开启全自动模式'} onClick={(event) => { event.stopPropagation(); onFullAuto() }}>{session.fullAutoEnabled ? '全自动中' : '全自动'}</button>}
           {onEdit && <button className="button-ghost" type="button" title="编辑 Agent" onClick={(event) => { event.stopPropagation(); onEdit() }} aria-label={`编辑 ${session.displayName}`}>✎</button>}
           {!detail && !embedded && !terminalEnded && <button className="button-ghost" type="button" onClick={(event) => { event.stopPropagation(); onOpen?.() }} aria-label={`查看 ${session.displayName}`}>⛶</button>}
           {terminalEnded ? <>
@@ -549,6 +556,14 @@ export default function TerminalTile({ session, detail = false, embedded = false
         <div className="terminal-ended-icon">›_</div>
         <strong>{session.status === 'completed' ? 'Agent 已正常完成' : session.status === 'stopped' ? 'Agent 已停止' : 'Agent 运行失败'}</strong>
         <span className={actionError ? 'terminal-ended-error' : undefined}>{actionError || (session.status === 'failed' && session.lastError ? session.lastError : '终端进程已经关闭，可重新启动或从总览删除。')}</span>
+      </div> : deepSeekWeb ? <div className='terminal-surface deepseek-web-surface' onClick={(event) => event.stopPropagation()}>
+        {(detail || embedded) && deepSeekWebUrl
+          ? <iframe src={deepSeekWebUrl} title={session.displayName + ' · DeepSeek Harness'} allow='clipboard-read; clipboard-write' referrerPolicy='no-referrer' />
+          : <div className='deepseek-service-overview'>
+            <AgentLogo kind='deepseek' className='deepseek-service-logo' />
+            <div><strong>{deepSeekWebUrl ? 'DeepSeek Harness Web 已就绪' : '正在启动 DeepSeek Harness Web'}</strong><span>{deepSeekWebUrl ?? 'Manager 正在等待官方服务地址…'}</span></div>
+            {!detail && !embedded && <button type='button' className='button-secondary button-compact' disabled={!deepSeekWebUrl} onClick={(event) => { event.stopPropagation(); onOpen?.() }}>打开完整界面</button>}
+          </div>}
       </div> : <div
         className="terminal-surface"
         onClick={(event) => event.stopPropagation()}

@@ -7,6 +7,8 @@ describe('start request policy', () => {
     expect(validateExecutable('codex', 'codex.cmd', '')).toBe('codex.cmd')
     expect(validateExecutable('claude', 'claude.exe', '')).toBe('claude.exe')
     expect(validateExecutable('pi', 'pi', '')).toBe('pi')
+    expect(validateExecutable('deepseek', 'dsh', '')).toBe('dsh')
+    expect(validateExecutable('deepseek', 'dsh.cmd', '')).toBe('dsh.cmd')
     expect(validateExecutable('generic', 'cmd.exe', '')).toBe('cmd.exe')
     expect(validateExecutable('generic', 'pwsh.exe', '')).toBe('pwsh.exe')
     expect(() => validateExecutable('codex', 'claude.cmd', '')).toThrow(/allowed/i)

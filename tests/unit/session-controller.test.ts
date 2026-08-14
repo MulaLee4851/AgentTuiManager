@@ -118,6 +118,25 @@ describe('SessionController recovery evidence', () => {
     expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('needs_approval')
   })
 
+  it('publishes the official DeepSeek Harness URL and clears it before restart', async () => {
+    const { controller, handles, manager } = fixture()
+    const session = await controller.startSession({
+      ...request(true),
+      agentKind: 'deepseek',
+      executable: 'dsh',
+      args: ['web', '--host', '127.0.0.1', '--port', '0'],
+      recovery: { executable: 'dsh', args: ['web', '--host', '127.0.0.1', '--port', '0'] },
+    })
+    handles[0]!.emit({ type: 'output', data: 'dsh web: http://127.0.0.1:43127\r\n' })
+    await settle()
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.webUrl).toBe('http://127.0.0.1:43127')
+
+    vi.mocked(manager.readLastExit).mockResolvedValue({ hostId: 'host-1', exitCode: 0, exitedAt: '2026-08-14T00:00:00.000Z' })
+    await controller.stopSession(session.sessionId)
+    await controller.restartSession(session.sessionId)
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.webUrl).toBeUndefined()
+  })
+
   it('updates an Agent configuration without restarting its Host', async () => {
     const { controller, manager, starts } = fixture()
     const session = await controller.startSession(request())
@@ -525,6 +544,24 @@ describe('SessionController recovery evidence', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('completes a structured Claude Hook when the user approves with Enter in the terminal', async () => {
+    const base = fixture()
+    const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
+    const session = await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+    base.handles[0]!.emit({
+      type: 'permission-request', requestId: 'hook-terminal-enter', toolName: 'Write', operation: 'write',
+    })
+    await settle()
+    expect(controller.listPendingApprovals().map((item) => item.requestId)).toEqual(['hook-terminal-enter'])
+
+    controller.write(session.sessionId, '\r')
+
+    expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'hook-terminal-enter', action: 'allow' }])
+    expect(base.handles[0]!.writes).toEqual([])
+    expect(controller.listPendingApprovals()).toEqual([])
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
   })
 
   it('falls back to Claude terminal approval only when no Hook arrives', async () => {

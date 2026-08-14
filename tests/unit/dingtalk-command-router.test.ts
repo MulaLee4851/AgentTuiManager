@@ -29,6 +29,7 @@ function createRouter(overrides: Partial<{
     write: vi.fn(),
     stopSession: vi.fn(async () => undefined),
     restartSession: vi.fn(async () => undefined),
+    setFullAutoMode: vi.fn(async () => undefined),
   }
   const audit = { list: vi.fn(() => []), record: vi.fn() }
   const bind = vi.fn(async () => true)
@@ -77,6 +78,14 @@ describe('DingTalkCommandRouter', () => {
     const blocked = createRouter({ approvals: [foreign] })
     await expect(blocked.router.execute('/approve-all', { staffId: 'staff-1' })).resolves.toContain('工作区白名单外')
     expect(blocked.manager.approveAllPending).not.toHaveBeenCalled()
+  })
+
+  it('turns full-auto mode on and off for a selected allowed Agent', async () => {
+    const { router, manager } = createRouter()
+    await expect(router.execute('/auto session- on', { staffId: 'staff-1' })).resolves.toContain('已为 Code Agent 开启全自动模式')
+    await expect(router.execute('/auto Code Agent off', { staffId: 'staff-1' })).resolves.toContain('已为 Code Agent 关闭全自动模式')
+    expect(manager.setFullAutoMode).toHaveBeenNthCalledWith(1, 'session-12345678', true)
+    expect(manager.setFullAutoMode).toHaveBeenNthCalledWith(2, 'session-12345678', false)
   })
 
   it('enforces per-user rate limits', async () => {

@@ -31,6 +31,8 @@ describe('App terminal wall', () => {
   it('recognizes terminal protocol replies that Codex Host already answered', () => {
     expect(isTerminalProtocolResponse('\x1b[1;1R')).toBe(true)
     expect(isTerminalProtocolResponse('\x1b[?1;2c')).toBe(true)
+    expect(isTerminalProtocolResponse('\x1b]10;rgb:cbcb/d9d9/d7d7\x1b\\')).toBe(true)
+    expect(isTerminalProtocolResponse('\x1b]10;rgb:cbcb/d9d9/d7d7\x1b\\\x1b]11;rgb:0b0b/1010/1111\x07')).toBe(true)
     expect(isTerminalProtocolResponse('continue\r')).toBe(false)
   })
 
@@ -41,7 +43,7 @@ describe('App terminal wall', () => {
     vi.clearAllMocks()
     window.localStorage.clear()
     api = {
-      listSessions: vi.fn(async () => [session]), startSession: vi.fn(), write: vi.fn(), resize: vi.fn(),
+      listSessions: vi.fn(async () => [session]), startSession: vi.fn(async (request) => ({ ...session, displayName: request.displayName, agentKind: request.agentKind, workspace: request.workspace })), write: vi.fn(), resize: vi.fn(),
       terminalReplay: vi.fn(async () => ({ data: '', sequence: 0 })),
       listAuditEntries: vi.fn(async () => []),
       exportAuditEntries: vi.fn(async () => undefined),
@@ -102,6 +104,25 @@ describe('App terminal wall', () => {
     expect(terminalMocks.open).toHaveBeenCalledTimes(1)
     expect(window.agentManager.subscribe).toHaveBeenCalledTimes(2)
     expect(terminalMocks.scrollToBottom).not.toHaveBeenCalled()
+  })
+
+  it('keeps DeepSeek lightweight in overview and embeds its official Web UI in detail', async () => {
+    vi.mocked(api.listSessions).mockResolvedValue([{
+      ...session,
+      agentKind: 'deepseek',
+      displayName: 'DeepSeek Harness',
+      webUrl: 'http://127.0.0.1:43127',
+    }])
+    render(<App />)
+    const tile = await screen.findByTestId('terminal-tile-session-1')
+    expect(within(tile).getByText('DeepSeek Harness Web 已就绪')).toBeInTheDocument()
+    expect(tile.querySelector('iframe')).toBeNull()
+    expect(Terminal).not.toHaveBeenCalled()
+
+    fireEvent.click(within(tile).getByRole('button', { name: '打开完整界面' }))
+    const frame = await screen.findByTitle('DeepSeek Harness · DeepSeek Harness')
+    expect(frame).toHaveAttribute('src', 'http://127.0.0.1:43127')
+    expect(Terminal).not.toHaveBeenCalled()
   })
 
   it('switches Agent list mode without recreating mounted terminals', async () => {
@@ -442,6 +463,37 @@ describe('App terminal wall', () => {
     fireEvent.click(await screen.findByRole('button', { name: '一键安装 Agent CLI' }))
     await waitFor(() => expect(api.installAgent).toHaveBeenCalledWith('codex', 'configured'))
     expect(await screen.findByText('环境已就绪，可以创建 Agent。')).toBeInTheDocument()
+  })
+
+  it('starts DeepSeek Harness as a managed local Web Agent', async () => {
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: /新建 Agent/ }))
+    fireEvent.change(screen.getByLabelText('Agent 类型'), { target: { value: 'deepseek' } })
+    expect(screen.getByAltText('DeepSeek Harness')).toBeInTheDocument()
+    expect(screen.getByText('DeepSeek Harness 官方当前没有交互式 TUI')).toBeInTheDocument()
+    expect(screen.getByText(/暂不进入 Manager 处理中心或全自动模式/)).toBeInTheDocument()
+    expect(screen.getByLabelText('工作区')).toBeDisabled()
+    expect(screen.getByLabelText('工作区')).toHaveValue('在 Harness Web 内选择')
+    expect(screen.getByRole('button', { name: '选择文件夹' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: '启动 Agent' }))
+
+    await waitFor(() => expect(api.detectAgentEnvironment).toHaveBeenCalledWith('deepseek', 'dsh'))
+    expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({
+      agentKind: 'deepseek',
+      executable: 'dsh',
+      args: ['web', '--host', '127.0.0.1', '--port', '0'],
+      recovery: { executable: 'dsh', args: ['web', '--host', '127.0.0.1', '--port', '0'] },
+    }))
+  })
+
+  it('keeps the Pi launcher unavailable while preserving the Agent type', async () => {
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: /新建 Agent/ }))
+    const pi = screen.getByRole('button', { name: /Pi.*暂不可用/ })
+    expect(pi).toBeDisabled()
+    expect(screen.getByLabelText('Agent 类型')).toHaveValue('codex')
   })
 
   it('uses the system picker for an Agent executable outside PATH', async () => {

@@ -81,4 +81,14 @@ describe('applyAgentLaunchProfile', () => {
     })
     expect(result.args).toEqual(['/d', '--feature', 'enabled'])
   })
+
+  it('uses DeepSeek Harness official environment variables without inventing a model flag', () => {
+    const result = applyAgentLaunchProfile('deepseek', ['web', '--port', '0'], profile())
+    expect(result.environment).toEqual({
+      DEEPSEEK_BASE_URL: 'https://gateway.example/v1',
+      DEEPSEEK_API_KEY: 'secret-key',
+    })
+    expect(result.args).toEqual(['web', '--port', '0', '--feature', 'enabled'])
+    expect(result.args).not.toContain('model-x')
+  })
 })

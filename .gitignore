@@ -5,7 +5,7 @@ node_modules/
 dist/
 dist-electron/
 release/
-release-next*/
+release*/
 build/
 coverage/
 *.log

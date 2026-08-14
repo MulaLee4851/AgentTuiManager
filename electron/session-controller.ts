@@ -57,6 +57,7 @@ export interface RecoveryActivityPort {
 }
 
 export interface FullAutoActivityPort {
+  pending?(request: ApprovalRequest): void
   approved(request: ApprovalRequest): void
   blocked(request: ApprovalRequest, reason: string): void
 }
@@ -134,7 +135,7 @@ const CLAUDE_TERMINAL_APPROVAL_FALLBACK_MS = 1_000
 const CLAUDE_TERMINAL_REDRAW_GUARD_MS = 3_000
 
 function isTerminalProtocolResponse(data: string): boolean {
-  return /^(?:\x1b\[\??\d+;\d+R|\x1b\[\??[\d;]*c|\x1b\[>[\d;]*c|\x1b\[\?[\d;]*u)$/.test(data)
+  return /^(?:(?:\x1b\[\??\d+;\d+R|\x1b\[\??[\d;]*c|\x1b\[>[\d;]*c|\x1b\[\?[\d;]*u)|(?:\x1b\](?:10|11|12);rgb:[\da-f]{1,4}\/[\da-f]{1,4}\/[\da-f]{1,4}(?:\x07|\x1b\\)))+$/i.test(data)
 }
 
 export class SessionController {
@@ -255,8 +256,11 @@ export class SessionController {
       try {
         const handle = await this.manager.reconnect(record.hostId)
         const terminalReplay = new TerminalReplayBuffer()
-        terminalReplay.append(await handle.replay(2_000).catch(() => ''))
         const agentKind = record.agentKind ?? 'generic'
+        const replay = await handle.replay(2_000).catch(() => '')
+        terminalReplay.append(replay)
+        const adapter = createAgentAdapter(agentKind)
+        const replayObservation = adapter.observeOutput(replay)
         const managed: ManagedSession = {
           summary: {
             sessionId: restoredSessionId,
@@ -266,6 +270,7 @@ export class SessionController {
             status: 'running',
             recoveryAttempts: 0,
             userStopRequested: false,
+            ...(replayObservation.webUrl ? { webUrl: replayObservation.webUrl } : {}),
             ...(record.nativeSessionId ? { nativeSessionId: record.nativeSessionId } : {}),
           ...(record.agentConfig ? { agentConfig: { ...record.agentConfig, extraArgs: [...record.agentConfig.extraArgs] } } : {}),
           ...(record.agentProxy ? { agentProxy: { ...record.agentProxy } } : {}),
@@ -279,11 +284,11 @@ export class SessionController {
           hostTransitioning: false,
           pendingHostInput: '',
           awaitingRecoveryReady: false,
-          agentReady: false,
+          agentReady: Boolean(replayObservation.ready),
           suppressTransientRetryUntilReady: true,
           terminalReplay,
           outputSequence: 0,
-          adapter: createAgentAdapter(agentKind),
+          adapter,
           approvalRequests: [],
           continueKeywordTail: '',
           continueKeywordAttempted: new Set(),
@@ -369,6 +374,7 @@ export class SessionController {
   write(sessionId: string, data: string): void {
     const managed = this.required(sessionId)
     if (isTerminalStatus(managed.summary.status)) throw new Error('Agent 已结束，请先重新启动')
+    let handledClaudeHookApproval = false
     if (data.length > 0) {
       this.cancelKeywordContinue(managed)
       if (managed.summary.agentKind === 'claude') {
@@ -398,12 +404,22 @@ export class SessionController {
     }
     else if (data.length > 0) {
       managed.pendingUserInterrupt = false
+      const claudeHookApproval = managed.summary.agentKind === 'claude' && /^[\r\n]+$/.test(data)
+        ? managed.approvalRequests.find((request) => request.source === 'claude-hook')
+        : undefined
       const terminalApproval = managed.approvalRequests.find((request) => request.source === 'terminal')
-      if (terminalApproval && /[\r\n]/.test(data)) {
+      if (claudeHookApproval) {
+        managed.adapter.acknowledgeUserInput(true)
+        managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
+        managed.handle.respondToPermission(claudeHookApproval.requestId, 'allow')
+        this.completeManualApproval(managed, claudeHookApproval)
+        handledClaudeHookApproval = true
+      } else if (terminalApproval && /[\r\n]/.test(data)) {
         managed.adapter.acknowledgeUserInput(true)
         this.completeManualApproval(managed, terminalApproval)
       } else if (managed.summary.status !== 'needs_approval') managed.adapter.acknowledgeUserInput()
     }
+    if (handledClaudeHookApproval) return
     if (managed.hostTransitioning) {
       if (isTerminalProtocolResponse(data)) return
       if (managed.pendingHostInput.length + data.length > MAX_PENDING_HOST_INPUT) {
@@ -714,6 +730,7 @@ export class SessionController {
       recoveryAttempted: _recoveryAttempted,
       recoveryRuleApplied: _recoveryRuleApplied,
       attentionKind: _attentionKind,
+      webUrl: _webUrl,
       ...summary
     } = managed.summary
     managed.summary = {
@@ -813,6 +830,10 @@ export class SessionController {
         managed.outputSequence += 1
         this.emit({ sessionId: managed.summary.sessionId, ...event, sequence: managed.outputSequence })
         const observation = managed.adapter.observeOutput(event.data)
+        if (observation.webUrl && managed.summary.webUrl !== observation.webUrl) {
+          managed.summary = { ...managed.summary, webUrl: observation.webUrl }
+          this.changed(managed.summary.sessionId)
+        }
         if (observation.ready || observation.approvalRequired) managed.agentReady = true
         this.observeContinueKeyword(managed, event.data, observation)
         if (observation.approvalRequired) {
@@ -971,6 +992,11 @@ export class SessionController {
     const recoveryToken = ++managed.recoveryToken
     managed.hostTransitioning = true
     managed.pendingHostInput = ''
+    if (managed.summary.webUrl) {
+      const { webUrl: _webUrl, ...summary } = managed.summary
+      managed.summary = summary
+      this.changed(managed.summary.sessionId)
+    }
     try {
       const scrollableRecipe = { ...recipe, args: terminalScrollbackArgs(managed.summary.agentKind, recipe.args) }
       const handle = await this.manager.start({
@@ -1500,6 +1526,7 @@ export class SessionController {
     if (requestIndex >= 0) managed.approvalRequests[requestIndex] = request
     else managed.approvalRequests.push(request)
     this.syncApprovalSummary(managed)
+    if (requestIndex < 0) this.fullAutoActivity?.pending?.(request)
     return request
   }
 
