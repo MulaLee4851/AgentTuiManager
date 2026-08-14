@@ -177,6 +177,17 @@ function jsonRecord(line: string): Record<string, unknown> | undefined {
   }
 }
 
+function isTopLevelCodexSession(meta: Record<string, unknown>): boolean {
+  if (typeof meta.parent_thread_id === 'string' && meta.parent_thread_id.trim()) return false
+
+  const source = meta.source
+  if (source === 'subagent') return false
+  if (source !== null && typeof source === 'object' && !Array.isArray(source)) {
+    if (Object.prototype.hasOwnProperty.call(source, 'subagent')) return false
+  }
+  return true
+}
+
 async function* linesOrEmpty(reader: NativeSessionDiscoveryReader, file: string): AsyncIterable<string> {
   try {
     for await (const line of reader.readLines(file)) yield line
@@ -230,7 +241,7 @@ async function discoverCodex(
     if (record?.type !== 'session_meta' || payload === null || typeof payload !== 'object' || Array.isArray(payload)) continue
     const meta = payload as Record<string, unknown>
     const id = meta.id
-    if (typeof id !== 'string' || !id || !sameWorkspace(meta.cwd, workspace)) continue
+    if (!isTopLevelCodexSession(meta) || typeof id !== 'string' || !id || !sameWorkspace(meta.cwd, workspace)) continue
     let baseUpdatedAt = timestampFrom(meta.timestamp, true)
     if (baseUpdatedAt === undefined) {
       try {
@@ -299,4 +310,49 @@ export async function discoverNativeSessions(
     return discoverClaude(workspace, options.roots?.claude ?? join(homedir(), '.claude'), reader)
   }
   return []
+}
+
+export async function discoverRecentNativeSessions(
+  agentKind: 'codex' | 'claude',
+  since: number,
+  options: NativeSessionDiscoveryOptions = {},
+): Promise<NativeSessionSummary[]> {
+  const reader = options.reader ?? defaultReader
+  if (agentKind === 'codex') {
+    const root = options.roots?.codex ?? join(homedir(), '.codex')
+    const history = await codexHistory(reader, root)
+    let files: string[]
+    try { files = await reader.listFiles(join(root, 'sessions')) } catch { return [] }
+    const sessions = new Map<string, NativeSessionSummary>()
+    for (const file of files.slice(0, MAX_DISCOVERY_FILES)) {
+      if (!/^rollout.*\.jsonl$/i.test(basename(file))) continue
+      let record: Record<string, unknown> | undefined
+      try { record = jsonRecord(await reader.readFirstLine(file)) } catch { continue }
+      const payload = record?.payload
+      if (record?.type !== 'session_meta' || !payload || typeof payload !== 'object' || Array.isArray(payload)) continue
+      const meta = payload as Record<string, unknown>
+      if (!isTopLevelCodexSession(meta) || typeof meta.id !== 'string' || typeof meta.cwd !== 'string') continue
+      let updatedAt = history.get(meta.id)?.updatedAt
+      try { updatedAt = Math.max(updatedAt ?? 0, await reader.mtime(file)) } catch { /* history timestamp remains usable */ }
+      if (!updatedAt || updatedAt < since) continue
+      const candidate: NativeSessionSummary = { id: meta.id, title: history.get(meta.id)?.title ?? meta.id, updatedAt, workspace: meta.cwd }
+      const previous = sessions.get(meta.id)
+      if (!previous || candidate.updatedAt > previous.updatedAt) sessions.set(meta.id, candidate)
+    }
+    return sortSessions(sessions.values())
+  }
+
+  const root = options.roots?.claude ?? join(homedir(), '.claude')
+  const sessions = new Map<string, NativeSessionSummary>()
+  for await (const line of linesOrEmpty(reader, join(root, 'history.jsonl'))) {
+    const record = jsonRecord(line)
+    const id = record?.sessionId
+    const workspace = record?.project
+    const updatedAt = timestampFrom(record?.timestamp) ?? 0
+    if (typeof id !== 'string' || typeof workspace !== 'string' || updatedAt < since) continue
+    const previous = sessions.get(id)
+    const candidate: NativeSessionSummary = { id, title: previous?.title ?? titleFrom(record?.display) ?? id, updatedAt: Math.max(previous?.updatedAt ?? 0, updatedAt), workspace }
+    sessions.set(id, candidate)
+  }
+  return sortSessions(sessions.values())
 }

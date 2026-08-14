@@ -23,8 +23,24 @@ describe('environmentForAgent', () => {
       .toEqual({ CODEX_API_KEY: 'user-key', USERPROFILE: 'C:\\Users\\me' })
   })
 
-  it('does not alter Claude or generic Agent environments', () => {
+  it('enables Claude inline scrollback without changing other inherited settings', () => {
     const source = { CODEX_API_KEY: 'unrelated', CODEX_THREAD_ID: 'parent' }
-    expect(environmentForAgent('claude', source)).toEqual(source)
+    expect(environmentForAgent('claude', source))
+      .toEqual({ ...source, CLAUDE_CODE_NO_FLICKER: '0' })
+    expect(environmentForAgent('claude', { CLAUDE_CODE_NO_FLICKER: '1', ANTHROPIC_BASE_URL: 'https://gateway.example' }))
+      .toEqual({ CLAUDE_CODE_NO_FLICKER: '0', ANTHROPIC_BASE_URL: 'https://gateway.example' })
+    expect(environmentForAgent('generic', source)).toEqual(source)
+  })
+
+  it('refreshes PATH only for Pi and leaves Codex and Claude untouched', () => {
+    const source = { Path: 'C:\\old-bin;C:\\shared', USERPROFILE: 'C:\\Users\\me' }
+    const options = {
+      platform: 'win32' as const,
+      registryPaths: ['%USERPROFILE%\\new-bin;C:\\shared', 'D:\\machine-bin'],
+    }
+    expect(environmentForAgent('pi', source, options).Path)
+      .toBe('C:\\old-bin;C:\\shared;C:\\Users\\me\\new-bin;D:\\machine-bin')
+    expect(environmentForAgent('codex', source, options).Path).toBe(source.Path)
+    expect(environmentForAgent('claude', source, options).Path).toBe(source.Path)
   })
 })

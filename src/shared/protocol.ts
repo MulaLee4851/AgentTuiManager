@@ -15,6 +15,9 @@ export type HostCommand =
   | { type: 'permission-hook'; token: string; requestId: string; toolName: string; command?: string; operation?: import('./manager-api').ApprovalRisk; filePath?: string; targetPaths?: string[]; toolInputSummary?: string; reason?: string }
   | { type: 'replay' }
   | { type: 'stop' }
+  | { type: 'claim-manager'; managerId: string; leaseMs: number; preserveOnLeaseExpiry?: boolean }
+  | { type: 'manager-heartbeat'; managerId: string }
+  | { type: 'preserve-on-disconnect'; managerId: string }
   | { type: 'ping' }
 
 export type HostEvent =
@@ -25,11 +28,13 @@ export type HostEvent =
   | { type: 'permission-request'; requestId: string; toolName: string; command?: string; operation?: import('./manager-api').ApprovalRisk; filePath?: string; targetPaths?: string[]; toolInputSummary?: string; reason?: string }
   | { type: 'permission-response'; requestId: string; action: 'allow' | 'ask' | 'deny' }
   | { type: 'replay'; data: string }
-  | { type: 'pong' }
+  | { type: 'manager-preserved'; managerId: string }
+  | { type: 'pong'; ownership: 'managed' | 'preserved' | 'unclaimed' }
 
 export interface HostExitFact {
   hostId: string
   exitCode: number
   signal?: number
+  reason?: 'process-exit' | 'manager-lease-expired'
   exitedAt: string
 }

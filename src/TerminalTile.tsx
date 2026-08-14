@@ -2,6 +2,15 @@ import { useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 
 import type { SessionSummary } from './shared/manager-api'
+import codexLogoUrl from '../logo/codex.png'
+import claudeLogoUrl from '../logo/claudecode.png'
+
+const AGENT_LOGO_URLS: Partial<Record<SessionSummary['agentKind'], string>> = { codex: codexLogoUrl, claude: claudeLogoUrl }
+
+function AgentLogo({ kind, className = '' }: { kind: SessionSummary['agentKind']; className?: string }): JSX.Element {
+  const source = AGENT_LOGO_URLS[kind]
+  return source ? <img className={className} src={source} alt={kind === 'claude' ? 'Claude Code' : 'Codex'} /> : <span className={className}>{kind === 'pi' ? 'Pi' : kind === 'generic' ? '›_' : 'C'}</span>
+}
 
 const STABLE_TERMINAL_COLS = 100
 const STABLE_TERMINAL_ROWS = 30
@@ -16,6 +25,29 @@ const MAX_FONT_SIZE = 18
 // `.xterm-viewport` keeps a thin scrollbar gutter; reserve it so the last column
 // is never clipped and the grid still fills the surface.
 const TERMINAL_SCROLLBAR_WIDTH = 9
+
+export const NATIVE_TERMINAL_THEME = {
+  background: '#0b1011',
+  foreground: '#cbd9d7',
+  cursor: '#b9d2cc',
+  selectionBackground: '#315d4e',
+  black: '#111719',
+  red: '#f07b7b',
+  green: '#4dcc99',
+  yellow: '#efbd58',
+  blue: '#78afe6',
+  magenta: '#c08ad8',
+  cyan: '#63c7c9',
+  white: '#d5dfdd',
+  brightBlack: '#667579',
+  brightRed: '#ff9a9a',
+  brightGreen: '#72deb5',
+  brightYellow: '#ffd37a',
+  brightBlue: '#9bc7f2',
+  brightMagenta: '#d6a6e8',
+  brightCyan: '#8adfe0',
+  brightWhite: '#f5f8f8',
+} as const
 
 function clamp(value: number, low: number, high: number): number {
   return Math.max(low, Math.min(high, value))
@@ -80,6 +112,8 @@ export default function TerminalTile({ session, detail = false, embedded = false
       convertEol: true,
       fontFamily: 'Cascadia Code, Consolas, monospace',
       fontSize: 12,
+      minimumContrastRatio: 1,
+      drawBoldTextInBrightColors: true,
       // Counted in visual rows, not messages. Narrowing the tile re-wraps every long line,
       // so the same history costs ~1.75x more rows at the grid width than at fullscreen
       // width. At 10,000 the trip fullscreen -> overview overflowed the limit and xterm
@@ -88,7 +122,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
       // xterm grows the scrollback lazily, so a higher ceiling costs nothing until a
       // session really is that long.
       scrollback: 30_000,
-      theme: { background: '#0b1011', foreground: '#cbd9d7', cursor: '#b9d2cc', selectionBackground: '#315d4e' },
+      theme: NATIVE_TERMINAL_THEME,
     })
     terminal.open(host)
     let pendingOutput = ''
@@ -497,7 +531,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
     >
       <header className="terminal-card-header" draggable={draggable} onDragStart={() => onDragStart?.()} onDragEnd={() => onDragEnd?.()}>
         <div className="agent-identity">
-          <span className={`agent-dot agent-${session.agentKind}`}>{session.agentKind === 'claude' ? 'CL' : session.agentKind === 'pi' ? 'Pi' : session.agentKind === 'generic' ? '›_' : 'C'}</span>
+          <AgentLogo kind={session.agentKind} className={'agent-dot agent-' + session.agentKind} />
           <div><h2>{session.displayName}</h2><p title={session.workspace}>{session.workspace}</p></div>
         </div>
         <div className="terminal-actions">
@@ -525,7 +559,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
       {!terminalEnded && <div className="terminal-status-slot">
         {actionError && session.status !== 'needs_approval' && session.status !== 'needs_attention' ? <div className="tile-error">{actionError}</div>
           : session.status === 'needs_approval' ? <div className="inline-request"><span>Agent 正在等待本次授权</span><button className="button-approve" type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.approveSession(session.sessionId) }}>批准</button></div>
-            : session.status === 'needs_attention' ? <div className="inline-request attention-request"><span title={session.lastError}>检测到异常：{session.lastError ?? '原因未知'}</span><button className="button-secondary button-compact" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.dismissRecoverySuggestion(session.sessionId)) }}>忽略</button><button className="button-secondary button-compact" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.acceptRecoverySuggestion(session.sessionId)) }}>采纳</button><button className="button-approve" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.tryRecoveryOnce(session.sessionId)) }}>尝试一次</button></div>
+            : session.status === 'needs_attention' ? <div className="inline-request attention-request"><span title={session.lastError}>{session.attentionKind === 'host-unresponsive' ? 'Agent 窗口疑似卡死，是否重启？' : '检测到异常：' + (session.lastError ?? '原因未知')}</span><button className="button-secondary button-compact" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.dismissRecoverySuggestion(session.sessionId)) }}>{session.attentionKind === 'host-unresponsive' ? '暂不重启' : '忽略'}</button>{session.attentionKind !== 'host-unresponsive' && <button className="button-secondary button-compact" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.acceptRecoverySuggestion(session.sessionId)) }}>采纳</button>}<button className="button-approve" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.tryRecoveryOnce(session.sessionId)) }}>{session.attentionKind === 'host-unresponsive' ? '重启 Agent' : '尝试一次'}</button></div>
               : session.status === 'recovering' ? <div className="recovery-bar"><span>↻</span><span>请稍后…</span></div>
                 : session.approvalSuggestion ? <div className="approval-suggestion"><span className="approval-suggestion-summary" tabIndex={0} data-tooltip={`已手动批准 ${session.approvalSuggestion.approvalCount} 次\n命令：${session.approvalSuggestion.command}\n加入后，相同命令将按安全规则自动批准。`}>已手动批准 {session.approvalSuggestion.approvalCount} 次 · {session.approvalSuggestion.command}</span><button type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.acceptApprovalSuggestion(session.sessionId) }}>加入</button><button type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.dismissApprovalSuggestion(session.sessionId) }}>暂不</button></div>
                   : null}

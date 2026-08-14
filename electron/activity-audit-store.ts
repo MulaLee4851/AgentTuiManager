@@ -19,7 +19,7 @@ function validEntry(value: unknown): value is AuditEntry {
   const entry = value as Partial<AuditEntry>
   return typeof entry.id === 'string' && typeof entry.timestamp === 'number'
     && ['info', 'warning', 'error'].includes(String(entry.level))
-    && ['session', 'approval', 'recovery', 'rule'].includes(String(entry.category))
+    && ['session', 'approval', 'recovery', 'rule', 'remote'].includes(String(entry.category))
     && typeof entry.action === 'string' && typeof entry.message === 'string'
 }
 

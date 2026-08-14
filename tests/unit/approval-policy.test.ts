@@ -146,15 +146,17 @@ describe('ApprovalPolicyEngine', () => {
     expect(canFullAutoApprove({
       command: 'npm test', toolName: 'Bash', risk: 'unknown', workspace: 'B:\\work',
     }).allowed).toBe(true)
+    expect(canFullAutoApprove({ command: 'tool:Task', toolName: 'Task', risk: 'unknown', workspace: 'B:\\work' }).allowed).toBe(true)
+    expect(canFullAutoApprove({ command: 'tool:Write', toolName: 'Write', risk: 'write', workspace: 'B:\\work' }).allowed).toBe(true)
+    expect(canFullAutoApprove({ command: undefined, toolName: 'Read', risk: 'unknown', workspace: 'B:\\work' }).allowed).toBe(true)
   })
 
   it.each([
     { command: 'rm -rf fixtures', risk: 'delete' as const, workspace: 'B:\\work' },
     { command: 'sudo whoami', risk: 'unknown' as const, workspace: 'B:\\work' },
-    { command: 'tool:Write', toolName: 'Write', risk: 'write' as const, workspace: 'B:\\work' },
+    { command: 'tool:Delete', toolName: 'Delete', risk: 'unknown' as const, workspace: 'B:\\work' },
     { command: 'tool:Shell', toolName: 'Shell', risk: 'unknown' as const, workspace: 'B:\\work' },
-    { command: 'tool:Edit', toolName: 'Edit', risk: 'write' as const, workspace: 'B:\\work', filePath: 'C:\\outside\\App.tsx' },
-    { command: undefined, risk: 'unknown' as const, workspace: 'B:\\work' },
+    { command: undefined, toolName: 'Bash', risk: 'unknown' as const, workspace: 'B:\\work' },
   ])('blocks unsafe or unbounded full-auto request: $command', (request) => {
     expect(canFullAutoApprove(request).allowed).toBe(false)
   })

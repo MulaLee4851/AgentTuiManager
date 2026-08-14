@@ -44,10 +44,11 @@ describe('App terminal wall', () => {
       listSessions: vi.fn(async () => [session]), startSession: vi.fn(), write: vi.fn(), resize: vi.fn(),
       terminalReplay: vi.fn(async () => ({ data: '', sequence: 0 })),
       listAuditEntries: vi.fn(async () => []),
+      exportAuditEntries: vi.fn(async () => undefined),
       listPendingApprovals: vi.fn(async () => []), approveRequest: vi.fn(), approveAndRememberRequest: vi.fn(), rejectRequest: vi.fn(),
       approveAllPending: vi.fn(async () => ({ approved: 0, skipped: 0, failed: 0, skippedRequestIds: [] })),
       stopSession: vi.fn(), approveSession: vi.fn(), chooseWorkspace: vi.fn(async () => 'B:\\chosen\\workspace'), subscribe: vi.fn(() => () => undefined),
-      restartSession: vi.fn(), continueSession: vi.fn(), tryRecoveryOnce: vi.fn(), removeSession: vi.fn(),
+      restartSession: vi.fn(), continueSession: vi.fn(), tryRecoveryOnce: vi.fn(), removeSession: vi.fn(), detachSession: vi.fn(),
       renameSession: vi.fn(),
       updateSessionConfig: vi.fn(),
       updateSessionProxy: vi.fn(),
@@ -55,12 +56,24 @@ describe('App terminal wall', () => {
       listCCSwitchProviders: vi.fn(async () => []),
       getContinueKeywordSettings: vi.fn(async () => ({ enabled: false, quietSeconds: 10, keywords: [] })),
       updateContinueKeywordSettings: vi.fn(async (settings) => settings),
+      getSessionSafetySettings: vi.fn(async () => ({ preserveWorkspaceOnCrash: true })),
+      updateSessionSafetySettings: vi.fn(async (settings) => settings),
+      getDingTalkSettings: vi.fn(async () => ({ enabled: false, hasClientSecret: false, allowedWorkspaces: [], commandsPerMinute: 20, bindingKey: 'key', agentModeEnabled: false, hasAgentApiKey: false, agentRetryCount: 3, agentProxyEnabled: false, agentProxyHost: '127.0.0.1', agentProxyPort: 7897, hasAgentProxyPassword: false, connectionStatus: 'disabled' as const })),
+      updateDingTalkSettings: vi.fn(async (settings) => ({ ...settings, hasClientSecret: Boolean(settings.clientSecret), connectionStatus: settings.enabled ? 'connected' : 'disabled' })),
+      resetDingTalkBinding: vi.fn(async () => ({ enabled: false, hasClientSecret: false, allowedWorkspaces: [], commandsPerMinute: 20, bindingKey: 'new-key', agentModeEnabled: false, hasAgentApiKey: false, agentRetryCount: 3, agentProxyEnabled: false, agentProxyHost: '127.0.0.1', agentProxyPort: 7897, hasAgentProxyPassword: false })),
       acceptRecoverySuggestion: vi.fn(), dismissRecoverySuggestion: vi.fn(),
       acceptApprovalSuggestion: vi.fn(), dismissApprovalSuggestion: vi.fn(),
       listApprovalRules: vi.fn(async () => ['git log --oneline']), addApprovalRule: vi.fn(), removeApprovalRule: vi.fn(),
       readClipboardText: vi.fn(async () => 'const pasted = true'),
       writeClipboardText: vi.fn(async () => undefined),
       discoverSessions: vi.fn(async () => [{ id: 'codex-1', title: '修复登录流程', updatedAt: 1_786_000_000_000, workspace: 'B:\\chosen\\workspace' }]),
+      detectAgentEnvironment: vi.fn(async (agentKind, executable) => ({
+        agentKind, executable, packageName: '@openai/codex', nodeAvailable: true, npmAvailable: true,
+        nodeVersion: 'v22.0.0', npmVersion: '10.0.0', agentInstalled: true, executableVersion: 'codex 1.0.0',
+      })),
+      chooseExecutable: vi.fn(async () => 'B:\\tools\\codex.cmd'),
+      installNodeAndNpm: vi.fn(),
+      installAgent: vi.fn(),
     }
     window.agentManager = api
   })
@@ -137,6 +150,58 @@ describe('App terminal wall', () => {
     expect(firstTile).not.toHaveClass('terminal-card-hidden')
     expect(secondTile).not.toHaveClass('terminal-card-hidden')
     expect(Terminal).toHaveBeenCalledTimes(2)
+  })
+
+  it('shows one compact placeholder while an external terminal hovers over the overview', async () => {
+    const listeners: Array<Parameters<AgentManagerApi['subscribe']>[0]> = []
+    vi.mocked(api.subscribe).mockImplementation((listener) => { listeners.push(listener); return () => undefined })
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+
+    act(() => {
+      for (const listener of listeners) listener({
+        type: 'external-terminal-drag',
+        projection: {
+          transactionId: 'native-drop-1',
+          phase: 'hovering',
+          terminalTitle: 'Codex',
+          terminalKind: 'windows-terminal',
+          suggestedAgentKind: 'codex',
+        },
+      })
+    })
+
+    expect(screen.getAllByTestId('handoff-placeholder')).toHaveLength(1)
+    expect(screen.getByTestId('handoff-placeholder')).toHaveTextContent('请稍后…')
+  })
+
+  it('opens a prefilled migration drawer when automatic external handoff needs confirmation', async () => {
+    const listeners: Array<Parameters<AgentManagerApi['subscribe']>[0]> = []
+    vi.mocked(api.subscribe).mockImplementation((listener) => { listeners.push(listener); return () => undefined })
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+
+    act(() => {
+      for (const listener of listeners) listener({
+        type: 'external-terminal-drag',
+        projection: {
+          transactionId: 'native-drop-2',
+          phase: 'dropped',
+          terminalTitle: 'Codex',
+          terminalKind: 'windows-terminal',
+          suggestedAgentKind: 'codex',
+          suggestedWorkspace: 'B:\\chosen\\workspace',
+          suggestedNativeSessionId: 'codex-1',
+          issue: '来源窗口安全校验未通过，请在原终端正常退出后确认迁入',
+        },
+      })
+    })
+
+    expect(await screen.findByRole('heading', { name: '添加 Agent' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '迁移外部会话' })).toHaveClass('active')
+    expect(screen.getByText('来源窗口安全校验未通过，请在原终端正常退出后确认迁入')).toBeInTheDocument()
+    expect(screen.getByDisplayValue('B:\\chosen\\workspace')).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('button', { name: '迁入 Manager' })).toBeEnabled())
   })
 
   it('restores the overview mode, workspace grouping, and selected workspace after remount', async () => {
@@ -359,6 +424,34 @@ describe('App terminal wall', () => {
         extraArgs: ['--reasoning', 'high'],
       },
     })))
+  })
+
+  it('offers one-click installation for a missing Agent CLI and rechecks the environment', async () => {
+    const detect = vi.mocked(api.detectAgentEnvironment!)
+    detect.mockResolvedValueOnce({
+      agentKind: 'codex', executable: 'codex', packageName: '@openai/codex',
+      nodeAvailable: true, npmAvailable: true, nodeVersion: 'v22.0.0', npmVersion: '10.0.0', agentInstalled: false,
+    }).mockResolvedValue({
+      agentKind: 'codex', executable: 'codex', packageName: '@openai/codex',
+      nodeAvailable: true, npmAvailable: true, nodeVersion: 'v22.0.0', npmVersion: '10.0.0',
+      agentInstalled: true, executableVersion: 'codex 1.0.0',
+    })
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: /新建 Agent/ }))
+    fireEvent.click(await screen.findByRole('button', { name: '一键安装 Agent CLI' }))
+    await waitFor(() => expect(api.installAgent).toHaveBeenCalledWith('codex', 'configured'))
+    expect(await screen.findByText('环境已就绪，可以创建 Agent。')).toBeInTheDocument()
+  })
+
+  it('uses the system picker for an Agent executable outside PATH', async () => {
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: /新建 Agent/ }))
+    fireEvent.click(screen.getByText('高级设置'))
+    fireEvent.click(screen.getByRole('button', { name: '选择文件' }))
+    await waitFor(() => expect(api.chooseExecutable).toHaveBeenCalledWith('codex'))
+    expect(screen.getByDisplayValue('B:\\tools\\codex.cmd')).toBeInTheDocument()
   })
 
   it('starts one Agent with an independent HTTP proxy while keeping model configuration local', async () => {
@@ -718,16 +811,33 @@ describe('App terminal wall', () => {
     fireEvent.click(screen.getByRole('button', { name: /审计$/ }))
     expect(await screen.findByRole('heading', { name: '活动审计' })).toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: 'Agent 总览' })).not.toBeInTheDocument()
-    expect(screen.getByText('Codex API 重构 已启动')).toBeInTheDocument()
+    expect(screen.getAllByText('Codex API 重构 已启动')).toHaveLength(2)
     expect(screen.getByText('已撤销自动批准规则')).toBeInTheDocument()
     fireEvent.change(screen.getByRole('combobox', { name: '审计时间' }), { target: { value: '24h' } })
     expect(screen.queryByText('已撤销自动批准规则')).not.toBeInTheDocument()
     fireEvent.change(screen.getByRole('combobox', { name: '审计 Agent' }), { target: { value: 'session-1' } })
-    expect(screen.getByText('Codex API 重构 已启动')).toBeInTheDocument()
+    expect(screen.getAllByText('Codex API 重构 已启动')).toHaveLength(2)
     fireEvent.change(screen.getByRole('combobox', { name: '审计工作区' }), { target: { value: 'b:\\projects\\api' } })
     expect(screen.getByRole('combobox', { name: '审计工作区' })).toHaveValue('b:\\projects\\api')
-    expect(screen.getByText('Codex API 重构 已启动')).toBeInTheDocument()
+    expect(screen.getAllByText('Codex API 重构 已启动')).toHaveLength(2)
     fireEvent.click(screen.getByRole('button', { name: /Agent 总览/ }))
     expect(await screen.findByRole('heading', { name: 'Agent 总览' })).toBeInTheDocument()
+  })
+
+  it('renders large audit histories in pages of fifty rows', async () => {
+    vi.mocked(api.listAuditEntries).mockResolvedValue(Array.from({ length: 120 }, (_, index) => ({
+      id: `audit-${index}`, timestamp: Date.now() - index, level: 'info' as const, category: 'session' as const,
+      action: 'session_event', message: `审计事件 ${index}`,
+    })))
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: /审计$/ }))
+    expect(await screen.findByText('共 120 条 · 第 1/3 页')).toBeInTheDocument()
+    expect(screen.getAllByText('审计事件 0')).toHaveLength(2)
+    expect(screen.queryByText('审计事件 50')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '下一页' }))
+    expect(screen.getByText('共 120 条 · 第 2/3 页')).toBeInTheDocument()
+    expect(screen.getAllByText('审计事件 50')).toHaveLength(2)
+    expect(screen.queryByText('审计事件 0')).not.toBeInTheDocument()
   })
 })

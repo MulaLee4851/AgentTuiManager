@@ -1,4 +1,3 @@
-import { win32 } from 'node:path'
 import type { ApprovalRisk } from '../src/shared/manager-api'
 
 export type { ApprovalRisk }
@@ -196,26 +195,8 @@ export function canBulkApproveCommand(command: string | undefined): boolean {
   return Boolean(normalized && !BULK_BLOCKED_COMMANDS.some((pattern) => pattern.test(normalized)))
 }
 
-const FULL_AUTO_BLOCKED_COMMANDS: RegExp[] = [
-  ...BULK_BLOCKED_COMMANDS,
-  /(?:^|\s)(?:rm|rmdir|del|erase|Remove-Item|Clear-Content|format)(?:\s|$)/i,
-  /git\s+(?:clean|reset\s+--hard)(?:\s|$)/i,
-  /(?:^|\s)(?:sudo|su)\s+/i,
-  /(?:^|\s)(?:chmod|chown)(?:\s|$)/i,
-  /(?:^|\s)(?:Set-Content|Out-File)\b/i,
-  /(?:^|[^<])>{1,2}(?![>&])/,
-]
-
-const FULL_AUTO_BLOCKED_TOOL = /^(?:Delete|Remove|Task|ApplyPatch|Move|Copy|Create|Upload|Publish|Deploy|Install|Uninstall|Kill|Stop|Restart|Format)$/i
+const FULL_AUTO_DELETE_TOOL = /^(?:Delete|Remove|Format)$/i
 const FULL_AUTO_UNBOUNDED_SHELL_TOOL = /^tool:(?:Shell|Bash|PowerShell|Exec|Command)$/i
-
-function workspaceContains(workspace: string, candidate: string): boolean {
-  const normalizedWorkspace = workspace.replace(/\//g, '\\')
-  const normalizedCandidate = candidate.replace(/\//g, '\\')
-  const root = win32.resolve(normalizedWorkspace).toLocaleLowerCase('en-US')
-  const target = win32.resolve(root, normalizedCandidate).toLocaleLowerCase('en-US')
-  return target === root || target.startsWith(root.endsWith('\\') ? root : root + '\\')
-}
 
 export function canFullAutoApprove(input: {
   command?: string
@@ -226,23 +207,18 @@ export function canFullAutoApprove(input: {
   targetPaths?: string[]
 }): { allowed: boolean; reason: string } {
   const command = input.command ? normalizedCommand(input.command) : undefined
-  if (!command) return { allowed: false, reason: 'Agent 没有提供完整命令或工具名称，无法确认影响范围' }
-  if (FULL_AUTO_UNBOUNDED_SHELL_TOOL.test(command)) {
+  const toolName = input.toolName ?? (command ? /^tool:([A-Za-z][\w-]*)$/i.exec(command)?.[1] : undefined)
+  if (input.risk === 'delete' || Boolean(toolName && FULL_AUTO_DELETE_TOOL.test(toolName))) {
+    return { allowed: false, reason: '删除操作不参与全自动批准，仍需逐次人工确认' }
+  }
+  if (command && BULK_BLOCKED_COMMANDS.some((pattern) => pattern.test(command))) {
+    return { allowed: false, reason: '命中删除、提权、下载执行、敏感覆盖或系统破坏保护规则' }
+  }
+  if (command && FULL_AUTO_UNBOUNDED_SHELL_TOOL.test(command)) {
     return { allowed: false, reason: 'Agent 没有提供完整 Shell 命令和参数，无法确认影响范围' }
   }
-  if (input.risk === 'delete' || FULL_AUTO_BLOCKED_COMMANDS.some((pattern) => pattern.test(command))) {
-    return { allowed: false, reason: '命中删除、覆盖、提权或系统破坏保护规则' }
-  }
-  const toolName = input.toolName ?? (/^tool:([A-Za-z][\w-]*)$/i.exec(command)?.[1])
-  if (/^tool:/i.test(command) && toolName && FULL_AUTO_BLOCKED_TOOL.test(toolName)) {
-    return { allowed: false, reason: '该工具可能执行删除、提权或无法限定范围的系统操作' }
-  }
-  const paths = [input.filePath, ...(input.targetPaths ?? [])].filter((value): value is string => Boolean(value))
-  if (input.risk === 'write' && paths.length === 0 && /^tool:/i.test(command)) {
-    return { allowed: false, reason: '写入工具没有提供目标路径，无法确认它位于当前工作区' }
-  }
-  if (paths.some((path) => !workspaceContains(input.workspace, path))) {
-    return { allowed: false, reason: '目标路径位于当前工作区之外' }
+  if (!command && toolName && /^(?:Shell|Bash|PowerShell|Exec|Command)$/i.test(toolName)) {
+    return { allowed: false, reason: 'Agent 没有提供完整 Shell 命令和参数，无法确认影响范围' }
   }
   return { allowed: true, reason: '全自动模式允许此普通操作' }
 }

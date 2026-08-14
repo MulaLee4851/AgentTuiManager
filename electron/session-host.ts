@@ -35,7 +35,9 @@ let managerId: string | undefined
 let managerLeaseMs = 15_000
 let managerLastHeartbeat = 0
 let preserveOnManagerDisconnect = false
+let preserveOnLeaseExpiry = true
 let managerLeaseTimer: ReturnType<typeof setInterval> | undefined
+let terminalExitReason: HostExitFact['reason'] = 'process-exit'
 
 async function atomicWriteJson(path: string, value: unknown): Promise<void> {
   const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`
@@ -95,9 +97,16 @@ function ensureManagerLeaseTimer(): void {
   managerLeaseTimer = setInterval(() => {
     if (!terminal || shuttingDown || preserveOnManagerDisconnect || !managerId) return
     if (Date.now() - managerLastHeartbeat <= managerLeaseMs) return
+    if (preserveOnLeaseExpiry) {
+      preserveOnManagerDisconnect = true
+      managerId = undefined
+      managerSocket = undefined
+      return
+    }
     const ownedTerminal = terminal
     managerId = undefined
     managerSocket = undefined
+    terminalExitReason = 'manager-lease-expired'
     ownedTerminal.kill()
     setTimeout(() => {
       if (terminal === ownedTerminal && !finalizing) void finalizeExit(1, undefined, 'manager-lease-expired')
@@ -143,7 +152,10 @@ function claudeArgs(args: string[], cwd: string): string[] {
       ...hooks,
       PermissionRequest: [
         ...permissionHooks,
-        { matcher: '*', hooks: [{ type: 'command', command: hookCommand(), timeout: 10 }] },
+        // The hook waits for the user/Manager decision. Keep Claude's command
+        // timeout aligned with the hook's 30-minute socket wait; a 10-second
+        // timeout killed valid requests while they were still visible in Manager.
+        { matcher: '*', hooks: [{ type: 'command', command: hookCommand(), timeout: 1_800 }] },
       ],
     },
   }
@@ -222,7 +234,7 @@ function startTerminal(socket: Socket, command: Extract<HostCommand, { type: 'st
       else pendingOutput.push(data)
     })
     terminal.onExit(({ exitCode, signal }) => {
-      void finalizeExit(exitCode, signal)
+      void finalizeExit(exitCode, signal, terminalExitReason)
     })
 
     send(socket, { type: 'ready', hostId })
@@ -285,6 +297,7 @@ function handleCommand(socket: Socket, command: HostCommand): void {
       managerSocket = socket
       managerId = command.managerId
       managerLeaseMs = Math.max(5_000, Math.min(60_000, command.leaseMs))
+      preserveOnLeaseExpiry = command.preserveOnLeaseExpiry !== false
       managerLastHeartbeat = Date.now()
       preserveOnManagerDisconnect = false
       ensureManagerLeaseTimer()
@@ -297,6 +310,7 @@ function handleCommand(socket: Socket, command: HostCommand): void {
         preserveOnManagerDisconnect = true
         managerId = undefined
         managerSocket = undefined
+        send(socket, { type: 'manager-preserved', managerId: command.managerId })
       }
       break
     case 'ping': send(socket, {

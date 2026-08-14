@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   discoverNativeSessions,
+  discoverRecentNativeSessions,
   type NativeSessionDiscoveryReader,
 } from '../../electron/native-session-discovery'
 
@@ -85,6 +86,49 @@ describe('discoverNativeSessions', () => {
     expect(reader.readFirstLine).toHaveBeenCalledTimes(5)
     expect(reader.readLines).toHaveBeenCalledTimes(1)
     expect(reader.readLines).toHaveBeenCalledWith(history)
+  })
+
+  it('filters Codex subagent rollouts from history and recent handoff candidates', async () => {
+    const root = 'C:\\fixture\\.codex'
+    const main = win32.join(root, 'sessions', 'rollout-main.jsonl')
+    const sourceChild = win32.join(root, 'sessions', 'rollout-source-child.jsonl')
+    const parentChild = win32.join(root, 'sessions', 'rollout-parent-child.jsonl')
+    const history = win32.join(root, 'history.jsonl')
+    const files = {
+      [main]: JSON.stringify({ type: 'session_meta', payload: { id: 'main', cwd: 'B:\\repo', source: 'cli' } }),
+      [sourceChild]: JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: 'source-child',
+          cwd: 'B:\\repo',
+          source: { subagent: { thread_spawn: { parent_thread_id: 'main', depth: 1 } } },
+        },
+      }),
+      [parentChild]: JSON.stringify({
+        type: 'session_meta',
+        payload: { id: 'parent-child', cwd: 'B:\\repo', source: 'cli', parent_thread_id: 'main' },
+      }),
+      [history]: '',
+    }
+    const reader = memoryReader(files, {
+      [main]: 10_000,
+      [sourceChild]: 11_000,
+      [parentChild]: 12_000,
+    })
+
+    await expect(discoverNativeSessions('codex', 'B:\\repo', {
+      roots: { codex: root },
+      reader,
+    })).resolves.toEqual([
+      { id: 'main', title: 'main', updatedAt: 10_000, workspace: 'B:\\repo' },
+    ])
+
+    await expect(discoverRecentNativeSessions('codex', 5_000, {
+      roots: { codex: root },
+      reader,
+    })).resolves.toEqual([
+      { id: 'main', title: 'main', updatedAt: 10_000, workspace: 'B:\\repo' },
+    ])
   })
 
   it('deduplicates Claude history using the first file-order title and latest timestamp', async () => {
@@ -176,5 +220,20 @@ describe('discoverNativeSessions', () => {
     expect(sessions).toHaveLength(200)
     expect(sessions[0]?.id).toBe('session-204')
     expect(sessions.at(-1)?.id).toBe('session-005')
+  })
+
+  it('finds only recent Codex candidates across workspaces for native drag handoff', async () => {
+    const root = 'C:\\fixture\\.codex'
+    const recent = win32.join(root, 'sessions', 'rollout-recent.jsonl')
+    const old = win32.join(root, 'sessions', 'rollout-old.jsonl')
+    const reader = memoryReader({
+      [recent]: JSON.stringify({ type: 'session_meta', payload: { id: 'recent', cwd: 'B:\\Recent' } }),
+      [old]: JSON.stringify({ type: 'session_meta', payload: { id: 'old', cwd: 'B:\\Old' } }),
+      [win32.join(root, 'history.jsonl')]: '',
+    }, { [recent]: 10_000, [old]: 1_000 })
+
+    await expect(discoverRecentNativeSessions('codex', 5_000, { roots: { codex: root }, reader })).resolves.toEqual([
+      { id: 'recent', title: 'recent', updatedAt: 10_000, workspace: 'B:\\Recent' },
+    ])
   })
 })

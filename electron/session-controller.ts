@@ -8,11 +8,15 @@ import { createAgentAdapter, extractApprovalCommand, type AgentAdapter, type Age
 import { canBulkApproveCommand, canFullAutoApprove, type ApprovalDecision } from './approval-policy'
 import { TerminalReplayBuffer } from './terminal-replay-buffer'
 import { terminalScrollbackArgs } from './start-request-policy'
+import type { StoredManagedSession } from './managed-session-catalog'
 
 export interface SessionHostManagerPort {
   start(options: StartHostOptions): Promise<HostHandle>
   reconnect(hostId: string): Promise<HostHandle>
   listLiveHosts(): Promise<HostRecord[]>
+  release?(hostId: string): Promise<void>
+  forceRelease?(hostId: string): Promise<void>
+  setPreserveOnLeaseExpiry?(value: boolean): void
   readLastExit(hostId: string): Promise<HostExitFact | undefined>
   updateMetadata(hostId: string, update: HostMetadataUpdate): Promise<void>
   removeArtifacts(hostId: string): Promise<void>
@@ -31,6 +35,14 @@ export interface ApprovalPolicyPort {
 export interface RecoveryPolicyPort {
   hasRule(reason: string): boolean
   addRule(reason: string): Promise<void> | void
+}
+
+export interface ManagedSessionCatalogPort {
+  list(): StoredManagedSession[]
+  upsert(entry: StoredManagedSession): Promise<void>
+  remove(sessionId: string): Promise<void>
+  clear(): Promise<void>
+  flush(): Promise<void>
 }
 
 export interface ContinueKeywordPolicyPort {
@@ -63,10 +75,12 @@ interface ManagedSession {
   handle: HostHandle
   generation: number
   recoveryToken: number
+  hostHealthFailures: number
   pendingUserInterrupt: boolean
   hostTransitioning: boolean
   pendingHostInput: string
   awaitingRecoveryReady: boolean
+  agentReady: boolean
   suppressTransientRetryUntilReady: boolean
   terminalReplay: TerminalReplayBuffer
   outputSequence: number
@@ -74,6 +88,13 @@ interface ManagedSession {
   nativeCapture?: NativeSessionCapture
   pendingApprovalCommand?: string
   approvalRequests: ApprovalRequest[]
+  pendingClaudeTerminalApproval?: {
+    timer: ReturnType<typeof setTimeout>
+    generation: number
+    observation: AgentObservation
+    eventData: string
+  }
+  claudeTerminalFallbackBlockedUntil?: number
   transientRetry?: {
     timer: ReturnType<typeof setTimeout>
     generation: number
@@ -103,9 +124,14 @@ function isTerminalStatus(status: SessionSummary['status']): boolean {
   return status === 'completed' || status === 'stopped' || status === 'failed'
 }
 
+const HOST_HEALTH_PROBE_TIMEOUT_MS = 1_000
+const HOST_HEALTH_FAILURE_LIMIT = 3
+
 const TRANSIENT_RETRY_DELAY_MS = 3_000
 const CONTINUE_SUBMIT_DELAY_MS = 75
 const MAX_PENDING_HOST_INPUT = 64 * 1024
+const CLAUDE_TERMINAL_APPROVAL_FALLBACK_MS = 1_000
+const CLAUDE_TERMINAL_REDRAW_GUARD_MS = 3_000
 
 function isTerminalProtocolResponse(data: string): boolean {
   return /^(?:\x1b\[\??\d+;\d+R|\x1b\[\??[\d;]*c|\x1b\[>[\d;]*c|\x1b\[\?[\d;]*u)$/.test(data)
@@ -128,6 +154,7 @@ export class SessionController {
     private readonly fullAutoActivity?: FullAutoActivityPort,
     private readonly continueKeywordPolicy?: ContinueKeywordPolicyPort,
     private readonly recoveryActivity?: RecoveryActivityPort,
+    private readonly catalog?: ManagedSessionCatalogPort,
   ) {
     this.manager = manager
     this.emit = emit
@@ -157,13 +184,17 @@ export class SessionController {
     return { data: managed.terminalReplay.snapshot(), sequence: managed.outputSequence }
   }
 
+  isSessionReady(sessionId: string): boolean {
+    return this.required(sessionId).agentReady
+  }
+
   async startSession(request: StartSessionRequest): Promise<SessionSummary> {
     const adapter = createAgentAdapter(request.agentKind)
     const nativeCapture = !request.nativeSessionId && adapter.supportsNativeSessions
       ? await this.prepareNativeCapture(request.agentKind, request.workspace)
       : undefined
     const sessionId = randomUUID()
-    const handle = await this.manager.start(this.hostOptions(request))
+    const handle = await this.manager.start(this.hostOptions(request, sessionId))
     const managed: ManagedSession = {
       summary: {
         sessionId,
@@ -181,10 +212,12 @@ export class SessionController {
       handle,
       generation: 1,
       recoveryToken: 0,
+      hostHealthFailures: 0,
       pendingUserInterrupt: false,
       hostTransitioning: false,
       pendingHostInput: '',
       awaitingRecoveryReady: false,
+      agentReady: false,
       suppressTransientRetryUntilReady: Boolean(request.nativeSessionId),
       terminalReplay: new TerminalReplayBuffer(),
       outputSequence: 0,
@@ -200,9 +233,25 @@ export class SessionController {
     return { ...managed.summary }
   }
 
-  async restoreLiveHosts(): Promise<void> {
-    for (const record of await this.manager.listLiveHosts()) {
-      if (this.sessions.has(record.hostId)) continue
+  async restoreSessions(preserveWorkspaceOnCrash = true): Promise<void> {
+    const liveRecords = await this.manager.listLiveHosts()
+    const reconnectableHostIds = new Set(liveRecords
+      .filter((record) => preserveWorkspaceOnCrash || record.managerOwnership === 'preserved')
+      .map((record) => record.hostId))
+    for (const record of liveRecords) {
+      if (reconnectableHostIds.has(record.hostId)) continue
+      await this.manager.release?.(record.hostId).catch(() => undefined)
+    }
+    const storedEntries = this.catalog?.list() ?? []
+    if (!preserveWorkspaceOnCrash) {
+      const preservedSessionIds = new Set(liveRecords.filter((record) => record.managerOwnership === 'preserved').map((record) => record.sessionId ?? record.hostId))
+      for (const entry of storedEntries) {
+        if (!preservedSessionIds.has(entry.sessionId)) await this.catalog?.remove(entry.sessionId)
+      }
+    }
+    for (const record of liveRecords.filter((candidate) => reconnectableHostIds.has(candidate.hostId))) {
+      const restoredSessionId = record.sessionId ?? record.hostId
+      if (this.sessions.has(restoredSessionId)) continue
       try {
         const handle = await this.manager.reconnect(record.hostId)
         const terminalReplay = new TerminalReplayBuffer()
@@ -210,7 +259,7 @@ export class SessionController {
         const agentKind = record.agentKind ?? 'generic'
         const managed: ManagedSession = {
           summary: {
-            sessionId: record.hostId,
+            sessionId: restoredSessionId,
             displayName: record.displayName ?? `已恢复 Agent ${record.hostId.slice(0, 8)}`,
             agentKind,
             workspace: record.cwd,
@@ -225,10 +274,12 @@ export class SessionController {
           handle,
           generation: 1,
           recoveryToken: 0,
+          hostHealthFailures: 0,
           pendingUserInterrupt: false,
           hostTransitioning: false,
           pendingHostInput: '',
           awaitingRecoveryReady: false,
+          agentReady: false,
           suppressTransientRetryUntilReady: true,
           terminalReplay,
           outputSequence: 0,
@@ -257,11 +308,60 @@ export class SessionController {
             },
           }
         }
-        this.sessions.set(record.hostId, managed)
-        this.changed(record.hostId)
+        this.sessions.set(restoredSessionId, managed)
+        this.changed(restoredSessionId)
         void this.pump(managed, managed.generation)
       } catch {
         // A live host can be between endpoint restarts; the next app launch probes again.
+      }
+    }
+    const liveSessionIds = new Set([...this.sessions.keys()])
+    for (const entry of this.catalog?.list() ?? []) {
+      if (liveSessionIds.has(entry.sessionId)) continue
+      const alreadyTerminal = isTerminalStatus(entry.summary.status)
+      const summary: SessionSummary = alreadyTerminal
+        ? { ...entry.summary }
+        : {
+            ...entry.summary,
+            status: 'stopped',
+            userStopRequested: true,
+            recoveryAttempts: 0,
+            lastError: entry.summary.lastError ?? 'Manager 上次未正常退出，受管终端已释放',
+          }
+      const handle = this.detachedHandle(entry.hostId)
+      this.sessions.set(entry.sessionId, {
+        summary,
+        ...(entry.request ? { request: entry.request } : {}),
+        handle,
+        generation: 1,
+        recoveryToken: 0,
+        hostHealthFailures: 0,
+        pendingUserInterrupt: false,
+        hostTransitioning: false,
+        pendingHostInput: '',
+        awaitingRecoveryReady: false,
+        agentReady: false,
+        suppressTransientRetryUntilReady: true,
+        terminalReplay: new TerminalReplayBuffer(),
+        outputSequence: 0,
+        adapter: createAgentAdapter(summary.agentKind),
+        approvalRequests: [],
+        continueKeywordTail: '',
+        continueKeywordAttempted: new Set(),
+      })
+      this.changed(entry.sessionId)
+    }
+  }
+
+  async restoreLiveHosts(): Promise<void> {
+    await this.restoreSessions(true)
+  }
+
+  updateCrashRetentionPolicy(preserveWorkspaceOnCrash: boolean): void {
+    this.manager.setPreserveOnLeaseExpiry?.(preserveWorkspaceOnCrash)
+    for (const managed of this.sessions.values()) {
+      if (!isTerminalStatus(managed.summary.status)) {
+        managed.handle.updateManagerLeasePolicy?.(preserveWorkspaceOnCrash)
       }
     }
   }
@@ -271,11 +371,21 @@ export class SessionController {
     if (isTerminalStatus(managed.summary.status)) throw new Error('Agent 已结束，请先重新启动')
     if (data.length > 0) {
       this.cancelKeywordContinue(managed)
+      if (managed.summary.agentKind === 'claude') {
+        this.cancelClaudeTerminalApproval(managed)
+        managed.claudeTerminalFallbackBlockedUntil = 0
+      }
       if (!isTerminalProtocolResponse(data)) managed.continueKeywordAttempted.clear()
       this.cancelTransientRetry(managed, true)
       this.cancelPendingContinueSubmit(managed)
       if (managed.summary.status === 'needs_attention') {
+        const resumeHostMonitoring = managed.summary.attentionKind === 'host-unresponsive'
         this.clearRecoveryState(managed, 'running')
+        if (resumeHostMonitoring) {
+          managed.hostHealthFailures = 0
+          managed.generation += 1
+          void this.pump(managed, managed.generation)
+        }
         this.changed(sessionId)
       }
     }
@@ -321,6 +431,9 @@ export class SessionController {
   approveRequest(requestId: string): void {
     const { managed, request } = this.requiredApproval(requestId)
     if (request.source === 'claude-hook') {
+      this.cancelClaudeTerminalApproval(managed)
+      managed.adapter.acknowledgeUserInput(true)
+      managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
       managed.handle.respondToPermission(request.requestId, 'allow')
     } else {
       managed.adapter.acknowledgeUserInput(true)
@@ -343,6 +456,9 @@ export class SessionController {
   rejectRequest(requestId: string): void {
     const { managed, request } = this.requiredApproval(requestId)
     if (request.source === 'claude-hook') {
+      this.cancelClaudeTerminalApproval(managed)
+      managed.adapter.acknowledgeUserInput(true)
+      managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
       managed.handle.respondToPermission(request.requestId, 'deny')
     } else {
       managed.adapter.acknowledgeUserInput(true)
@@ -392,6 +508,14 @@ export class SessionController {
   dismissRecoverySuggestion(sessionId: string): void {
     const managed = this.required(sessionId)
     if (managed.summary.status !== 'needs_attention') return
+    if (managed.summary.attentionKind === 'host-unresponsive') {
+      this.clearRecoveryState(managed, 'running')
+      managed.hostHealthFailures = 0
+      managed.generation += 1
+      this.changed(sessionId)
+      void this.pump(managed, managed.generation)
+      return
+    }
     const action = managed.summary.recoveryAction
     this.clearRecoveryState(managed, action === 'resume' ? 'failed' : 'running', action === 'resume')
     this.changed(sessionId)
@@ -437,7 +561,9 @@ export class SessionController {
     const normalized = displayName.trim()
     if (!normalized || normalized.length > 120 || /[\r\n\0]/.test(normalized)) throw new Error('Agent 名称应为 1 到 120 个字符')
     if (managed.summary.displayName === normalized) return
-    await this.manager.updateMetadata(managed.handle.hostId, { displayName: normalized })
+    if (!isTerminalStatus(managed.summary.status)) {
+      await this.manager.updateMetadata(managed.handle.hostId, { displayName: normalized })
+    }
     managed.summary = { ...managed.summary, displayName: normalized }
     if (managed.request) managed.request = { ...managed.request, displayName: normalized }
     managed.approvalRequests = managed.approvalRequests.map((request) => ({ ...request, displayName: normalized }))
@@ -447,7 +573,9 @@ export class SessionController {
   async updateSessionConfig(sessionId: string, config: AgentConfigSummary): Promise<void> {
     const managed = this.required(sessionId)
     const normalized = { ...config, extraArgs: [...config.extraArgs] }
-    await this.manager.updateMetadata(managed.handle.hostId, { agentConfig: normalized.enabled ? normalized : null })
+    if (!isTerminalStatus(managed.summary.status)) {
+      await this.manager.updateMetadata(managed.handle.hostId, { agentConfig: normalized.enabled ? normalized : null })
+    }
     managed.summary = { ...managed.summary, agentConfig: normalized }
     if (managed.request) managed.request = { ...managed.request, agentConfig: normalized }
     this.changed(sessionId)
@@ -455,7 +583,9 @@ export class SessionController {
 
   async updateSessionProxy(sessionId: string, proxy: AgentProxySummary | undefined): Promise<void> {
     const managed = this.required(sessionId)
-    await this.manager.updateMetadata(managed.handle.hostId, { agentProxy: proxy ? { ...proxy } : null })
+    if (!isTerminalStatus(managed.summary.status)) {
+      await this.manager.updateMetadata(managed.handle.hostId, { agentProxy: proxy ? { ...proxy } : null })
+    }
     const { agentProxy: _previous, ...summary } = managed.summary
     managed.summary = { ...summary, ...(proxy ? { agentProxy: { ...proxy } } : {}) }
     if (managed.request) {
@@ -467,7 +597,9 @@ export class SessionController {
 
   async setFullAutoMode(sessionId: string, enabled: boolean): Promise<void> {
     const managed = this.required(sessionId)
-    await this.manager.updateMetadata(managed.handle.hostId, { fullAutoEnabled: enabled })
+    if (!isTerminalStatus(managed.summary.status)) {
+      await this.manager.updateMetadata(managed.handle.hostId, { fullAutoEnabled: enabled })
+    }
     managed.summary = { ...managed.summary, fullAutoEnabled: enabled }
     if (enabled) {
       for (const request of [...managed.approvalRequests]) {
@@ -489,6 +621,42 @@ export class SessionController {
       .map((managed) => managed.summary.sessionId)
     await Promise.all(active.map((sessionId) => this.stopSession(sessionId)))
     return active.length
+  }
+
+  async preserveAllSessions(): Promise<number> {
+    const active = [...this.sessions.values()].filter((managed) => !isTerminalStatus(managed.summary.status))
+    const preserved: ManagedSession[] = []
+    try {
+      for (const managed of active) {
+        if (!managed.handle.preserveOnDisconnect) throw new Error(`${managed.summary.displayName} 的 Host 不支持安全保留，请重启 Agent 后再试`)
+        await managed.handle.preserveOnDisconnect()
+        preserved.push(managed)
+      }
+    } catch (error) {
+      for (const managed of preserved) managed.handle.resumeManagement?.()
+      throw error
+    }
+    for (const managed of active) {
+      managed.generation += 1
+      managed.handle.disconnect()
+    }
+    return active.length
+  }
+
+  async clearAllSessions(): Promise<number> {
+    const count = this.sessions.size
+    await this.stopAllSessions()
+    for (const managed of this.sessions.values()) {
+      managed.handle.disconnect()
+      await this.manager.removeArtifacts(managed.handle.hostId).catch(() => undefined)
+    }
+    this.sessions.clear()
+    await this.catalog?.clear()
+    return count
+  }
+
+  flushCatalog(): Promise<void> {
+    return this.catalog?.flush() ?? Promise.resolve()
   }
 
   async restartSession(sessionId: string): Promise<void> {
@@ -527,6 +695,7 @@ export class SessionController {
     managed.handle.disconnect()
     managed.pendingUserInterrupt = false
     managed.awaitingRecoveryReady = false
+    managed.agentReady = false
     managed.suppressTransientRetryUntilReady = Boolean(managed.summary.nativeSessionId)
     managed.adapter.resetForRecovery()
     if (managed.nativeCapture?.timer) clearTimeout(managed.nativeCapture.timer)
@@ -541,6 +710,10 @@ export class SessionController {
       approvalTargetPaths: _approvalTargetPaths,
       approvalInputSummary: _approvalInputSummary,
       approvalSuggestion: _suggestion,
+      recoveryAction: _recoveryAction,
+      recoveryAttempted: _recoveryAttempted,
+      recoveryRuleApplied: _recoveryRuleApplied,
+      attentionKind: _attentionKind,
       ...summary
     } = managed.summary
     managed.summary = {
@@ -554,6 +727,7 @@ export class SessionController {
     this.changed(sessionId)
 
     try {
+      options.sessionId = sessionId
       const handle = await this.manager.start(options)
       managed.handle = handle
       managed.hostTransitioning = false
@@ -589,6 +763,7 @@ export class SessionController {
     managed.handle.disconnect()
     await this.manager.removeArtifacts(managed.handle.hostId).catch(() => undefined)
     this.sessions.delete(sessionId)
+    await this.catalog?.remove(sessionId)
     this.changed(sessionId)
   }
 
@@ -599,7 +774,19 @@ export class SessionController {
         event = await managed.handle.nextEvent()
       } catch (error) {
         if (managed.generation !== generation) return
-        if (isTimeout(error)) continue
+        if (isTimeout(error)) {
+          try {
+            await managed.handle.ping(HOST_HEALTH_PROBE_TIMEOUT_MS)
+            managed.hostHealthFailures = 0
+          } catch {
+            managed.hostHealthFailures += 1
+            if (managed.hostHealthFailures >= HOST_HEALTH_FAILURE_LIMIT) {
+              this.markHostUnresponsive(managed)
+              return
+            }
+          }
+          continue
+        }
         const transientRetryPending = this.cancelTransientRetry(managed)
         const exit = await this.readExitFact(managed.handle.hostId)
         if (exit) await this.onExit(managed, generation, exit.exitCode)
@@ -619,12 +806,14 @@ export class SessionController {
         return
       }
       if (managed.generation !== generation) return
+      managed.hostHealthFailures = 0
       if (event.type === 'output') {
         this.cancelKeywordContinue(managed)
         managed.terminalReplay.append(event.data)
         managed.outputSequence += 1
         this.emit({ sessionId: managed.summary.sessionId, ...event, sequence: managed.outputSequence })
         const observation = managed.adapter.observeOutput(event.data)
+        if (observation.ready || observation.approvalRequired) managed.agentReady = true
         this.observeContinueKeyword(managed, event.data, observation)
         if (observation.approvalRequired) {
           this.cancelTransientRetry(managed, true)
@@ -633,50 +822,14 @@ export class SessionController {
         if (observation.recoverableError && !managed.suppressTransientRetryUntilReady) {
           this.scheduleTransientRetry(managed, observation.recoverableError)
         }
-        if (observation.approvalRequired && managed.summary.status !== 'needs_approval') {
-          const approvalCommand = observation.approvalCommand ?? extractApprovalCommand(event.data)
-          const decision = this.approvalPolicy?.decide(approvalCommand)
-          const fullAuto = managed.summary.fullAutoEnabled
-            ? canFullAutoApprove({ command: approvalCommand, risk: decision?.risk ?? 'unknown', workspace: managed.summary.workspace })
-            : undefined
-          if (decision?.action === 'auto-approve' || fullAuto?.allowed) {
-            if (fullAuto?.allowed && decision?.action !== 'auto-approve') {
-              this.fullAutoActivity?.approved(this.approvalForActivity(managed, {
-                requestId: 'terminal:auto-' + randomUUID(), source: 'terminal',
-                risk: decision?.risk ?? 'unknown', reason: observation.approvalReason ?? fullAuto.reason,
-                ...(approvalCommand ? { command: approvalCommand } : {}),
-                ...(observation.approvalReason ? { agentReason: observation.approvalReason } : {}),
-              }))
-            }
-            managed.adapter.acknowledgeUserInput(true)
-            managed.handle.write(managed.adapter.approvalInput())
-            managed.summary = reduceSession(managed.summary, { type: 'started' }) as SessionSummary
+        if (observation.approvalRequired) {
+          if (managed.summary.agentKind === 'claude') {
+            this.scheduleClaudeTerminalApproval(managed, observation, event.data)
           } else {
-            const queued = this.queueApproval(managed, {
-              requestId: 'terminal:' + randomUUID(),
-              source: 'terminal',
-              risk: decision?.risk ?? 'unknown',
-              reason: observation.approvalReason ?? decision?.reason ?? '未能识别授权请求的具体影响，需要人工确认',
-              ...(approvalCommand ? { command: approvalCommand } : {}),
-              ...(observation.approvalReason ? { agentReason: observation.approvalReason } : {}),
-            })
-            if (managed.summary.fullAutoEnabled && fullAuto && !fullAuto.allowed) this.fullAutoActivity?.blocked(queued, fullAuto.reason)
+            this.handleTerminalApproval(managed, observation, event.data)
           }
-          this.changed(managed.summary.sessionId)
-        }
-        if (observation.approvalRequired && managed.summary.status === 'needs_approval') {
-          const approvalCommand = observation.approvalCommand ?? extractApprovalCommand(event.data)
-          if (approvalCommand && approvalCommand !== managed.pendingApprovalCommand) {
-            const decision = this.approvalPolicy?.decide(approvalCommand)
-            this.queueApproval(managed, {
-              requestId: 'terminal:' + randomUUID(),
-              source: 'terminal',
-              risk: decision?.risk ?? 'unknown',
-              reason: decision?.reason ?? managed.summary.approvalReason ?? '未能识别授权请求的具体影响，需要人工确认',
-              command: approvalCommand,
-            })
-            this.changed(managed.summary.sessionId)
-          }
+        } else if (managed.summary.agentKind === 'claude') {
+          this.cancelClaudeTerminalApproval(managed)
         }
         const resumedNow = managed.awaitingRecoveryReady && observation.ready
         if (resumedNow) {
@@ -695,6 +848,10 @@ export class SessionController {
         }
         this.scheduleNativeCapture(managed)
       } else if (event.type === 'permission-request') {
+        managed.agentReady = true
+        this.cancelClaudeTerminalApproval(managed)
+        this.removeTerminalApprovals(managed)
+        managed.adapter.acknowledgeUserInput(true)
         const toolName = /^[A-Za-z][\w-]{0,63}$/.test(event.toolName) ? event.toolName : 'Unknown'
         const approvalCommand = event.command ?? `tool:${toolName}`
         const decision = this.approvalPolicy?.decide(approvalCommand)
@@ -711,6 +868,7 @@ export class SessionController {
         }
         const fullAuto = managed.summary.fullAutoEnabled ? canFullAutoApprove(fullAutoInput) : undefined
         if (decision?.action === 'auto-approve' || fullAuto?.allowed) {
+          managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
           managed.handle.respondToPermission(event.requestId, 'allow')
           if (fullAuto?.allowed && decision?.action !== 'auto-approve') {
             this.fullAutoActivity?.approved(this.approvalForActivity(managed, {
@@ -758,6 +916,7 @@ export class SessionController {
     const transientRetryPending = this.cancelTransientRetry(managed)
     this.cancelKeywordContinue(managed)
     this.cancelPendingContinueSubmit(managed)
+    this.cancelClaudeTerminalApproval(managed)
     managed.approvalRequests.length = 0
     this.syncApprovalSummary(managed)
     managed.handle.disconnect()
@@ -815,6 +974,7 @@ export class SessionController {
     try {
       const scrollableRecipe = { ...recipe, args: terminalScrollbackArgs(managed.summary.agentKind, recipe.args) }
       const handle = await this.manager.start({
+        sessionId: managed.summary.sessionId,
         agentKind: managed.summary.agentKind,
         executable: scrollableRecipe.executable,
         args: scrollableRecipe.args,
@@ -843,6 +1003,7 @@ export class SessionController {
       managed.outputSequence = 0
       managed.pendingUserInterrupt = false
       managed.awaitingRecoveryReady = true
+      managed.agentReady = false
       managed.suppressTransientRetryUntilReady = false
       managed.adapter.resetForRecovery()
       this.flushPendingHostInput(managed)
@@ -877,6 +1038,21 @@ export class SessionController {
     }
   }
 
+  private markHostUnresponsive(managed: ManagedSession): void {
+    if (managed.pendingUserInterrupt || managed.summary.userStopRequested || isTerminalStatus(managed.summary.status)) return
+    this.cancelTransientRetry(managed, true)
+    this.cancelPendingContinueSubmit(managed)
+    this.cancelKeywordContinue(managed)
+    managed.summary = {
+      ...reduceSession(managed.summary, { type: 'retry-exhausted', reason: '终端进程连续无响应' }) as SessionSummary,
+      recoveryAction: 'resume',
+      recoveryAttempted: false,
+      recoveryRuleApplied: false,
+      attentionKind: 'host-unresponsive',
+    }
+    this.changed(managed.summary.sessionId)
+  }
+
   private async performRecoveryOnce(managed: ManagedSession, ruleApplied: boolean): Promise<void> {
     const reason = managed.summary.lastError
     const action = managed.summary.recoveryAction
@@ -884,6 +1060,10 @@ export class SessionController {
       throw new Error('当前没有可恢复的异常')
     }
     if (managed.activeRecoveryReason) throw new Error('本次异常已经尝试恢复，Manager 不会再次重试')
+    if (managed.summary.attentionKind === 'host-unresponsive') {
+      await this.restartUnresponsiveHost(managed, reason)
+      return
+    }
 
     managed.activeRecoveryReason = reason
     managed.pendingUserInterrupt = false
@@ -906,6 +1086,30 @@ export class SessionController {
     await this.startRecovery(managed)
   }
 
+  private async restartUnresponsiveHost(managed: ManagedSession, reason: string): Promise<void> {
+    if (!this.manager.forceRelease) throw new Error('当前版本不支持释放无响应终端，请重启 Manager 后再试')
+    const sessionId = managed.summary.sessionId
+    const oldHostId = managed.handle.hostId
+    managed.activeRecoveryReason = reason
+    managed.summary = { ...managed.summary, status: 'recovering', recoveryAttempts: 1, recoveryAttempted: true, recoveryRuleApplied: false }
+    this.changed(sessionId)
+    managed.generation += 1
+    managed.handle.disconnect()
+    try {
+      await this.manager.forceRelease(oldHostId)
+      managed.summary = { ...managed.summary, status: 'failed' }
+      managed.activeRecoveryReason = undefined
+      await this.restartSession(sessionId)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      managed.hostTransitioning = false
+      managed.pendingHostInput = ''
+      managed.summary = { ...managed.summary, status: 'needs_attention', lastError: `重启失败：${message}`, recoveryAction: 'resume', recoveryAttempted: true, recoveryRuleApplied: false, attentionKind: 'host-unresponsive' }
+      this.changed(sessionId)
+      throw error
+    }
+  }
+
   private clearRecoveryState(
     managed: ManagedSession,
     status: SessionSummary['status'],
@@ -915,6 +1119,7 @@ export class SessionController {
       recoveryAction: _action,
       recoveryAttempted: _attempted,
       recoveryRuleApplied: _ruleApplied,
+      attentionKind: _attentionKind,
       lastError,
       ...summary
     } = managed.summary
@@ -1052,12 +1257,13 @@ export class SessionController {
     return true
   }
 
-  private hostOptions(request: StartSessionRequest): StartHostOptions {
+  private hostOptions(request: StartSessionRequest, sessionId?: string): StartHostOptions {
     const args = terminalScrollbackArgs(request.agentKind, request.args)
     const recovery = request.recovery
       ? { ...request.recovery, args: terminalScrollbackArgs(request.agentKind, request.recovery.args) }
       : undefined
     return {
+      ...(sessionId ? { sessionId } : {}),
       displayName: request.displayName,
       agentKind: request.agentKind,
       executable: request.executable,
@@ -1141,6 +1347,108 @@ export class SessionController {
     } finally {
       capture.inFlight = false
       if (managed.nativeCapture === capture) this.scheduleNativeCapture(managed)
+    }
+  }
+
+  private scheduleClaudeTerminalApproval(managed: ManagedSession, observation: AgentObservation, eventData: string): void {
+    if (Date.now() < (managed.claudeTerminalFallbackBlockedUntil ?? 0)) return
+    if (managed.approvalRequests.some((request) => request.source === 'claude-hook')) return
+    const pending = managed.pendingClaudeTerminalApproval
+    if (pending) {
+      pending.observation = observation
+      pending.eventData = eventData
+      return
+    }
+    const generation = managed.generation
+    const scheduled = {
+      generation,
+      observation,
+      eventData,
+      timer: setTimeout(() => {
+        if (managed.pendingClaudeTerminalApproval !== scheduled) return
+        delete managed.pendingClaudeTerminalApproval
+        if (managed.generation !== generation || managed.summary.userStopRequested
+          || isTerminalStatus(managed.summary.status)
+          || managed.approvalRequests.some((request) => request.source === 'claude-hook')) return
+        this.handleTerminalApproval(managed, scheduled.observation, scheduled.eventData)
+      }, CLAUDE_TERMINAL_APPROVAL_FALLBACK_MS),
+    }
+    managed.pendingClaudeTerminalApproval = scheduled
+  }
+
+  private cancelClaudeTerminalApproval(managed: ManagedSession): void {
+    if (!managed.pendingClaudeTerminalApproval) return
+    clearTimeout(managed.pendingClaudeTerminalApproval.timer)
+    delete managed.pendingClaudeTerminalApproval
+  }
+
+  private removeTerminalApprovals(managed: ManagedSession): void {
+    const remaining = managed.approvalRequests.filter((request) => request.source !== 'terminal')
+    if (remaining.length === managed.approvalRequests.length) return
+    managed.approvalRequests = remaining
+    this.syncApprovalSummary(managed)
+  }
+
+  private handleTerminalApproval(managed: ManagedSession, observation: AgentObservation, eventData: string): void {
+    if (observation.approvalRequired && managed.summary.status !== 'needs_approval') {
+      const approvalCommand = observation.approvalCommand ?? extractApprovalCommand(eventData)
+      const decision = this.approvalPolicy?.decide(approvalCommand)
+      const fullAuto = managed.summary.fullAutoEnabled
+        ? canFullAutoApprove({ command: approvalCommand, risk: decision?.risk ?? 'unknown', workspace: managed.summary.workspace })
+        : undefined
+      if (decision?.action === 'auto-approve' || fullAuto?.allowed) {
+        if (fullAuto?.allowed && decision?.action !== 'auto-approve') {
+          this.fullAutoActivity?.approved(this.approvalForActivity(managed, {
+            requestId: 'terminal:auto-' + randomUUID(), source: 'terminal',
+            risk: decision?.risk ?? 'unknown', reason: observation.approvalReason ?? fullAuto.reason,
+            ...(approvalCommand ? { command: approvalCommand } : {}),
+            ...(observation.approvalReason ? { agentReason: observation.approvalReason } : {}),
+          }))
+        }
+        managed.adapter.acknowledgeUserInput(true)
+        managed.handle.write(managed.adapter.approvalInput())
+        managed.summary = reduceSession(managed.summary, { type: 'started' }) as SessionSummary
+      } else {
+        const queued = this.queueApproval(managed, {
+          requestId: 'terminal:' + randomUUID(), source: 'terminal',
+          risk: decision?.risk ?? 'unknown',
+          reason: observation.approvalReason ?? decision?.reason ?? '未能识别授权请求的具体影响，需要人工确认',
+          ...(approvalCommand ? { command: approvalCommand } : {}),
+          ...(observation.approvalReason ? { agentReason: observation.approvalReason } : {}),
+        })
+        if (managed.summary.fullAutoEnabled && fullAuto && !fullAuto.allowed) this.fullAutoActivity?.blocked(queued, fullAuto.reason)
+      }
+      this.changed(managed.summary.sessionId)
+    }
+    if (observation.approvalRequired && managed.summary.status === 'needs_approval') {
+      const approvalCommand = observation.approvalCommand ?? extractApprovalCommand(eventData)
+      if (approvalCommand && approvalCommand !== managed.pendingApprovalCommand) {
+        const decision = this.approvalPolicy?.decide(approvalCommand)
+        const fullAuto = managed.summary.fullAutoEnabled
+          ? canFullAutoApprove({ command: approvalCommand, risk: decision?.risk ?? 'unknown', workspace: managed.summary.workspace })
+          : undefined
+        if (decision?.action === 'auto-approve' || fullAuto?.allowed) {
+          if (fullAuto?.allowed && decision?.action !== 'auto-approve') {
+            this.fullAutoActivity?.approved(this.approvalForActivity(managed, {
+              requestId: 'terminal:auto-' + randomUUID(), source: 'terminal',
+              risk: decision?.risk ?? 'unknown', reason: observation.approvalReason ?? fullAuto.reason,
+              command: approvalCommand,
+              ...(observation.approvalReason ? { agentReason: observation.approvalReason } : {}),
+            }))
+          }
+          managed.adapter.acknowledgeUserInput(true)
+          managed.handle.write(managed.adapter.approvalInput())
+        } else {
+          const queued = this.queueApproval(managed, {
+            requestId: 'terminal:' + randomUUID(), source: 'terminal',
+            risk: decision?.risk ?? 'unknown',
+            reason: observation.approvalReason ?? decision?.reason ?? managed.summary.approvalReason ?? '未能识别授权请求的具体影响，需要人工确认',
+            command: approvalCommand,
+          })
+          if (managed.summary.fullAutoEnabled && fullAuto && !fullAuto.allowed) this.fullAutoActivity?.blocked(queued, fullAuto.reason)
+        }
+        this.changed(managed.summary.sessionId)
+      }
     }
   }
 
@@ -1269,6 +1577,68 @@ export class SessionController {
   }
 
   private changed(sessionId: string): void {
+    const managed = this.sessions.get(sessionId)
+    if (managed && this.catalog) {
+      void this.catalog.upsert({
+        sessionId,
+        hostId: managed.handle.hostId,
+        summary: this.catalogSummary(managed.summary),
+        ...(managed.request ? { request: this.catalogRequest(managed.request) } : {}),
+        updatedAt: new Date().toISOString(),
+      }).catch(() => undefined)
+    }
     this.emit({ type: 'sessions-changed', sessionId })
+  }
+
+  private catalogSummary(summary: SessionSummary): SessionSummary {
+    const {
+      pendingApprovalCommand: _pendingApprovalCommand,
+      approvalReason: _approvalReason,
+      approvalToolName: _approvalToolName,
+      approvalFilePath: _approvalFilePath,
+      approvalTargetPaths: _approvalTargetPaths,
+      approvalInputSummary: _approvalInputSummary,
+      pendingApprovalCount: _pendingApprovalCount,
+      approvalSuggestion: _approvalSuggestion,
+      ...safe
+    } = summary
+    return safe
+  }
+
+  private catalogRequest(request: StartSessionRequest): StartSessionRequest {
+    const safe: StartSessionRequest = {
+      displayName: request.displayName,
+      agentKind: request.agentKind,
+      workspace: request.workspace,
+      executable: request.executable,
+      args: [...request.args],
+      cols: request.cols,
+      rows: request.rows,
+      ...(request.maxContinueRetries === undefined ? {} : { maxContinueRetries: request.maxContinueRetries }),
+      ...(request.nativeSessionId ? { nativeSessionId: request.nativeSessionId } : {}),
+      ...(request.recovery ? { recovery: { ...request.recovery, args: [...request.recovery.args] } } : {}),
+    }
+    if (request.agentConfig && 'hasApiKey' in request.agentConfig) {
+      safe.agentConfig = { ...request.agentConfig, extraArgs: [...request.agentConfig.extraArgs] }
+    }
+    if (request.agentProxy && 'hasPassword' in request.agentProxy) safe.agentProxy = { ...request.agentProxy }
+    return safe
+  }
+
+  private detachedHandle(hostId: string): HostHandle {
+    const unavailable = (): never => { throw new Error('Agent 已停止，请先重新启动') }
+    return {
+      hostId,
+      nextEvent: () => Promise.reject(new Error('Agent 已停止')),
+      ping: () => Promise.reject(new Error('Agent 已停止')),
+      write: unavailable,
+      resize: () => undefined,
+      replay: () => Promise.resolve(''),
+      respondToPermission: unavailable,
+      stop: () => Promise.resolve(),
+      preserveOnDisconnect: () => Promise.resolve(),
+      updateManagerLeasePolicy: () => undefined,
+      disconnect: () => undefined,
+    }
   }
 }

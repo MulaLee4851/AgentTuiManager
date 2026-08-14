@@ -4,7 +4,14 @@
 node_modules/
 dist/
 dist-electron/
+release/
+release-next*/
 build/
 coverage/
 *.log
 *.tsbuildinfo
+agent-environment-*.js
+docs/
+*.patch
+AGENTS.md
+bug.md

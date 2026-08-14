@@ -10,6 +10,10 @@ class FakeHandle implements HostHandle {
   readonly writes: string[] = []
   readonly permissionResponses: Array<{ requestId: string; action: 'allow' | 'ask' | 'deny' }> = []
   stops = 0
+  disconnects = 0
+  preserveOnDisconnect = vi.fn(async (): Promise<void> => undefined)
+  resumeManagement = vi.fn()
+  updateManagerLeasePolicy = vi.fn()
   readonly hostId: string
   private readonly events: Array<HostEvent | Error> = []
   private readonly waiters: Array<{ resolve: (event: HostEvent) => void; reject: (error: Error) => void }> = []
@@ -21,6 +25,7 @@ class FakeHandle implements HostHandle {
     if (event) return Promise.resolve(event)
     return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }))
   }
+  ping = vi.fn(async (): Promise<'managed'> => 'managed')
   emit(event: HostEvent): void {
     const waiter = this.waiters.shift()
     if (waiter) waiter.resolve(event)
@@ -38,7 +43,7 @@ class FakeHandle implements HostHandle {
     this.permissionResponses.push({ requestId, action })
   }
   async stop(): Promise<void> { this.stops += 1 }
-  disconnect(): void {}
+  disconnect(): void { this.disconnects += 1 }
 }
 
 function fixture(discovery?: NativeSessionDiscoveryPort) {
@@ -53,6 +58,9 @@ function fixture(discovery?: NativeSessionDiscoveryPort) {
     }),
     reconnect: vi.fn(),
     listLiveHosts: vi.fn(async (): Promise<HostRecord[]> => []),
+    release: vi.fn(async () => undefined),
+    forceRelease: vi.fn(async () => undefined),
+    setPreserveOnLeaseExpiry: vi.fn(),
     readLastExit: vi.fn(async () => undefined),
     updateMetadata: vi.fn(async () => undefined),
     removeArtifacts: vi.fn(async () => undefined),
@@ -86,6 +94,30 @@ describe('SessionController recovery evidence', () => {
     expect(starts).toHaveLength(1)
   })
 
+  it('only reports a resumed native Agent ready after a real prompt or approval arrives', async () => {
+    const { controller, handles } = fixture()
+    const session = await controller.startSession({ ...request(true), nativeSessionId: 'native-1' })
+    expect(controller.isSessionReady(session.sessionId)).toBe(false)
+
+    handles[0]!.emit({ type: 'output', data: 'loading history…' })
+    await settle()
+    expect(controller.isSessionReady(session.sessionId)).toBe(false)
+
+    handles[0]!.emit({ type: 'output', data: 'OpenAI Codex\r\n›\r\n' })
+    await settle()
+    expect(controller.isSessionReady(session.sessionId)).toBe(true)
+  })
+
+  it('treats a restored Agent approval prompt as interactive readiness', async () => {
+    const { controller, handles } = fixture()
+    const session = await controller.startSession({ ...request(true), nativeSessionId: 'native-1' })
+    handles[0]!.emit({ type: 'output', data: 'OpenAI Codex\r\nWould you like to run the following command?\r\n1. Yes, proceed\r\n2. No' })
+    await settle()
+
+    expect(controller.isSessionReady(session.sessionId)).toBe(true)
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('needs_approval')
+  })
+
   it('updates an Agent configuration without restarting its Host', async () => {
     const { controller, manager, starts } = fixture()
     const session = await controller.startSession(request())
@@ -104,7 +136,7 @@ describe('SessionController recovery evidence', () => {
     expect(starts).toHaveLength(1)
   })
 
-  it('automatically continues a live terminal after a model-capacity error', async () => {
+  it('surfaces a live model-capacity error without automatically sending continue', async () => {
     vi.useFakeTimers()
     try {
       const { controller, handles } = fixture()
@@ -113,18 +145,14 @@ describe('SessionController recovery evidence', () => {
       await vi.advanceTimersByTimeAsync(0)
 
       expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)).toMatchObject({
-        status: 'recovering',
-        recoveryAttempts: 1,
+        status: 'needs_attention',
+        recoveryAttempts: 0,
       })
       expect(handles[0]!.writes).toEqual([])
 
-      await vi.advanceTimersByTimeAsync(2_999)
+      await vi.advanceTimersByTimeAsync(10_000)
       expect(handles[0]!.writes).toEqual([])
-      await vi.advanceTimersByTimeAsync(1)
-      expect(handles[0]!.writes).toEqual(['continue'])
-      await vi.advanceTimersByTimeAsync(75)
-      expect(handles[0]!.writes).toEqual(['continue', '\r'])
-      expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
+      expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('needs_attention')
     } finally {
       vi.useRealTimers()
     }
@@ -172,7 +200,7 @@ describe('SessionController recovery evidence', () => {
     }
   })
 
-  it('limits repeated live capacity retries to three attempts', async () => {
+  it('never loops automatic continue for repeated live capacity errors', async () => {
     vi.useFakeTimers()
     try {
       const { controller, handles } = fixture()
@@ -185,10 +213,10 @@ describe('SessionController recovery evidence', () => {
       handles[0]!.emit({ type: 'output', data: 'Selected model is at capacity. Please try a different model.' })
       await vi.advanceTimersByTimeAsync(0)
 
-      expect(handles[0]!.writes).toEqual(['continue', '\r', 'continue', '\r', 'continue', '\r'])
+      expect(handles[0]!.writes).toEqual([])
       expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)).toMatchObject({
         status: 'needs_attention',
-        recoveryAttempts: 3,
+        recoveryAttempts: 0,
       })
       expect(handles[0]!.stops).toBe(0)
     } finally {
@@ -235,60 +263,37 @@ describe('SessionController recovery evidence', () => {
     expect(starts).toHaveLength(1)
   })
 
-  it('starts the resume host only after abnormal exit and continues only after adapter readiness', async () => {
+  it('surfaces abnormal exit and waits for an explicit one-shot recovery', async () => {
     const { controller, handles, starts } = fixture()
     const session = await controller.startSession(request(true))
     handles[0]!.emit({ type: 'exit', exitCode: 1 })
     await settle()
 
-    expect(starts).toHaveLength(2)
-    expect(starts[1]).toMatchObject({ executable: 'codex', args: ['resume', 'native-1'] })
-    expect(handles[1]!.writes).toEqual([])
-    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('recovering')
-
-    handles[1]!.emit({ type: 'output', data: 'loading session' })
-    await settle()
-    expect(handles[1]!.writes).toEqual([])
-    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('recovering')
-
-    handles[1]!.emit({ type: 'output', data: 'OpenAI Codex\r\n›\r\n' })
-    await settle()
-    expect(handles[1]!.writes).toEqual(['continue'])
-    await new Promise((resolve) => setTimeout(resolve, 100))
-    expect(handles[1]!.writes).toEqual(['continue', '\r'])
-    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
+    expect(starts).toHaveLength(1)
+    expect(handles[0]!.writes).toEqual([])
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('needs_attention')
   })
 
-  it('stops a late recovery host when the user stops while start is pending', async () => {
-    const { controller, handles, starts, manager } = fixture()
+  it('allows user stop while an abnormal exit is awaiting attention', async () => {
+    const { controller, handles, starts } = fixture()
     const session = await controller.startSession(request(true))
-    let resolveRecovery: ((handle: HostHandle) => void) | undefined
-    vi.mocked(manager.start).mockImplementationOnce((options) => {
-      starts.push(options)
-      return new Promise((resolve) => { resolveRecovery = resolve })
-    })
     handles[0]!.emit({ type: 'exit', exitCode: 1 })
     await settle()
-    expect(resolveRecovery).toBeTypeOf('function')
+    expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('needs_attention')
 
     await controller.stopSession(session.sessionId)
-    const late = new FakeHandle('late-recovery')
-    resolveRecovery?.(late)
-    await settle()
-
-    expect(late.stops).toBe(1)
-    expect(late.writes).toEqual([])
+    expect(starts).toHaveLength(1)
     expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('stopped')
   })
 
-  it('recovers a non-user connection loss when no exit fact appears', async () => {
+  it('surfaces a non-user connection loss when no exit fact appears', async () => {
     const { controller, handles, starts } = fixture()
     await controller.startSession(request(true))
     handles[0]!.fail(new Error('pipe closed'))
     await settle()
     await settle()
-    expect(starts).toHaveLength(2)
-    expect(starts[1]).toMatchObject({ executable: 'codex', args: ['resume', 'native-1'] })
+    expect(starts).toHaveLength(1)
+    expect(controller.listSessions()[0]).toMatchObject({ status: 'needs_attention', recoveryAction: 'resume' })
   })
 
   it('does not recover a user-stopped connection loss', async () => {
@@ -316,13 +321,14 @@ describe('SessionController recovery evidence', () => {
     expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('completed')
   })
 
-  it('restores persisted agent recovery metadata and can resume after a later crash', async () => {
+  it('restores persisted agent recovery metadata and surfaces a later crash', async () => {
     const { controller, handles, starts, manager } = fixture()
     const restoredHandle = new FakeHandle('restored-host')
     vi.mocked(manager.listLiveHosts).mockResolvedValue([{
       hostId: 'restored-host', agentKind: 'claude', cwd: 'B:\\work', nativeSessionId: 'claude-native',
       pid: 42, endpoint: 'pipe', lifecycle: 'running', createdAt: 'now', updatedAt: 'now', cols: 90, rows: 28,
       recovery: { executable: 'claude', args: ['--resume', 'claude-native'] },
+      managerOwnership: 'preserved',
     }])
     vi.mocked(manager.reconnect).mockResolvedValue(restoredHandle)
     await controller.restoreLiveHosts()
@@ -330,12 +336,9 @@ describe('SessionController recovery evidence', () => {
 
     restoredHandle.emit({ type: 'exit', exitCode: 1 })
     await settle()
-    expect(starts).toHaveLength(1)
-    expect(starts[0]).toMatchObject({ agentKind: 'claude', executable: 'claude', args: ['--resume', 'claude-native'] })
-    expect(handles.at(-1)?.writes).toEqual([])
-    handles.at(-1)?.emit({ type: 'output', data: 'Claude Code\r\n❯\r\n' })
-    await settle()
-    expect(handles.at(-1)?.writes).toEqual(['continue'])
+    expect(starts).toHaveLength(0)
+    expect(restoredHandle.writes).toEqual([])
+    expect(controller.listSessions()[0]).toMatchObject({ status: 'needs_attention', recoveryAction: 'resume' })
   })
 
   it('projects an explicit approval prompt into the session summary', async () => {
@@ -379,6 +382,87 @@ describe('SessionController recovery evidence', () => {
     expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('needs_approval')
   })
 
+  it('keeps a silent Agent running while its Host answers health probes', async () => {
+    const { controller, handles } = fixture()
+    await controller.startSession(request(true))
+    handles[0]!.fail(new Error('Timed out waiting for host event from host host-1'))
+    await settle()
+    expect(handles[0]!.ping).toHaveBeenCalled()
+    expect(controller.listSessions()[0]).toMatchObject({ status: 'running' })
+  })
+
+  it('asks before restarting after three consecutive Host probe failures', async () => {
+    const { controller, handles, starts } = fixture()
+    await controller.startSession(request(true))
+    handles[0]!.ping.mockRejectedValue(new Error('pong timeout'))
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      handles[0]!.fail(new Error('Timed out waiting for host event from host host-1'))
+      await settle()
+    }
+    expect(starts).toHaveLength(1)
+    expect(handles[0]!.writes).toEqual([])
+    expect(controller.listSessions()[0]).toMatchObject({
+      status: 'needs_attention',
+      attentionKind: 'host-unresponsive',
+      lastError: '终端进程连续无响应',
+    })
+  })
+
+  it('releases only the unresponsive managed Host after the user confirms restart', async () => {
+    const { controller, handles, starts, manager } = fixture()
+    const session = await controller.startSession(request(true))
+    handles[0]!.ping.mockRejectedValue(new Error('pong timeout'))
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      handles[0]!.fail(new Error('Timed out waiting for host event from host host-1'))
+      await settle()
+    }
+    await controller.tryRecoveryOnce(session.sessionId)
+    expect(manager.forceRelease).toHaveBeenCalledWith('host-1')
+    expect(starts).toHaveLength(2)
+    expect(controller.listSessions()[0]).toMatchObject({ status: 'running' })
+    expect(controller.listSessions()[0]!.attentionKind).toBeUndefined()
+  })
+
+  it('takes over a live Host after an abnormal Manager exit when crash retention is enabled', async () => {
+    const { controller, manager } = fixture()
+    const restoredHandle = new FakeHandle('managed-host')
+    vi.mocked(manager.listLiveHosts).mockResolvedValue([{
+      hostId: 'managed-host', sessionId: 'session-1', displayName: 'Still running', agentKind: 'codex', cwd: 'B:\\work',
+      pid: 42, endpoint: 'pipe', lifecycle: 'running', createdAt: 'now', updatedAt: 'now', managerOwnership: 'managed',
+    }])
+    vi.mocked(manager.reconnect).mockResolvedValue(restoredHandle)
+
+    await controller.restoreSessions(true)
+
+    expect(manager.reconnect).toHaveBeenCalledWith('managed-host')
+    expect(manager.release).not.toHaveBeenCalled()
+    expect(controller.listSessions()[0]).toMatchObject({ sessionId: 'session-1', displayName: 'Still running', status: 'running' })
+  })
+
+  it('releases a live Host after an abnormal Manager exit when crash retention is disabled', async () => {
+    const { controller, manager } = fixture()
+    manager.release = vi.fn(async () => undefined)
+    vi.mocked(manager.listLiveHosts).mockResolvedValue([{
+      hostId: 'managed-host', sessionId: 'session-1', agentKind: 'codex', cwd: 'B:\\work',
+      pid: 42, endpoint: 'pipe', lifecycle: 'running', createdAt: 'now', updatedAt: 'now', managerOwnership: 'managed',
+    }])
+
+    await controller.restoreSessions(false)
+
+    expect(manager.release).toHaveBeenCalledWith('managed-host')
+    expect(manager.reconnect).not.toHaveBeenCalled()
+  })
+
+  it('updates the lease policy of all currently running Hosts', async () => {
+    const { controller, handles, manager } = fixture()
+    await controller.startSession(request())
+
+    controller.updateCrashRetentionPolicy(false)
+
+    expect(manager.setPreserveOnLeaseExpiry).toHaveBeenCalledWith(false)
+    expect(handles[0]!.updateManagerLeasePolicy).toHaveBeenCalledWith(false)
+  })
+
   it('waits for the complete Codex modal command instead of classifying a truncated OSC signal', async () => {
     const base = fixture()
     const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
@@ -402,6 +486,89 @@ describe('SessionController recovery evidence', () => {
     expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'read-1', action: 'allow' }])
     expect(base.handles[0]!.writes).toEqual([])
     expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
+  })
+
+  it('lets a structured Claude Hook replace an earlier terminal-text candidate', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
+      const session = await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+      base.handles[0]!.emit({
+        type: 'output',
+        data: 'Write file\r\nAllow this tool use?\r\n1. Yes\r\n2. No',
+      })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(controller.listPendingApprovals()).toEqual([])
+
+      await vi.advanceTimersByTimeAsync(300)
+      base.handles[0]!.emit({
+        type: 'permission-request', requestId: 'hook-command-1', toolName: 'PowerShell',
+        command: 'Set-Content package.json updated', operation: 'write',
+      })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(controller.listPendingApprovals().map((item) => item.requestId)).toEqual(['hook-command-1'])
+
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(controller.listPendingApprovals().map((item) => item.requestId)).toEqual(['hook-command-1'])
+      controller.approveRequest('hook-command-1')
+      expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'hook-command-1', action: 'allow' }])
+      expect(base.handles[0]!.writes).toEqual([])
+      expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
+
+      base.handles[0]!.emit({
+        type: 'output',
+        data: 'Write file\r\nAllow this tool use?\r\n1. Yes\r\n2. No',
+      })
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(controller.listPendingApprovals()).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('falls back to Claude terminal approval only when no Hook arrives', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
+      await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+      base.handles[0]!.emit({
+        type: 'output',
+        data: 'Write file\r\nAllow this tool use?\r\n1. Yes\r\n2. No',
+      })
+      await vi.advanceTimersByTimeAsync(999)
+      expect(controller.listPendingApprovals()).toEqual([])
+      await vi.advanceTimersByTimeAsync(1)
+      expect(controller.listPendingApprovals()).toHaveLength(1)
+      expect(controller.listPendingApprovals()[0]).toMatchObject({ source: 'terminal', command: 'tool:Write' })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('auto-approves a Claude Hook once without also pressing Enter through terminal fallback', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const activity = { approved: vi.fn(), blocked: vi.fn() }
+      const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine(), undefined, activity)
+      const session = await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+      await controller.setFullAutoMode(session.sessionId, true)
+      base.handles[0]!.emit({ type: 'output', data: 'Bash command\r\n git status\r\nAllow this tool use?\r\n1. Yes' })
+      await vi.advanceTimersByTimeAsync(250)
+      base.handles[0]!.emit({
+        type: 'permission-request', requestId: 'hook-auto-1', toolName: 'PowerShell',
+        command: 'Set-Content package.json updated', operation: 'write',
+      })
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'hook-auto-1', action: 'allow' }])
+      expect(base.handles[0]!.writes).toEqual([])
+      expect(activity.approved).toHaveBeenCalledTimes(1)
+      expect(controller.listPendingApprovals()).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('uses the complete Claude Bash command to auto-approve a read-only ls request', async () => {
@@ -520,6 +687,23 @@ describe('SessionController recovery evidence', () => {
     expect(activity.blocked).toHaveBeenCalledWith(expect.objectContaining({ requestId: 'delete-blocked' }), expect.stringContaining('删除'))
     expect(controller.listPendingApprovals().map((item) => item.requestId)).toEqual(['delete-blocked'])
     expect(base.manager.updateMetadata).toHaveBeenCalledWith('host-1', { fullAutoEnabled: true })
+  })
+
+  it('auto-approves ordinary Claude tools without a saved rule or target path', async () => {
+    const base = fixture()
+    const activity = { approved: vi.fn(), blocked: vi.fn() }
+    const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine(), undefined, activity)
+    const session = await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+    await controller.setFullAutoMode(session.sessionId, true)
+    base.handles[0]!.emit({ type: 'permission-request', requestId: 'task-auto', toolName: 'Task', operation: 'unknown' })
+    base.handles[0]!.emit({ type: 'permission-request', requestId: 'write-auto', toolName: 'Write', operation: 'write' })
+    await settle()
+    expect(base.handles[0]!.permissionResponses).toEqual([
+      { requestId: 'task-auto', action: 'allow' },
+      { requestId: 'write-auto', action: 'allow' },
+    ])
+    expect(controller.listPendingApprovals()).toEqual([])
+    expect(activity.approved).toHaveBeenCalledTimes(2)
   })
 
   it('immediately processes eligible pending requests when full-auto is enabled', async () => {
@@ -747,5 +931,25 @@ describe('SessionController recovery evidence', () => {
 
     expect(controller.listSessions()).toEqual([])
     expect(manager.removeArtifacts).toHaveBeenCalledWith('host-1')
+  })
+
+  it('disconnects no Agent until every running Host confirms preserved state', async () => {
+    const { controller, handles } = fixture()
+    await controller.startSession(request())
+    await controller.startSession({ ...request(), displayName: 'Second Agent' })
+    let confirmFirst: (() => void) | undefined
+    let confirmSecond: (() => void) | undefined
+    handles[0]!.preserveOnDisconnect.mockImplementationOnce(() => new Promise<void>((resolve) => { confirmFirst = resolve }))
+    handles[1]!.preserveOnDisconnect.mockImplementationOnce(() => new Promise<void>((resolve) => { confirmSecond = resolve }))
+
+    const preserving = controller.preserveAllSessions()
+    await settle()
+    expect(handles.map((handle) => handle.disconnects)).toEqual([0, 0])
+    confirmFirst?.()
+    await settle()
+    expect(handles.map((handle) => handle.disconnects)).toEqual([0, 0])
+    confirmSecond?.()
+    await expect(preserving).resolves.toBe(2)
+    expect(handles.map((handle) => handle.disconnects)).toEqual([1, 1])
   })
 })

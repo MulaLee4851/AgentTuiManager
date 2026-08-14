@@ -30,7 +30,8 @@ button:disabled { cursor: default; opacity: .55; }
 
 .app-shell { min-height: 100vh; height: 100vh; overflow: hidden; background: var(--bg); }
 .topbar { height: 54px; display: flex; align-items: center; gap: 12px; padding: 0 14px; background: #151d20; border-bottom: 1px solid var(--line); }
-.brand-block { width: 29px; height: 29px; flex: 0 0 auto; display: grid; place-items: center; color: var(--green); border: 1px solid #3e665a; border-radius: 5px; font-size: 11px; font-weight: 900; }
+.brand-block { width: 29px; height: 29px; flex: 0 0 auto; display: grid; place-items: center; overflow: hidden; border: 1px solid #3e665a; border-radius: 5px; }
+.brand-block img { width: 100%; height: 100%; display: block; object-fit: cover; }
 .app-title { min-width: 0; }
 .app-title strong, .app-title small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .app-title small { max-width: min(44vw, 540px); color: var(--muted); font-size: 9px; }
@@ -122,7 +123,7 @@ button:disabled { cursor: default; opacity: .55; }
 .workspace-scope-toggle[aria-checked='true'] i { background: #286b53; }
 .workspace-scope-toggle[aria-checked='true'] i::after { background: var(--green); transform: translateX(11px); }
 
-.terminal-grid { min-height: 0; display: grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); grid-auto-rows: minmax(220px, 1fr); gap: 8px; padding: 8px; overflow-y: auto; overflow-x: hidden; }
+.terminal-grid { --terminal-grid-row-height: max(220px, calc((100% - 8px) / 2)); min-height: 0; display: grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); grid-template-rows: repeat(2, var(--terminal-grid-row-height)); grid-auto-rows: var(--terminal-grid-row-height); gap: 8px; padding: 8px; overflow-y: auto; overflow-x: hidden; align-content: start; }
 .terminal-grid-detail { display: flex; flex: 1; width: 100%; height: 100%; min-height: 0; padding: 0; overflow: hidden; }
 .terminal-card { position: relative; min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); border: 1px solid var(--line); border-radius: 7px; }
 .terminal-card.terminal-card-hidden { display: none; }
@@ -132,6 +133,7 @@ button:disabled { cursor: default; opacity: .55; }
 .agent-identity { min-width: 0; display: flex; align-items: center; gap: 8px; }
 .agent-identity > div { min-width: 0; }
 .agent-dot { width: 22px; height: 22px; flex: 0 0 auto; display: grid; place-items: center; color: #092219; background: var(--green); border-radius: 4px; font-size: 9px; font-weight: 900; }
+.agent-dot[src] { display: block; object-fit: cover; }
 .agent-claude { color: #2b1b00; background: #e7ad4f; }
 .agent-pi { color: #0b1c2d; background: var(--blue); }
 .agent-generic { color: #d1dbda; background: #3b494d; }
@@ -202,7 +204,7 @@ button:disabled { cursor: default; opacity: .55; }
 .agent-session-list em.status-needs_approval::before, .agent-session-list em.status-needs_attention::before { background: var(--amber); }
 .agent-session-list em.status-starting::before, .agent-session-list em.status-recovering::before, .agent-session-list em.status-failed::before { background: var(--red); }
 .agent-session-list em.status-completed::before { background: var(--blue); }
-.terminal-grid-list { display: flex; min-width: 0; width: 100%; height: 100%; padding: 0; overflow: hidden; }
+.terminal-grid-list { --terminal-grid-row-height: auto; display: flex; min-width: 0; width: 100%; height: 100%; padding: 0; overflow: hidden; }
 
 .empty-state { min-height: 0; display: grid; place-items: center; align-content: center; color: var(--muted); text-align: center; }
 .empty-state h2 { margin: 11px 0 4px; color: var(--text); font-size: 15px; }
@@ -232,6 +234,7 @@ button:disabled { cursor: default; opacity: .55; }
 .launcher-agent-option { min-height: 78px; display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 10px; align-items: center; padding: 10px; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; text-align: left; }
 .launcher-agent-option.active { padding: 9px; background: var(--green-soft); border: 2px solid var(--green); }
 .launcher-option-logo { width: 34px; height: 34px; display: grid; place-items: center; color: #092219; background: var(--green); border-radius: 5px; font-size: 10px; font-weight: 900; }
+.launcher-option-logo[src] { display: block; object-fit: cover; }
 .launcher-option-logo.option-claude { color: #291a00; background: #e7ad4f; }
 .launcher-option-logo.option-pi { color: #0a1b2b; background: var(--blue); }
 .launcher-option-logo.option-generic { color: #d1dbda; background: #3b494d; }
@@ -239,6 +242,30 @@ button:disabled { cursor: default; opacity: .55; }
 .launcher-agent-option strong { margin-bottom: 3px; font-size: 11px; }
 .launcher-agent-option > span:last-child > span { color: var(--muted); font-size: 8px; }
 .launcher-form-grid { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 10px; align-items: center; margin-top: 16px; }
+.launcher-environment { display: grid; gap: 8px; margin-top: 14px; padding: 11px; background: #131b1d; border: 1px solid var(--line); border-radius: 6px; }
+.launcher-environment .launcher-section-title { margin: 0; }
+.launcher-environment-checks { display: grid; grid-template-columns: repeat(auto-fit, minmax(105px, 1fr)); gap: 6px; }
+.launcher-environment-checks span { min-width: 0; padding: 7px 8px; overflow: hidden; background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.launcher-environment-checks .ok { color: var(--green); border-color: #397860; }
+.launcher-environment-checks .bad { color: var(--red); border-color: #754045; }
+.launcher-environment-install { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: #dbc797; font-size: 9px; }
+.launcher-environment-install-agent { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(170px, 220px) auto; }
+.launcher-environment-install-agent label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 8px; }
+.launcher-environment-install-agent .launcher-field { min-width: 0; min-height: 28px; height: 28px; padding: 0 7px; font-size: 8px; }
+.launcher-install-progress { display: grid; gap: 7px; padding: 9px; overflow: hidden; background: var(--terminal); border: 1px solid var(--line); border-radius: 5px; }
+.launcher-install-progress-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--text); font-size: 9px; }
+.launcher-install-progress-head time { color: var(--muted); font: 9px 'Cascadia Mono', Consolas, monospace; }
+.launcher-install-pulse { height: 3px; overflow: hidden; background: #263235; border-radius: 2px; }
+.launcher-install-pulse span { display: block; width: 34%; height: 100%; background: var(--green); animation: install-progress-pulse 1.25s ease-in-out infinite alternate; }
+.launcher-install-progress.phase-completed .launcher-install-pulse span { width: 100%; animation: none; }
+.launcher-install-progress.phase-failed .launcher-install-pulse span { width: 100%; background: var(--red); animation: none; }
+.launcher-install-output { display: grid; gap: 3px; max-height: 94px; overflow-y: auto; color: var(--muted); font: 8px/1.45 'Cascadia Mono', Consolas, monospace; overflow-wrap: anywhere; }
+.launcher-install-output span { display: block; }
+.launcher-install-output .warning { color: var(--amber); }
+.launcher-install-output .error { color: var(--red); }
+@keyframes install-progress-pulse { from { transform: translateX(-5%); } to { transform: translateX(195%); } }
+@media (max-width: 760px) { .launcher-environment-install-agent { grid-template-columns: 1fr; align-items: stretch; } }
+.launcher-state.success { color: var(--green); }
 .launcher-form-grid label, .agent-launcher .advanced-settings label { color: var(--muted); font-size: 9px; }
 .launcher-command-preview { margin-top: 13px; padding: 11px; color: #cbd7d5; background: var(--terminal); border: 1px solid var(--line); border-radius: 5px; font: 9px/1.5 'Cascadia Mono', Consolas, monospace; }
 .launcher-command-preview small { display: block; color: #6e8281; }
@@ -257,6 +284,19 @@ button:disabled { cursor: default; opacity: .55; }
 .launcher-state { padding: 24px 8px; color: var(--muted); text-align: center; font-size: 10px; }
 .launcher-state.error, .launcher-error { color: #f0a0ad; }
 .launcher-external-note { margin-bottom: 12px; padding: 11px; color: #aebfc3; background: var(--blue-soft); border-left: 3px solid var(--blue); border-radius: 4px; font-size: 9px; }
+.external-session-item.active { border-color: var(--green); background: var(--green-soft); }
+.external-migration-steps { display: grid; gap: 5px; margin-top: 12px; padding: 10px 12px; border-left: 3px solid var(--green); border-radius: 4px; background: var(--green-soft); color: var(--text); font-size: 10px; }
+.external-migration-steps span { color: var(--muted); overflow-wrap: anywhere; }
+.terminal-card-dragging { opacity: .58; border-color: var(--green); }
+.terminal-card-header[draggable='true'] { cursor: grab; }
+.terminal-card-header[draggable='true']:active { cursor: grabbing; }
+.native-terminal-dropzone { position: absolute; z-index: 7; right: 16px; bottom: 16px; left: 16px; min-height: 58px; display: flex; align-items: center; justify-content: center; gap: 12px; padding: 10px 14px; border: 1px dashed var(--green); border-radius: 6px; background: rgba(23, 63, 52, .96); box-shadow: 0 16px 40px rgba(0,0,0,.42); color: var(--text); pointer-events: auto; }
+.native-terminal-dropzone strong { color: var(--green); }
+.native-terminal-dropzone span { color: var(--muted); font-size: 10px; }
+.native-terminal-dropzone.busy { border-style: solid; }
+.handoff-error { position: absolute; z-index: 8; right: 16px; bottom: 16px; left: 16px; padding: 10px 12px; border: 1px solid var(--red); border-radius: 5px; background: var(--red-soft); color: #ffd9d9; font-size: 10px; overflow-wrap: anywhere; }
+.external-handoff-placeholder { min-width: 0; min-height: 190px; display: grid; place-items: center; color: var(--muted); background: var(--terminal); border: 1px dashed var(--green); border-radius: 7px; font-size: 11px; }
+.agent-overview-workbench { position: relative; }
 .launcher-config-panel { display: grid; align-content: start; gap: 12px; }
 .launcher-config-intro { display: grid; gap: 4px; padding: 12px 13px; color: #b7c9c5; background: var(--green-soft); border-left: 3px solid var(--green); border-radius: 5px; }
 .launcher-config-intro strong { color: var(--text); font-size: 11px; }
@@ -342,6 +382,34 @@ button:disabled { cursor: default; opacity: .55; }
 
 .rules-dialog { width: min(560px, 100vw); }
 .rules-dialog footer { justify-content: flex-end; margin-top: 18px; }
+.dingtalk-settings-dialog { width: min(600px, 100vw); }
+.dingtalk-settings-dialog > header { min-height: 48px; }
+.dingtalk-status { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10px; }
+.dingtalk-status i { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+.dingtalk-status.status-connected { color: var(--green); }
+.dingtalk-status.status-connected i { background: var(--green); }
+.dingtalk-status.status-connecting { color: var(--amber); }
+.dingtalk-status.status-connecting i { background: var(--amber); }
+.dingtalk-status.status-error { color: var(--red); }
+.dingtalk-status.status-error i { background: var(--red); }
+.dingtalk-settings-fields { display: grid; gap: 10px; margin-top: 12px; }
+.dingtalk-settings-fields.disabled { opacity: .58; }
+.dingtalk-settings-fields > label { display: grid; gap: 5px; color: var(--muted); font-size: 10px; }
+.dingtalk-settings-fields fieldset { display: grid; gap: 8px; margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 6px; }
+.dingtalk-settings-fields legend { padding: 0 4px; color: var(--muted); font-size: 10px; }
+.dingtalk-workspace-list { display: grid; gap: 5px; max-height: 132px; overflow: auto; }
+.dingtalk-workspace-list label, .dingtalk-clear-secret { display: flex !important; grid-template-columns: none !important; align-items: center; gap: 7px !important; min-width: 0; color: var(--text) !important; }
+.dingtalk-workspace-list span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
+.dingtalk-binding-card, .dingtalk-agent-mode { display: grid; gap: 9px; padding: 11px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.dingtalk-binding-card > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.dingtalk-binding-card strong, .dingtalk-agent-mode strong { color: var(--text); font-size: 10px; }
+.dingtalk-binding-card span, .dingtalk-binding-card small { color: var(--muted); font-size: 9px; overflow-wrap: anywhere; }
+.dingtalk-init-command { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
+.dingtalk-init-command code { min-width: 0; padding: 8px; overflow: hidden; color: var(--green); background: var(--terminal); border: 1px solid var(--line); border-radius: 5px; font: 9px 'Cascadia Mono', Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.dingtalk-agent-mode > div { display: grid; gap: 9px; }
+.dingtalk-agent-mode > div.disabled, .dingtalk-agent-proxy.disabled { opacity: .55; }
+.dingtalk-agent-mode > div > label:not(.launcher-config-toggle), .dingtalk-agent-proxy label { display: grid; gap: 5px; color: var(--muted); font-size: 9px; }
+.dingtalk-agent-proxy { display: grid; grid-template-columns: minmax(0, 1fr) 100px; gap: 8px; padding: 9px; background: #131b1d; border: 1px solid var(--line); border-radius: 5px; }
 .rules-help { margin: 14px 0; color: var(--muted); font-size: 10px; line-height: 1.55; }
 .rule-add { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
 .rules-list { display: grid; gap: 7px; max-height: calc(100vh - 260px); overflow: auto; margin-top: 14px; }
@@ -355,15 +423,31 @@ button:disabled { cursor: default; opacity: .55; }
 .audit-filters { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: flex-end; gap: 8px; }
 .audit-filters label { display: grid; gap: 5px; color: var(--muted); font-size: 9px; }
 .audit-filter-wide select { max-width: 170px; }
-.audit-list { display: grid; gap: 7px; }
+.audit-workbench { display: grid; grid-template-columns: minmax(360px, 1fr) minmax(300px, 38%); gap: 8px; min-height: 0; }
+.audit-list { display: grid; align-content: start; gap: 7px; min-width: 0; }
 .audit-row { display: grid; grid-template-columns: 150px 58px minmax(0, 1fr) 48px; align-items: center; gap: 12px; padding: 11px 13px; background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--blue); border-radius: 6px; }
+.audit-row { cursor: pointer; }
+.audit-row.active { border-color: var(--green); background: #20322d; }
 .audit-row.audit-warning { border-left-color: var(--amber); }
 .audit-row.audit-error { border-left-color: var(--red); }
 .audit-row time, .audit-row small, .audit-category, .audit-level { color: var(--muted); font-size: 9px; }
 .audit-row div { min-width: 0; display: grid; gap: 3px; }
 .audit-row strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .audit-row code { overflow: hidden; color: #b8c7c5; font: 9px/1.45 'Cascadia Mono', Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.audit-detail { min-width: 0; align-self: start; padding: 14px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+.audit-detail > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+.audit-detail h3 { margin: 4px 0 0; font-size: 14px; overflow-wrap: anywhere; }
+.audit-detail dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin: 12px 0; }
+.audit-detail dl div, .audit-detail-fields > div { min-width: 0; padding: 8px; border: 1px solid var(--line); border-radius: 5px; background: var(--panel-2); }
+.audit-detail dt, .audit-detail-fields strong { color: var(--muted); font-size: 8px; text-transform: uppercase; }
+.audit-detail dd { margin: 3px 0 0; font-size: 10px; overflow-wrap: anywhere; }
+.audit-detail-fields { display: grid; gap: 7px; }
+.audit-detail-fields > div { display: grid; gap: 5px; }
+.audit-detail-fields code { color: var(--text); font: 10px/1.55 'Cascadia Mono', Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.audit-notice { margin: -8px 0 10px; color: var(--green); font-size: 10px; overflow-wrap: anywhere; }
 .audit-empty { min-height: 300px; display: grid; place-items: center; color: var(--muted); }
+.audit-pagination { position: sticky; bottom: 0; display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 42px; padding: 7px 9px; color: var(--muted); font-size: 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--appbar); }
+.audit-pagination div { display: flex; gap: 6px; }
 
 .attention-page { height: 100vh; overflow: hidden; background: var(--bg); }
 .attention-shell { height: calc(100vh - 54px); min-height: 0; display: grid; grid-template-columns: 215px 355px minmax(430px, 1fr); }
@@ -456,7 +540,7 @@ button:disabled { cursor: default; opacity: .55; }
   .topbar .button-secondary, .app-title small { display: none; }
   .workspace-layout { grid-template-columns: 1fr; }
   .sidebar { display: none; }
-  .terminal-grid { grid-template-columns: 1fr; grid-template-rows: none; grid-auto-rows: minmax(230px, 1fr); }
+  .terminal-grid { --terminal-grid-row-height: max(230px, calc((100% - 8px) / 2)); grid-template-columns: 1fr; grid-template-rows: repeat(2, var(--terminal-grid-row-height)); grid-auto-rows: var(--terminal-grid-row-height); }
   .terminal-grid-list { display: flex; grid-auto-rows: unset; }
   .agent-overview-workbench-list { grid-template-columns: 72px minmax(0, 1fr); }
   .agent-session-list { padding: 7px; }
@@ -465,6 +549,7 @@ button:disabled { cursor: default; opacity: .55; }
   .agent-session-list > button > span:nth-child(2), .agent-session-list em { display: none; }
   .agent-form, .rules-dialog { width: 100vw; }
   .audit-header { align-items: stretch; flex-direction: column; }
+  .audit-workbench { grid-template-columns: 1fr; }
   .audit-row { grid-template-columns: 1fr; gap: 5px; }
   .attention-shell { height: calc(100vh - 54px); grid-template-columns: 1fr; }
   .attention-shell-embedded { grid-template-columns: 1fr; }

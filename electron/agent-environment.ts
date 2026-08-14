@@ -1,4 +1,5 @@
 import type { AgentKind } from '../src/shared/manager-api'
+import { environmentWithFreshWindowsPath, type WindowsPathRefreshOptions } from './windows-environment'
 
 const CODEX_PARENT_MARKERS = [
   'CODEX_THREAD_ID',
@@ -17,14 +18,25 @@ function remove(environment: NodeJS.ProcessEnv, name: string): void {
   if (key) delete environment[key]
 }
 
-export function environmentForAgent(agentKind: AgentKind, source: NodeJS.ProcessEnv = process.env): Record<string, string> {
-  const environment: NodeJS.ProcessEnv = { ...source }
+export function environmentForAgent(
+  agentKind: AgentKind,
+  source: NodeJS.ProcessEnv = process.env,
+  pathRefreshOptions: WindowsPathRefreshOptions = {},
+): Record<string, string> {
+  const environment: NodeJS.ProcessEnv = agentKind === 'pi'
+    ? environmentWithFreshWindowsPath(source, pathRefreshOptions)
+    : { ...source }
   if (agentKind === 'codex' && CODEX_PARENT_MARKERS.some((name) => keyOf(source, name) !== undefined)) {
     for (const name of CODEX_PARENT_MARKERS) remove(environment, name)
     // When Manager itself is launched by Codex, these credentials belong to the
     // parent Agent. Let the nested native CLI load the user's own config.toml.
     remove(environment, 'CODEX_API_KEY')
     remove(environment, 'OPENAI_API_KEY')
+  }
+  if (agentKind === 'claude') {
+    // Claude Code's official inline fallback keeps completed messages in the
+    // containing terminal scrollback instead of an alternate-screen viewport.
+    environment.CLAUDE_CODE_NO_FLICKER = '0'
   }
   return Object.fromEntries(Object.entries(environment).filter((entry): entry is [string, string] => entry[1] !== undefined))
 }

@@ -3,9 +3,20 @@ import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } fro
 import TerminalTile from './TerminalTile'
 import ApprovalRulesDialog from './ApprovalRulesDialog'
 import ContinueKeywordDialog from './ContinueKeywordDialog'
+import SessionSafetyDialog from './SessionSafetyDialog'
+import DingTalkSettingsDialog from './DingTalkSettingsDialog'
 import AuditPage from './AuditPage'
 import AttentionCenter from './AttentionCenter'
-import type { AgentConfigSource, AgentKind, ApprovalRequest, CCSwitchProviderSummary, NativeSessionSummary, StartSessionRequest, SessionSummary } from './shared/manager-api'
+import type { AgentConfigSource, AgentEnvironmentSummary, AgentInstallProgress, AgentKind, ApprovalRequest, CCSwitchProviderSummary, ExternalTerminalDragProjection, NativeSessionSummary, NpmRegistryChoice, StartSessionRequest, SessionSummary } from './shared/manager-api'
+import managerLogoUrl from '../logo/AgentTuiManager.png'
+import codexLogoUrl from '../logo/codex.png'
+import claudeLogoUrl from '../logo/claudecode.png'
+
+const AGENT_LOGO_URLS: Partial<Record<AgentKind, string>> = { codex: codexLogoUrl, claude: claudeLogoUrl }
+function AgentLogo({ kind, className = '', label }: { kind: AgentKind; className?: string; label?: string }): JSX.Element {
+  const source = AGENT_LOGO_URLS[kind]
+  return source ? <img className={className} src={source} alt={label ?? (kind === 'claude' ? 'Claude Code' : 'Codex')} /> : <span className={className}>{kind === 'pi' ? 'Pi' : kind === 'generic' ? '›_' : 'C'}</span>
+}
 
 function FullAutoDialog({ session, onClose, onChanged }: { session: SessionSummary; onClose: () => void; onChanged: () => void }): JSX.Element {
   const [confirmed, setConfirmed] = useState(false)
@@ -24,7 +35,7 @@ function FullAutoDialog({ session, onClose, onChanged }: { session: SessionSumma
   return <div className='modal-backdrop full-auto-backdrop' role='presentation'><section className='full-auto-dialog' role='dialog' aria-modal='true' aria-labelledby='full-auto-title'>
     <header><div><p className={enabling ? 'detail-kicker delete' : 'detail-kicker read'}>{enabling ? '高风险模式' : '当前已开启'}</p><h2 id='full-auto-title'>{enabling ? '开启全自动模式' : '关闭全自动模式'}</h2></div></header>
     <div className='full-auto-dialog-body'><p>仅对 <strong>{session.displayName}</strong> 生效。适合你暂时离开、但仍希望 Agent 连续工作的场景。</p>
-      {enabling ? <><div className='full-auto-warning'><strong>普通读取、写入和已识别工具会自动批准</strong><span>操作将直接执行，可能修改当前工作区内容。请先确认 Agent 当前任务和工作区无误。</span></div><ul><li>删除、递归删除、提权和敏感系统操作仍需人工批准</li><li>工作区外写入会被拦截</li><li>命令或目标信息不完整时不会自动放行</li><li>每次自动批准和拦截都会写入审计</li></ul><label className='full-auto-confirm'><input type='checkbox' checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />我了解风险，并确认暂时离开期间允许此 Agent 自动执行普通操作</label></> : <div className='full-auto-safe-note'>关闭后，后续没有命中安全规则的请求会重新进入处理中心。已经执行的操作不会撤销。</div>}
+      {enabling ? <><div className='full-auto-warning'><strong>除删除和严重危险命令外，其他工具请求都会自动批准</strong><span>操作将直接执行，也可能修改工作区外内容。请先确认 Agent 当前任务和运行环境无误。</span></div><ul><li>删除操作始终需要逐次人工批准</li><li>递归强制删除、提权、下载后执行、敏感文件覆盖和系统破坏命令会被拦截</li><li>Shell 工具未提供完整命令参数时不会自动放行</li><li>每次自动批准和拦截都会写入审计</li></ul><label className='full-auto-confirm'><input type='checkbox' checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />我了解风险，并确认暂时离开期间允许此 Agent 自动执行普通操作</label></> : <div className='full-auto-safe-note'>关闭后，后续没有命中安全规则的请求会重新进入处理中心。已经执行的操作不会撤销。</div>}
       {error && <p className='form-error'>{error}</p>}
     </div><footer><button className='button-secondary' type='button' onClick={onClose}>取消</button><button className={enabling ? 'button-danger full-auto-confirm-button' : 'button-primary'} type='button' disabled={busy || (enabling && !confirmed)} onClick={() => { void submit() }}>{busy ? '请稍后…' : enabling ? '开启全自动模式' : '关闭全自动模式'}</button></footer>
   </section></div>
@@ -40,7 +51,10 @@ interface OverviewPreferences {
   overviewMode: 'wall' | 'list'
   groupByWorkspace: boolean
   activeWorkspace?: string
+  sessionOrder?: string[]
 }
+
+type OverlayKind = 'agent-form' | 'agent-editor' | 'approval-rules' | 'continue-keywords' | 'session-safety' | 'dingtalk' | 'full-auto'
 
 function readOverviewPreferences(): OverviewPreferences {
   const fallback: OverviewPreferences = { overviewMode: 'wall', groupByWorkspace: false }
@@ -52,6 +66,7 @@ function readOverviewPreferences(): OverviewPreferences {
       overviewMode: value.overviewMode === 'list' ? 'list' : 'wall',
       groupByWorkspace: value.groupByWorkspace === true,
       ...(typeof value.activeWorkspace === 'string' && value.activeWorkspace ? { activeWorkspace: value.activeWorkspace } : {}),
+      ...(Array.isArray(value.sessionOrder) ? { sessionOrder: value.sessionOrder.filter((item): item is string => typeof item === 'string') } : {}),
     }
   } catch {
     return fallback
@@ -108,7 +123,15 @@ function CCSwitchProviderList({
   </div>
 }
 
-function NewAgentForm({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: (workspace: string) => void }): JSX.Element {
+interface ExternalImportIntent {
+  transactionId: string
+  workspace?: string
+  agentKind?: 'codex' | 'claude'
+  nativeSessionId?: string
+  issue?: string
+}
+
+function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boolean; initialImport?: ExternalImportIntent; onClose: () => void; onCreated: (workspace: string) => void }): JSX.Element {
   const [agentKind, setAgentKind] = useState<AgentKind>('codex')
   const [displayName, setDisplayName] = useState('新 Agent')
   const [workspace, setWorkspace] = useState('')
@@ -134,6 +157,13 @@ function NewAgentForm({ open, onClose, onCreated }: { open: boolean; onClose: ()
   const [nativeSessionId, setNativeSessionId] = useState('')
   const [discoveryState, setDiscoveryState] = useState<'idle' | 'loading' | 'ready' | 'unsupported' | 'error'>('idle')
   const [discoveryError, setDiscoveryError] = useState('')
+  const [environment, setEnvironment] = useState<AgentEnvironmentSummary>()
+  const [environmentState, setEnvironmentState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
+  const [environmentError, setEnvironmentError] = useState('')
+  const [environmentBusy, setEnvironmentBusy] = useState(false)
+  const [npmRegistry, setNpmRegistry] = useState<NpmRegistryChoice>('configured')
+  const [installProgress, setInstallProgress] = useState<AgentInstallProgress>()
+  const [installMessages, setInstallMessages] = useState<Array<{ text: string; level: 'info' | 'warning' | 'error' }>>([])
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [launcherTab, setLauncherTab] = useState<'new' | 'history' | 'external' | 'config'>('new')
@@ -141,6 +171,33 @@ function NewAgentForm({ open, onClose, onCreated }: { open: boolean; onClose: ()
   const [closeArmed, setCloseArmed] = useState(false)
   const closeTimer = useRef<ReturnType<typeof setTimeout>>()
   const discoveryVersion = useRef(0)
+
+  useEffect(() => window.agentManager.subscribe((event) => {
+    if (event.type !== 'agent-install-progress') return
+    const progress = event.progress
+    if ((progress.target === 'agent' || progress.target === 'dependency') && progress.agentKind !== agentKind) return
+    setInstallProgress(progress)
+    const message = progress.message
+    if (!message) return
+    setInstallMessages((current) => {
+      if (current.at(-1)?.text === message) return current
+      return [...current, { text: message, level: progress.level ?? 'info' }].slice(-8)
+    })
+  }), [agentKind])
+
+  useEffect(() => {
+    if (!initialImport) return
+    const kind = initialImport.agentKind ?? 'codex'
+    setAgentKind(kind)
+    setExecutable(kind)
+    setLauncherTab('external')
+    if (initialImport.workspace) {
+      setWorkspace(initialImport.workspace)
+      void loadNativeSessions(kind, initialImport.workspace).then(() => {
+        if (initialImport.nativeSessionId) setNativeSessionId(initialImport.nativeSessionId)
+      })
+    }
+  }, [initialImport?.transactionId])
 
   useEffect(() => {
     if (open) setCloseArmed(false)
@@ -203,8 +260,75 @@ function NewAgentForm({ open, onClose, onCreated }: { open: boolean; onClose: ()
   const changeKind = (kind: AgentKind): void => {
     setAgentKind(kind)
     setExecutable(kind === 'generic' ? 'cmd.exe' : kind)
+    setInstallProgress(undefined); setInstallMessages([])
     if (workspace) void loadNativeSessions(kind, workspace)
     if (configSource === 'ccswitch') void loadCCSwitchProviders(kind)
+  }
+
+  const detectEnvironment = async (kind = agentKind, candidate = executable): Promise<void> => {
+    if (kind === 'generic' || typeof window.agentManager.detectAgentEnvironment !== 'function') {
+      setEnvironment(undefined); setEnvironmentState('idle'); setEnvironmentError(''); return
+    }
+    setEnvironmentState('loading'); setEnvironmentError('')
+    try {
+      const result = await window.agentManager.detectAgentEnvironment(kind, candidate.trim())
+      setEnvironment(result); setEnvironmentState('ready')
+    } catch (reason) {
+      setEnvironment(undefined); setEnvironmentState('error')
+      setEnvironmentError(reason instanceof Error ? reason.message : String(reason))
+    }
+  }
+
+  useEffect(() => {
+    if (!open || agentKind === 'generic') return
+    const timer = setTimeout(() => { void detectEnvironment() }, 300)
+    return () => clearTimeout(timer)
+  }, [agentKind, executable, open])
+
+  const installNode = async (): Promise<void> => {
+    if (typeof window.agentManager.installNodeAndNpm !== 'function') return
+    setEnvironmentBusy(true); setEnvironmentError(''); setInstallProgress(undefined); setInstallMessages([])
+    try {
+      await window.agentManager.installNodeAndNpm()
+      setInstallProgress((current) => ({ target: 'node', phase: 'completed', elapsedMs: current?.elapsedMs ?? 0, message: 'Node.js/npm 安装成功', level: 'info' }))
+      setInstallMessages((current) => [...current, { text: 'Node.js/npm 安装成功', level: 'info' as const }].slice(-8))
+      await detectEnvironment()
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason)
+      setEnvironmentError(message); setInstallProgress((current) => ({ target: 'node', phase: 'failed', elapsedMs: current?.elapsedMs ?? 0, message, level: 'error' }))
+    }
+    finally { setEnvironmentBusy(false) }
+  }
+
+  const installSelectedAgent = async (): Promise<void> => {
+    if (typeof window.agentManager.installAgent !== 'function') return
+    setEnvironmentBusy(true); setEnvironmentError(''); setInstallProgress(undefined); setInstallMessages([])
+    try {
+      await window.agentManager.installAgent(agentKind, npmRegistry)
+      setInstallProgress((current) => ({ target: 'agent', agentKind, phase: 'completed', elapsedMs: current?.elapsedMs ?? 0, message: 'Agent CLI 安装成功', level: 'info' }))
+      setInstallMessages((current) => [...current, { text: 'Agent CLI 安装成功，可以创建 Agent。', level: 'info' as const }].slice(-8))
+      await detectEnvironment()
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason)
+      setEnvironmentError(message); setInstallProgress((current) => ({ target: 'agent', agentKind, phase: 'failed', elapsedMs: current?.elapsedMs ?? 0, message, level: 'error' }))
+      setInstallMessages((current) => [...current, { text: message, level: 'error' as const }].slice(-8))
+    }
+    finally { setEnvironmentBusy(false) }
+  }
+
+  const installPiRipgrep = async (): Promise<void> => {
+    if (typeof window.agentManager.installRipgrep !== 'function') return
+    setEnvironmentBusy(true); setEnvironmentError(''); setInstallProgress(undefined); setInstallMessages([])
+    try {
+      await window.agentManager.installRipgrep()
+      setInstallProgress((current) => ({ target: 'dependency', agentKind: 'pi', phase: 'completed', elapsedMs: current?.elapsedMs ?? 0, message: 'ripgrep 安装成功', level: 'info' }))
+      setInstallMessages((current) => [...current, { text: 'ripgrep 安装成功，Pi 下次启动不会重复下载。', level: 'info' as const }].slice(-8))
+      await detectEnvironment()
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason)
+      setEnvironmentError(message); setInstallProgress((current) => ({ target: 'dependency', agentKind: 'pi', phase: 'failed', elapsedMs: current?.elapsedMs ?? 0, message, level: 'error' }))
+      setInstallMessages((current) => [...current, { text: message, level: 'error' as const }].slice(-8))
+    } finally { setEnvironmentBusy(false) }
   }
 
   const chooseWorkspace = async (): Promise<void> => {
@@ -222,6 +346,21 @@ function NewAgentForm({ open, onClose, onCreated }: { open: boolean; onClose: ()
 
   const submit = async (event: FormEvent): Promise<void> => {
     event.preventDefault(); setBusy(true); setError('')
+    if (agentKind !== 'generic' && typeof window.agentManager.detectAgentEnvironment === 'function') {
+      try {
+        const currentEnvironment = await window.agentManager.detectAgentEnvironment(agentKind, executable.trim())
+        setEnvironment(currentEnvironment); setEnvironmentState('ready'); setEnvironmentError('')
+        if (!currentEnvironment.nodeAvailable || !currentEnvironment.npmAvailable) {
+          setError('未检测到 Node.js/npm，请先点击“一键安装 Node.js/npm”'); setBusy(false); return
+        }
+        if (!currentEnvironment.agentInstalled) {
+          setError('当前 Agent 尚未安装，请一键安装或在高级设置中选择可用的 Executable 文件'); setBusy(false); return
+        }
+      } catch (reason) {
+        const message = reason instanceof Error ? reason.message : String(reason)
+        setEnvironmentState('error'); setEnvironmentError(message); setError('环境检测失败：' + message); setBusy(false); return
+      }
+    }
     const parsedArgs = args.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
     const resumeArgs = nativeSessionId
       ? agentKind === 'codex' ? ['resume', nativeSessionId] : agentKind === 'claude' ? ['--resume', nativeSessionId] : undefined
@@ -254,6 +393,17 @@ function NewAgentForm({ open, onClose, onCreated }: { open: boolean; onClose: ()
     catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); setBusy(false) }
   }
 
+  const chooseExecutable = async (): Promise<void> => {
+    if (typeof window.agentManager.chooseExecutable !== 'function') return
+    setEnvironmentError('')
+    try {
+      const selected = await window.agentManager.chooseExecutable(agentKind)
+      if (selected) setExecutable(selected)
+    } catch (reason) {
+      setEnvironmentError(reason instanceof Error ? reason.message : String(reason))
+    }
+  }
+
   const filteredSessions = nativeSessions.filter((nativeSession) => {
     const query = historyQuery.trim().toLocaleLowerCase('zh-CN')
     return !query || nativeSession.title.toLocaleLowerCase('zh-CN').includes(query)
@@ -284,14 +434,38 @@ function NewAgentForm({ open, onClose, onCreated }: { open: boolean; onClose: ()
         <nav className='launcher-tabs' aria-label='会话方式'><button type='button' className={`launcher-tab${launcherTab === 'new' ? ' active' : ''}`} onClick={() => setLauncherTab('new')}>新会话</button><button type='button' className={`launcher-tab${launcherTab === 'history' ? ' active' : ''}`} onClick={() => setLauncherTab('history')}>恢复历史</button><button type='button' className={`launcher-tab${launcherTab === 'external' ? ' active' : ''}`} onClick={() => setLauncherTab('external')}>迁移外部会话</button><button type='button' className={`launcher-tab${launcherTab === 'config' ? ' active' : ''}`} onClick={() => setLauncherTab('config')}>独立配置</button></nav>
         <label className='sr-only' htmlFor='agent-kind'>Agent 类型</label><select className='sr-only' id='agent-kind' value={agentKind} onChange={(event) => changeKind(event.target.value as AgentKind)}><option value='codex'>Codex</option><option value='claude'>Claude Code</option><option value='pi'>Pi</option><option value='generic'>通用终端</option></select>
         <label className='sr-only' htmlFor='native-session'>历史会话</label><select className='sr-only' id='native-session' value={nativeSessionId} disabled={!workspace || discoveryState === 'loading' || discoveryState === 'unsupported'} onChange={(event) => setNativeSessionId(event.target.value)}><option value=''>新建会话</option>{nativeSessions.map((item) => <option key={item.id} value={item.id}>{item.title} · {new Date(item.updatedAt).toLocaleString()}</option>)}</select>
-        {launcherTab === 'new' && <section className='launcher-panel'><div className='launcher-section-title'><h2>选择 Agent</h2><span>选择本机 CLI</span></div><div className='launcher-agent-options'>{agentOptions.map((option) => <button type='button' key={option.kind} className={`launcher-agent-option${agentKind === option.kind ? ' active' : ''}`} onClick={() => changeKind(option.kind)}><span className={`launcher-option-logo option-${option.kind}`}>{option.logo}</span><span><strong>{option.title}</strong><span>{option.subtitle}</span></span></button>)}</div>
+        {launcherTab === 'new' && <section className='launcher-panel'><div className='launcher-section-title'><h2>选择 Agent</h2><span>选择本机 CLI</span></div><div className='launcher-agent-options'>{agentOptions.map((option) => <button type='button' key={option.kind} className={`launcher-agent-option${agentKind === option.kind ? ' active' : ''}`} onClick={() => changeKind(option.kind)}><AgentLogo kind={option.kind} className={`launcher-option-logo option-${option.kind}`} label={option.title} /><span><strong>{option.title}</strong><span>{option.subtitle}</span></span></button>)}</div>
            {discoveryState === 'unsupported' && <p className='launcher-state'>该 Agent 暂不支持自动读取历史会话</p>}
            {discoveryState === 'error' && <p className='launcher-state error'>读取失败：{discoveryError}，仍可新建会话。</p>}
+           {agentKind !== 'generic' && <div className='launcher-environment' aria-live='polite'>
+             <div className='launcher-section-title'><h2>运行环境检测</h2><button type='button' className='button-secondary mini-button' disabled={environmentBusy || environmentState === 'loading'} onClick={() => { void detectEnvironment() }}>{environmentState === 'loading' ? '检测中…' : '重新检测'}</button></div>
+             {environmentState === 'loading' && <p className='launcher-state'>正在检测 Node.js、npm 和 {agentKind}…</p>}
+             {(environmentState === 'error' || environmentError) && <p className='launcher-state error'>{environmentError}</p>}
+             {environmentState === 'ready' && environment && <div className='launcher-environment-checks'>
+               <span className={environment.nodeAvailable ? 'ok' : 'bad'}>● Node.js　{environment.nodeVersion ?? '未安装'}</span>
+               <span className={environment.npmAvailable ? 'ok' : 'bad'}>● npm　{environment.npmVersion ?? '未安装'}</span>
+               <span className={environment.agentInstalled ? 'ok' : 'bad'}>● Agent CLI　{environment.executableVersion ?? '未安装'}</span>
+               {agentKind === 'pi' && <span className={environment.ripgrepAvailable ? 'ok' : 'bad'}>● ripgrep　{environment.ripgrepVersion ?? '未安装'}</span>}
+             </div>}
+             {environmentState === 'ready' && environment && (!environment.nodeAvailable || !environment.npmAvailable) && <div className='launcher-environment-install'><span>需要先安装 Node.js/npm。</span><button type='button' className='button-secondary mini-button' disabled={environmentBusy} onClick={() => { void installNode() }}>{environmentBusy ? '安装中…' : '一键安装 Node.js/npm'}</button></div>}
+             {environmentState === 'ready' && environment?.npmAvailable && !environment.agentInstalled && <div className='launcher-environment-install launcher-environment-install-agent'><span>未检测到 Agent CLI，暂时不能创建。</span><label>安装源<select className='launcher-field' aria-label='npm 安装源' disabled={environmentBusy} value={npmRegistry} onChange={(event) => setNpmRegistry(event.target.value as NpmRegistryChoice)}><option value='configured'>跟随本机 npm 配置</option><option value='npmmirror'>npmmirror（国内）</option><option value='tencent'>腾讯云（国内）</option><option value='huawei'>华为云（国内）</option><option value='official'>npm 官方源</option></select></label><button type='button' className='button-secondary mini-button' disabled={environmentBusy} onClick={() => { void installSelectedAgent() }}>{environmentBusy ? '安装中…' : '一键安装 Agent CLI'}</button></div>}
+             {agentKind === 'pi' && environmentState === 'ready' && environment?.agentInstalled && !environment.ripgrepAvailable && <div className='launcher-environment-install'><span>Pi 缺少 ripgrep，启动时会重复尝试从 GitHub 下载。</span><button type='button' className='button-secondary mini-button' disabled={environmentBusy} onClick={() => { void installPiRipgrep() }}>{environmentBusy ? '安装中…' : '一键安装 ripgrep'}</button></div>}
+             {(environmentBusy || installProgress) && <div className={`launcher-install-progress phase-${installProgress?.phase ?? 'starting'}`}>
+               <div className='launcher-install-progress-head'><strong>{installProgress?.phase === 'completed' ? '安装完成' : installProgress?.phase === 'failed' ? '安装失败' : '正在安装'}</strong><time>{Math.floor((installProgress?.elapsedMs ?? 0) / 60_000).toString().padStart(2, '0')}:{Math.floor(((installProgress?.elapsedMs ?? 0) % 60_000) / 1_000).toString().padStart(2, '0')}</time></div>
+               <div className='launcher-install-pulse' aria-hidden='true'><span /></div>
+               <div className='launcher-install-output'>{installMessages.length ? installMessages.map((item, index) => <span key={`${index}-${item.text}`} className={item.level}>{item.text}</span>) : <span>正在等待安装程序输出…</span>}</div>
+             </div>}
+             {environmentState === 'ready' && environment?.nodeAvailable && environment.npmAvailable && environment.agentInstalled && <p className='launcher-state success'>环境已就绪，可以创建 Agent。</p>}
+           </div>}
           <div className='launcher-form-grid'><label htmlFor='session-name'>显示名称</label><input id='session-name' className='launcher-field' required value={displayName} onChange={(event) => setDisplayName(event.target.value)} /><label htmlFor='approval-mode'>审批策略</label><select id='approval-mode' className='launcher-field' defaultValue='workspace'><option value='workspace'>使用工作区默认策略</option><option value='manual'>全部手动确认</option><option value='builtin'>仅使用内置安全规则</option></select></div><div className='launcher-command-preview'>{executable || '<custom-command>'}<small>cwd: {workspace || '请选择工作区'}</small></div>
-          <details className='advanced-settings'><summary>高级设置</summary><div><label>Executable<input required value={executable} onChange={(event) => setExecutable(event.target.value)} /></label><label>参数（每行一个）<textarea rows={3} value={args} onChange={(event) => setArgs(event.target.value)} /></label><label>自动 continue 最大次数<input type='number' min={1} max={10} required value={maxContinueRetries} onChange={(event) => setMaxContinueRetries(Number(event.target.value))} /></label><small>遇到明确的临时错误时，每隔 3 秒重试一次。正常结束或手动中断不会重试。</small></div></details></section>}
+           <details className='advanced-settings'><summary>高级设置</summary><div><label>Executable<div className='workspace-picker'><input required value={executable} onChange={(event) => setExecutable(event.target.value)} /><button type='button' className='button-secondary' onClick={() => { void chooseExecutable() }}>选择文件</button></div></label><small>如果 CLI 没有加入全局 PATH，可选择完整的 .exe 或 .cmd 路径；修改后会自动重新检测。</small><label>参数（每行一个）<textarea rows={3} value={args} onChange={(event) => setArgs(event.target.value)} /></label><label>自动 continue 最大次数<input type='number' min={1} max={10} required value={maxContinueRetries} onChange={(event) => setMaxContinueRetries(Number(event.target.value))} /></label><small>遇到明确的临时错误时，每隔 3 秒重试一次。正常结束或手动中断不会重试。</small></div></details></section>}
         {launcherTab === 'history' && <section className='launcher-panel'><div className='launcher-filter-row'><input className='launcher-field' value={historyQuery} onChange={(event) => setHistoryQuery(event.target.value)} placeholder='搜索标题或会话 ID' /><select className='launcher-field' value={agentKind} onChange={(event) => changeKind(event.target.value as AgentKind)}><option value='codex'>Codex</option><option value='claude'>Claude Code</option><option value='pi'>Pi</option><option value='generic'>通用终端</option></select></div><div className='launcher-section-title'><h2>该工作区的历史会话</h2><span>按最近活动排序</span></div>
-          {discoveryState === 'loading' && <p className='launcher-state'>正在读取历史会话…</p>}{discoveryState === 'unsupported' && <p className='launcher-state'>该 Agent 暂不支持自动读取历史会话</p>}{discoveryState === 'error' && <p className='launcher-state error'>读取失败：{discoveryError}，仍可新建会话。</p>}{discoveryState === 'ready' && filteredSessions.length === 0 && <p className='launcher-state'>该工作区没有可恢复的历史会话</p>}<div className='launcher-session-list'>{filteredSessions.map((item) => <button type='button' aria-pressed={nativeSessionId === item.id} key={item.id} className={`launcher-session-item${nativeSessionId === item.id ? ' active' : ''}`} onClick={() => setNativeSessionId((current) => current === item.id ? '' : item.id)}><span className={`launcher-option-logo option-${agentKind}`}>{agentKind === 'claude' ? 'CL' : agentKind === 'pi' ? 'Pi' : 'C'}</span><span><strong>{item.title}</strong><span>{item.subtitle || item.id}</span><small>{agentKind === 'claude' ? 'Claude Code' : agentKind.toUpperCase()} · {item.id}</small></span><time>{new Date(item.updatedAt).toLocaleString()}</time></button>)}</div></section>}
-        {launcherTab === 'external' && <section className='launcher-panel'><div className='launcher-external-note'>迁移会在原终端正常停止后，通过 Agent 自带的历史恢复能力在本应用重新打开；不会复制终端画面或改变原生会话数据。</div><div className='launcher-section-title'><h2>检测到的外部 Agent</h2><span>当前没有可迁移进程</span></div></section>}
+          {discoveryState === 'loading' && <p className='launcher-state'>正在读取历史会话…</p>}{discoveryState === 'unsupported' && <p className='launcher-state'>该 Agent 暂不支持自动读取历史会话</p>}{discoveryState === 'error' && <p className='launcher-state error'>读取失败：{discoveryError}，仍可新建会话。</p>}{discoveryState === 'ready' && filteredSessions.length === 0 && <p className='launcher-state'>该工作区没有可恢复的历史会话</p>}<div className='launcher-session-list'>{filteredSessions.map((item) => <button type='button' aria-pressed={nativeSessionId === item.id} key={item.id} className={`launcher-session-item${nativeSessionId === item.id ? ' active' : ''}`} onClick={() => setNativeSessionId((current) => current === item.id ? '' : item.id)}><AgentLogo kind={agentKind} className={`launcher-option-logo option-${agentKind}`} label={agentKind} /><span><strong>{item.title}</strong><span>{item.subtitle || item.id}</span><small>{agentKind === 'claude' ? 'Claude Code' : agentKind.toUpperCase()} · {item.id}</small></span><time>{new Date(item.updatedAt).toLocaleString()}</time></button>)}</div></section>}
+        {launcherTab === 'external' && <section className='launcher-panel'><div className='launcher-external-note'>{initialImport?.issue ?? '先在外部终端正常退出当前 Agent，再从下方选择原生会话。Manager 会通过 Agent 自带的 resume 接管；不会复制终端画面或改变原生会话数据。'}</div><div className='launcher-section-title'><h2>可迁入的原生会话</h2><span>{discoveryState === 'ready' ? filteredSessions.length + ' 个' : '请先选择工作区'}</span></div>
+          {discoveryState === 'loading' && <p className='launcher-state'>正在检测原生会话…</p>}{discoveryState === 'unsupported' && <p className='launcher-state'>当前 Agent 暂不支持原生会话迁入</p>}{discoveryState === 'error' && <p className='launcher-state error'>检测失败：{discoveryError}</p>}{discoveryState === 'ready' && filteredSessions.length === 0 && <p className='launcher-state'>该工作区没有可迁入的原生会话</p>}
+          <div className='launcher-session-list'>{filteredSessions.map((item) => <button type='button' aria-pressed={nativeSessionId === item.id} key={item.id} className={`launcher-session-item external-session-item${nativeSessionId === item.id ? ' active' : ''}`} onClick={() => setNativeSessionId((current) => current === item.id ? '' : item.id)}><AgentLogo kind={agentKind} className={`launcher-option-logo option-${agentKind}`} label={agentKind} /><span><strong>{item.title}</strong><span>{item.subtitle || item.workspace}</span><small>{item.id}</small></span><time>{new Date(item.updatedAt).toLocaleString()}</time></button>)}</div>
+          {nativeSessionId && <div className='external-migration-steps'><strong>准备迁入</strong><span>1. 确认外部 Agent 已正常退出　2. 点击底部“迁入 Manager”　3. 若原会话仍被占用，Manager 会保留当前表单并提示重试</span></div>}
+        </section>}
         {launcherTab === 'config' && <section className='launcher-panel launcher-config-panel'>
           <div className='launcher-config-intro'><strong>默认继承本机配置</strong><span>关闭时与普通终端启动方式完全一致，不读取或修改本机 Codex、Claude Code 配置文件。</span></div>
           <label className='launcher-config-toggle'><span><strong>为这个 Agent 使用独立配置</strong><small>仅注入这个 Agent 的进程环境；当前工作区和其他 Agent 不受影响。</small></span><input type='checkbox' role='switch' aria-label='启用独立配置' checked={configEnabled} onChange={(event) => setConfigEnabled(event.target.checked)} /></label>
@@ -321,7 +495,7 @@ function NewAgentForm({ open, onClose, onCreated }: { open: boolean; onClose: ()
       </div>
       {closeArmed && <p className='launcher-dismiss-hint'>再点击一次空白处关闭，已填写内容会保留</p>}
       {error && <p className='launcher-error'>{error}</p>}
-      <footer className='launcher-foot'><span>{nativeSessionId ? '将在新终端中恢复已选择的历史会话' : launcherTab === 'external' ? '迁移不会中断或接管外部终端' : launcherTab === 'config' ? configEnabled ? '独立配置只应用于这个 Agent' : '当前继续继承本机配置' : `将启动新的 ${agentOptions.find((option) => option.kind === agentKind)?.title ?? 'Agent'} 会话`}</span><button type='button' className='button-secondary' onClick={onClose}>取消</button>{launcherTab !== 'external' && <button type='submit' className='button-primary' disabled={busy || !workspace || (configEnabled && configSource === 'ccswitch' && !ccSwitchProviderId)}>{busy ? '请稍后…' : nativeSessionId ? '恢复会话' : '启动 Agent'}</button>}</footer>
+      <footer className='launcher-foot'><span>{nativeSessionId ? launcherTab === 'external' ? '将通过原生 resume 迁入所选会话' : '将在新终端中恢复已选择的历史会话' : launcherTab === 'external' ? '选择一个已正常退出的原生会话' : launcherTab === 'config' ? configEnabled ? '独立配置只应用于这个 Agent' : '当前继续继承本机配置' : `将启动新的 ${agentOptions.find((option) => option.kind === agentKind)?.title ?? 'Agent'} 会话`}</span><button type='button' className='button-secondary' onClick={onClose}>取消</button>{(launcherTab !== 'external' || nativeSessionId) && <button type='submit' className='button-primary' disabled={busy || environmentBusy || !workspace || (launcherTab === 'external' && !nativeSessionId) || (configEnabled && configSource === 'ccswitch' && !ccSwitchProviderId)}>{busy ? '请稍后…' : launcherTab === 'external' ? '迁入 Manager' : nativeSessionId ? '恢复会话' : '启动 Agent'}</button>}</footer>
     </form>
   </div>
 }
@@ -448,7 +622,7 @@ function EditAgentForm({ open, session, onClose, onSaved }: { open: boolean; ses
       <div className='launcher-workspace-row'><label>工作区</label><div className='workspace-picker'><input className='launcher-field' disabled value={session.workspace} readOnly /><button type='button' className='button-secondary' disabled>选择文件夹</button></div></div>
       <div className='launcher-content'>
         <nav className='launcher-tabs' aria-label='编辑范围'><button type='button' className={`launcher-tab${editTab === 'basic' ? ' active' : ''}`} onClick={() => setEditTab('basic')}>基本信息</button><button type='button' className={`launcher-tab${editTab === 'config' ? ' active' : ''}`} onClick={() => { setEditTab('config'); if (configEnabled && configSource === 'ccswitch') void loadCCSwitchProviders() }}>独立配置</button></nav>
-        {editTab === 'basic' && <section className='launcher-panel'><div className='launcher-section-title'><h2>Agent 类型</h2><span>类型和工作区暂不可修改</span></div><div className='launcher-agent-options'>{options.map((option) => <button type='button' disabled key={option.kind} className={`launcher-agent-option${session.agentKind === option.kind ? ' active' : ''}`}><span className={`launcher-option-logo option-${option.kind}`}>{option.logo}</span><span><strong>{option.title}</strong><span>{session.agentKind === option.kind ? '当前类型' : '不可修改'}</span></span></button>)}</div>
+        {editTab === 'basic' && <section className='launcher-panel'><div className='launcher-section-title'><h2>Agent 类型</h2><span>类型和工作区暂不可修改</span></div><div className='launcher-agent-options'>{options.map((option) => <button type='button' disabled key={option.kind} className={`launcher-agent-option${session.agentKind === option.kind ? ' active' : ''}`}><AgentLogo kind={option.kind} className={`launcher-option-logo option-${option.kind}`} label={option.title} /><span><strong>{option.title}</strong><span>{session.agentKind === option.kind ? '当前类型' : '不可修改'}</span></span></button>)}</div>
           <div className='launcher-form-grid'><label htmlFor='edit-session-name'>显示名称</label><input id='edit-session-name' className='launcher-field' required maxLength={120} value={displayName} onChange={(event) => setDisplayName(event.target.value)} /><label>审批策略</label><select className='launcher-field' disabled defaultValue='workspace'><option value='workspace'>使用工作区默认策略</option></select></div>
           <div className='launcher-command-preview'>{session.agentKind === 'generic' ? 'cmd.exe' : session.agentKind}<small>session: {session.nativeSessionId ?? session.sessionId}</small></div>
           <details className='advanced-settings'><summary>高级设置</summary><div><label>Executable<input disabled value={session.agentKind === 'generic' ? 'cmd.exe' : session.agentKind} readOnly /></label><label>Model<input disabled value='跟随本机配置' readOnly /></label><label>参数<textarea disabled rows={3} value='当前版本不可修改' readOnly /></label></div></details>
@@ -498,6 +672,8 @@ export default function App(): JSX.Element {
   const [formMounted, setFormMounted] = useState(false)
   const [showApprovalRules, setShowApprovalRules] = useState(false)
   const [showContinueKeywords, setShowContinueKeywords] = useState(false)
+  const [showSessionSafety, setShowSessionSafety] = useState(false)
+  const [showDingTalkSettings, setShowDingTalkSettings] = useState(false)
   const [showEditor, setShowEditor] = useState(false)
   const [editingSessionId, setEditingSessionId] = useState<string>()
   const [showNotifications, setShowNotifications] = useState(false)
@@ -510,16 +686,41 @@ export default function App(): JSX.Element {
   const [groupByWorkspace, setGroupByWorkspace] = useState(initialOverviewPreferences.current.groupByWorkspace)
   const [listActiveId, setListActiveId] = useState<string>()
   const [activeWorkspace, setActiveWorkspace] = useState<string | undefined>(initialOverviewPreferences.current.activeWorkspace)
+  const [sessionOrder, setSessionOrder] = useState<string[]>(initialOverviewPreferences.current.sessionOrder ?? [])
+  const [draggingSessionId, setDraggingSessionId] = useState<string>()
+  const [detachBusy, setDetachBusy] = useState(false)
+  const [handoffError, setHandoffError] = useState('')
+  const [externalDrag, setExternalDrag] = useState<ExternalTerminalDragProjection | null>(null)
+  const [externalImport, setExternalImport] = useState<ExternalImportIntent>()
   const notificationRef = useRef<HTMLDivElement>(null)
   const notificationHideTimer = useRef<ReturnType<typeof setTimeout>>()
   useEffect(() => {
-    writeOverviewPreferences({ overviewMode, groupByWorkspace, ...(activeWorkspace ? { activeWorkspace } : {}) })
-  }, [activeWorkspace, groupByWorkspace, overviewMode])
+    writeOverviewPreferences({ overviewMode, groupByWorkspace, ...(activeWorkspace ? { activeWorkspace } : {}), sessionOrder })
+  }, [activeWorkspace, groupByWorkspace, overviewMode, sessionOrder])
+  const closeOtherOverlays = useCallback((except: OverlayKind): void => {
+    if (except !== 'agent-form') setShowForm(false)
+    if (except !== 'agent-editor') setShowEditor(false)
+    if (except !== 'approval-rules') setShowApprovalRules(false)
+    if (except !== 'continue-keywords') setShowContinueKeywords(false)
+    if (except !== 'session-safety') setShowSessionSafety(false)
+    if (except !== 'dingtalk') setShowDingTalkSettings(false)
+    if (except !== 'full-auto') setFullAutoSessionId(undefined)
+    setShowNotifications(false)
+  }, [])
   const openAgentForm = (): void => {
+    closeOtherOverlays('agent-form')
     setFormMounted(true)
     setShowForm(true)
   }
-  const openAgentEditor = (sessionId: string): void => { setEditingSessionId(sessionId); setShowEditor(true) }
+  const openAgentEditor = (sessionId: string): void => {
+    closeOtherOverlays('agent-editor')
+    setEditingSessionId(sessionId)
+    setShowEditor(true)
+  }
+  const openFullAuto = (sessionId: string): void => {
+    closeOtherOverlays('full-auto')
+    setFullAutoSessionId(sessionId)
+  }
   const reloadInFlight = useRef<Promise<void>>()
   const reloadRequested = useRef(false)
   const reload = useCallback(async () => {
@@ -565,7 +766,10 @@ export default function App(): JSX.Element {
 
   useEffect(() => {
     void reload()
-    return window.agentManager.subscribe((event) => { if (event.type === 'sessions-changed') void reload() })
+    return window.agentManager.subscribe((event) => {
+      if (event.type === 'sessions-changed') void reload()
+      if (event.type === 'external-terminal-drag') setExternalDrag(event.projection)
+    })
   }, [reload])
 
   useEffect(() => {
@@ -592,21 +796,37 @@ export default function App(): JSX.Element {
 
   const selected = sessions.find((session) => session.sessionId === selectedId)
   const editingSession = sessions.find((session) => session.sessionId === editingSessionId)
+  const orderedSessions = useMemo(() => {
+    const positions = new Map(sessionOrder.map((id, index) => [id, index]))
+    return sessions.map((session, index) => ({ session, index })).sort((left, right) => {
+      const leftPosition = positions.get(left.session.sessionId) ?? sessionOrder.length + left.index
+      const rightPosition = positions.get(right.session.sessionId) ?? sessionOrder.length + right.index
+      return leftPosition - rightPosition
+    }).map(({ session }) => session)
+  }, [sessionOrder, sessions])
   const workspaceGroups = useMemo(() => {
     const groups = new Map<string, { workspace: string; sessions: SessionSummary[] }>()
-    for (const session of sessions) {
+    for (const session of orderedSessions) {
       const key = workspaceKey(session.workspace)
       const group = groups.get(key) ?? { workspace: session.workspace, sessions: [] }
       group.sessions.push(session)
       groups.set(key, group)
     }
     return [...groups.values()]
-  }, [sessions])
+  }, [orderedSessions])
   const currentWorkspace = activeWorkspace && workspaceGroups.some((group) => workspaceKey(group.workspace) === workspaceKey(activeWorkspace))
     ? activeWorkspace
     : workspaceGroups[0]?.workspace
-  const visibleSessions = useMemo(() => sessions.filter((session) => currentWorkspace && workspaceKey(session.workspace) === workspaceKey(currentWorkspace)), [currentWorkspace, sessions])
-  const overviewSessions = groupByWorkspace ? visibleSessions : sessions
+  useEffect(() => {
+    if (externalDrag?.phase !== 'dropped') return
+    closeOtherOverlays('agent-form')
+    setExternalImport({ transactionId: externalDrag.transactionId, ...(externalDrag.suggestedWorkspace ?? currentWorkspace ? { workspace: externalDrag.suggestedWorkspace ?? currentWorkspace } : {}), ...(externalDrag.suggestedAgentKind ? { agentKind: externalDrag.suggestedAgentKind } : {}), ...(externalDrag.suggestedNativeSessionId ? { nativeSessionId: externalDrag.suggestedNativeSessionId } : {}), ...(externalDrag.issue ? { issue: externalDrag.issue } : {}) })
+    setFormMounted(true)
+    setShowForm(true)
+    setExternalDrag(null)
+  }, [closeOtherOverlays, externalDrag?.phase, externalDrag?.transactionId])
+  const visibleSessions = useMemo(() => orderedSessions.filter((session) => currentWorkspace && workspaceKey(session.workspace) === workspaceKey(currentWorkspace)), [currentWorkspace, orderedSessions])
+  const overviewSessions = groupByWorkspace ? visibleSessions : orderedSessions
   const overviewSessionIds = useMemo(() => new Set(overviewSessions.map((session) => session.sessionId)), [overviewSessions])
   const listSessions = overviewSessions
   const activeListSessionId = listSessions.some((session) => session.sessionId === listActiveId) ? listActiveId : listSessions[0]?.sessionId
@@ -619,7 +839,7 @@ export default function App(): JSX.Element {
   const activeWorkspaceName = currentWorkspace?.split(/[\\/]/).filter(Boolean).at(-1) ?? '尚未选择工作区'
   const mountedSessions = selected
     ? sessions.filter((session) => session.sessionId === selected.sessionId)
-    : view === 'overview' ? sessions : []
+    : view === 'overview' ? orderedSessions : []
 
   const approveNotification = async (request: ApprovalRequest): Promise<void> => {
     setNotificationBusyId(request.requestId)
@@ -641,6 +861,36 @@ export default function App(): JSX.Element {
     finally { setNotificationBusyId(undefined) }
   }
   const fullAutoSession = sessions.find((session) => session.sessionId === fullAutoSessionId)
+  const moveDraggedBefore = (targetId: string): void => {
+    if (!draggingSessionId || draggingSessionId === targetId) return
+    setSessionOrder(() => {
+      const ids = orderedSessions.map((session) => session.sessionId).filter((id) => id !== draggingSessionId)
+      const targetIndex = ids.indexOf(targetId)
+      ids.splice(targetIndex < 0 ? ids.length : targetIndex, 0, draggingSessionId)
+      return ids
+    })
+  }
+  const detachDragged = async (): Promise<void> => {
+    if (!draggingSessionId || detachBusy) return
+    const session = sessions.find((item) => item.sessionId === draggingSessionId)
+    if (!session) return
+    if (!session.nativeSessionId || (session.agentKind !== 'codex' && session.agentKind !== 'claude')) {
+      setHandoffError('这个 Agent 尚未建立可恢复的 Codex/Claude 原生会话，不能拖出。')
+      setDraggingSessionId(undefined)
+      return
+    }
+    setDetachBusy(true); setHandoffError('')
+    try {
+      await window.agentManager.detachSession(session.sessionId)
+      setSelectedId(undefined)
+      await reload()
+    } catch (reason) {
+      setHandoffError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setDetachBusy(false)
+      setDraggingSessionId(undefined)
+    }
+  }
 
   return (
     <main className={`app-shell${selected ? ' detail-shell' : ''}`}>
@@ -648,9 +898,9 @@ export default function App(): JSX.Element {
         <button type='button' className='button-secondary' onClick={() => setSelectedId(undefined)} aria-label='返回总览'>← 返回总览</button>
         <strong>{selected.displayName}</strong>
         <span>{selected.agentKind.toUpperCase()} · {selected.workspace}</span>
-        <div className='topbar-spacer' /><button type='button' className={'full-auto-toolbar-button' + (selected.fullAutoEnabled ? ' active' : '')} onClick={() => setFullAutoSessionId(selected.sessionId)}>{selected.fullAutoEnabled ? '全自动中' : '全自动模式'}</button><button type='button' className='button-secondary button-compact' onClick={() => openAgentEditor(selected.sessionId)}>编辑 Agent</button>
+        <div className='topbar-spacer' /><button type='button' className={'full-auto-toolbar-button' + (selected.fullAutoEnabled ? ' active' : '')} onClick={() => openFullAuto(selected.sessionId)}>{selected.fullAutoEnabled ? '全自动中' : '全自动模式'}</button><button type='button' className='button-secondary button-compact' onClick={() => openAgentEditor(selected.sessionId)}>编辑 Agent</button>
       </div> : <header className='topbar'>
-        <div className='brand-block'>AT</div>
+        <div className='brand-block'><img src={managerLogoUrl} alt='Agent TUI Manager' /></div>
         <div className='app-title'><strong>Agent TUI Manager</strong><small title={groupByWorkspace ? currentWorkspace : '全部工作区'}>{groupByWorkspace ? currentWorkspace ?? '尚未选择工作区' : '全部工作区'}</small></div>
         <div className='topbar-spacer' />
         <div className='notification-wrap' ref={notificationRef} onMouseEnter={revealNotifications} onFocusCapture={revealNotifications} onBlurCapture={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) hideNotifications() }}>
@@ -673,8 +923,8 @@ export default function App(): JSX.Element {
             <footer><span>仅展示最近 5 项</span><button className='button-secondary button-compact' type='button' onClick={() => { hideNotifications(); setView('attention') }}>打开处理中心</button></footer>
           </aside>}
         </div>
-        <button className='button-secondary' type='button' onClick={() => setShowApprovalRules(true)}>批准规则</button>
-        <button className='button-secondary' type='button' onClick={() => setShowContinueKeywords(true)}>Continue 规则</button>
+        <button className='button-secondary' type='button' onClick={() => { closeOtherOverlays('approval-rules'); setShowApprovalRules(true) }}>批准规则</button>
+        <button className='button-secondary' type='button' onClick={() => { closeOtherOverlays('continue-keywords'); setShowContinueKeywords(true) }}>Continue 规则</button>
         <button className='button-primary' type='button' onClick={openAgentForm}>＋ 新建 Agent</button>
       </header>}
       <div className={`workspace-layout${selected ? ' workspace-layout-detail' : ''}`}>
@@ -684,16 +934,18 @@ export default function App(): JSX.Element {
           <button className={`nav-item${view === 'overview' ? ' active' : ''}`} type='button' onClick={() => setView('overview')}><span>▦</span><span>Agent 总览</span></button>
           <button className={`nav-item${view === 'attention' ? ' active' : ''}`} type='button' onClick={() => setView('attention')}><span>!</span><span>处理中心</span>{totalPendingCount > 0 && <i className='nav-count'>{totalPendingCount}</i>}</button>
           <button className={`nav-item${view === 'audit' ? ' active' : ''}`} type='button' aria-label='审计' onClick={() => setView('audit')}><span>↺</span><span>审计</span></button>
-          <button className='nav-item' type='button' onClick={() => setShowApprovalRules(true)}><span>✓</span><span>批准规则</span></button>
-          <button className='nav-item' type='button' onClick={() => setShowContinueKeywords(true)}><span>↻</span><span>Continue 规则</span></button>
+          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('approval-rules'); setShowApprovalRules(true) }}><span>✓</span><span>批准规则</span></button>
+          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('continue-keywords'); setShowContinueKeywords(true) }}><span>↻</span><span>Continue 规则</span></button>
+          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('session-safety'); setShowSessionSafety(true) }}><span>⚙</span><span>会话安全</span></button>
+          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('dingtalk'); setShowDingTalkSettings(true) }}><span>↗</span><span>钉钉远程</span></button>
         </nav>
         <section className='workspace-main'>
           <div className='sectionbar'>{selected ? <span aria-hidden='true' /> : <><h1>{view === 'overview' ? 'Agent 总览' : view === 'attention' ? '处理中心' : '活动审计'}</h1><span>{view === 'overview' ? `${runningCount} 运行 · ${overviewPendingCount} 待处理 · ${overviewSessions.length} 总计` : view === 'attention' ? `${totalPendingCount} 个待处理项` : '所有会话活动记录'}</span><div className='topbar-spacer' />{view === 'overview' && <div className='overview-mode-switch' role='group' aria-label='Agent 显示模式'><button type='button' aria-pressed={overviewMode === 'wall'} title='总览模式' onClick={() => setOverviewMode('wall')}>▦ 总览</button><button type='button' aria-pressed={overviewMode === 'list'} title='列表模式' onClick={() => setOverviewMode('list')}>☰ 列表</button></div>}{view === 'overview' && <button className='workspace-scope-toggle' type='button' role='switch' aria-checked={groupByWorkspace} onClick={() => setGroupByWorkspace((enabled) => !enabled)}><i />按工作区划分</button>}<span>{view === 'attention' || !groupByWorkspace ? '全部工作区' : activeWorkspaceName}</span></>}</div>
-          <div className={`workspace-overview-shell${view === 'overview' ? '' : ' workspace-view-hidden'}`}>{sessions.length === 0
+          <div className={`workspace-overview-shell${view === 'overview' ? '' : ' workspace-view-hidden'}`}>{sessions.length === 0 && externalDrag?.phase !== 'hovering'
             ? <section className='empty-state'><div className='empty-icon'>›_</div><h2>还没有受管 Agent</h2><p>选择工作区并启动你的第一个终端 Agent。</p><button className='button-primary' type='button' onClick={openAgentForm}>新增 Agent</button></section>
             : <section className={`agent-overview-workbench${overviewMode === 'list' && !selected ? ' agent-overview-workbench-list' : ''}${selected ? ' agent-overview-workbench-detail' : ''}`}>
-              {overviewMode === 'list' && !selected && <aside className='agent-session-list' aria-label='Agent 列表'>{listSessions.map((session) => <button type='button' className={session.sessionId === activeListSessionId ? 'active' : ''} aria-pressed={session.sessionId === activeListSessionId} aria-label={`切换到 ${session.displayName}`} key={session.sessionId} onClick={() => setListActiveId(session.sessionId)}><span className={`agent-dot agent-${session.agentKind}`}>{session.agentKind === 'claude' ? 'CL' : session.agentKind === 'pi' ? 'Pi' : session.agentKind === 'generic' ? '›_' : 'C'}</span><span><strong>{session.displayName}</strong><small title={session.workspace}>{session.workspace}</small></span><em className={`status-${session.status}`}>{SESSION_STATUS_LABEL[session.status]}</em></button>)}</aside>}
-              <section key='terminal-grid' className={`terminal-grid terminal-grid-count-${Math.min(selected ? 1 : overviewSessions.length, 6)}${overviewMode === 'list' && !selected ? ' terminal-grid-list' : ''}${selected ? ' terminal-grid-detail' : ''}`}>{mountedSessions.map((session) => <TerminalTile
+              {overviewMode === 'list' && !selected && <aside className='agent-session-list' aria-label='Agent 列表'>{listSessions.map((session) => <button type='button' className={session.sessionId === activeListSessionId ? 'active' : ''} aria-pressed={session.sessionId === activeListSessionId} aria-label={`切换到 ${session.displayName}`} key={session.sessionId} onClick={() => setListActiveId(session.sessionId)}><AgentLogo kind={session.agentKind} className={`agent-dot agent-${session.agentKind}`} label={session.agentKind} /><span><strong>{session.displayName}</strong><small title={session.workspace}>{session.workspace}</small></span><em className={`status-${session.status}`}>{SESSION_STATUS_LABEL[session.status]}</em></button>)}</aside>}
+              <section key='terminal-grid' className={`terminal-grid terminal-grid-count-${Math.min(selected ? 1 : overviewSessions.length + (externalDrag?.phase === 'hovering' ? 1 : 0), 6)}${overviewMode === 'list' && !selected ? ' terminal-grid-list' : ''}${selected ? ' terminal-grid-detail' : ''}`}>{mountedSessions.map((session) => <TerminalTile
                 key={session.sessionId}
                 session={session}
                 detail={Boolean(selected)}
@@ -701,17 +953,30 @@ export default function App(): JSX.Element {
                 hidden={!selected && (!overviewSessionIds.has(session.sessionId) || overviewMode === 'list' && session.sessionId !== activeListSessionId)}
                 onOpen={() => setSelectedId(session.sessionId)}
                 onEdit={() => openAgentEditor(session.sessionId)}
-                onFullAuto={() => setFullAutoSessionId(session.sessionId)}
-              />)}</section>
+                onFullAuto={() => openFullAuto(session.sessionId)}
+                draggable={!selected && overviewMode === 'wall'}
+                dragging={draggingSessionId === session.sessionId}
+                onDragStart={() => { setDraggingSessionId(session.sessionId); setHandoffError('') }}
+                onDragEnd={() => { if (!detachBusy) setDraggingSessionId(undefined) }}
+                onDragOver={() => moveDraggedBefore(session.sessionId)}
+              />)}{externalDrag?.phase === 'hovering' && view === 'overview' && !selected && <div className='external-handoff-placeholder' data-testid='handoff-placeholder' aria-live='polite'>请稍后…</div>}</section>
+              {draggingSessionId && <div
+                className={'native-terminal-dropzone' + (detachBusy ? ' busy' : '')}
+                onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'move' }}
+                onDrop={(event) => { event.preventDefault(); void detachDragged() }}
+              ><strong>{detachBusy ? '请稍后…' : '拖到这里，在原生终端继续'}</strong><span>Manager 会先安全释放会话，再用原生 resume 打开普通 cmd。</span></div>}
+              {handoffError && <div className='handoff-error' role='alert'>{handoffError}</div>}
             </section>}</div>
           {view === 'attention' && <AttentionCenter sessions={sessions} approvals={approvals} onReload={reload} onOpenSession={(sessionId) => { setSelectedId(sessionId); setView('overview') }} />}
           {view === 'audit' && <AuditPage sessions={sessions} />}
         </section>
       </div>
-      {formMounted && <NewAgentForm open={showForm} onClose={() => setShowForm(false)} onCreated={(workspace) => { setActiveWorkspace(workspace); setShowForm(false); setFormMounted(false); void reload() }} />}
+      {formMounted && <NewAgentForm open={showForm} initialImport={externalImport} onClose={() => setShowForm(false)} onCreated={(workspace) => { setActiveWorkspace(workspace); setShowForm(false); setFormMounted(false); setExternalImport(undefined); void reload() }} />}
       {editingSession && <EditAgentForm open={showEditor} session={editingSession} onClose={() => setShowEditor(false)} onSaved={() => { setShowEditor(false); void reload() }} />}
       {showApprovalRules && <ApprovalRulesDialog onClose={() => setShowApprovalRules(false)} />}
       {showContinueKeywords && <ContinueKeywordDialog onClose={() => setShowContinueKeywords(false)} />}
+      {showSessionSafety && <SessionSafetyDialog onClose={() => setShowSessionSafety(false)} />}
+      {showDingTalkSettings && <DingTalkSettingsDialog sessions={sessions} onClose={() => setShowDingTalkSettings(false)} />}
       {fullAutoSession && <FullAutoDialog session={fullAutoSession} onClose={() => setFullAutoSessionId(undefined)} onChanged={() => { void reload() }} />}
     </main>
   )

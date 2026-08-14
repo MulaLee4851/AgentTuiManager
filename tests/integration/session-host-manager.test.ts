@@ -179,6 +179,72 @@ describe('SessionHostManager integration', () => {
     })
   })
 
+  it('force releases only the registered Host tree and allows a replacement', async () => {
+    const { manager, runtimeDir, workspace } = await fixture()
+    const handle = await start(manager, workspace, 'running')
+    await nextMatching(handle, (event) => event.type === 'output' && event.data.includes('fake-agent>'))
+    const entry = { manager, hostId: handle.hostId, runtimeDir }
+    const pid = await readRegisteredPid(entry)
+    handle.disconnect()
+
+    await manager.forceRelease(handle.hostId)
+
+    expect(await waitForProcessExit(pid, 2_000)).toBe(true)
+    await expect(readFile(join(runtimeDir, `host-${handle.hostId}.json`), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await readdir(workspace)).toEqual([])
+    const replacement = await start(manager, workspace, 'running')
+    await expect(nextMatching(replacement, (event) => event.type === 'output' && event.data.includes('fake-agent>'))).resolves.toMatchObject({ type: 'output' })
+  })
+
+  it('keeps the PTY alive by default after the Manager lease expires and allows takeover', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'agent-tui-host-lease-'))
+    tempRoots.push(root)
+    const runtimeDir = join(root, 'runtime')
+    const workspace = join(root, 'workspace')
+    await mkdir(workspace, { recursive: true })
+    const manager = new SessionHostManager({ runtimeDir, hostEntry: HOST_ENTRY, leaseMs: 5_000 })
+    managerRuntimeDirs.set(manager, runtimeDir)
+    const handle = await start(manager, workspace, 'running')
+    await nextMatching(handle, (event) => event.type === 'output' && event.data.includes('fake-agent>'))
+    handle.disconnect()
+    const replacement = new SessionHostManager({ runtimeDir, hostEntry: HOST_ENTRY, leaseMs: 5_000 })
+    await expect.poll(async () => (await replacement.listLiveHosts())[0]?.managerOwnership, { timeout: 9_000 }).toBe('preserved')
+    const reconnected = await replacement.reconnect(handle.hostId)
+    handles.push(reconnected)
+    reconnected.write('lease-takeover\r')
+    await expect(nextMatching(reconnected, (event) => event.type === 'output' && event.data.includes('lease-takeover'))).resolves.toMatchObject({ type: 'output' })
+  }, 12_000)
+
+  it('releases the PTY after the Manager lease expires when crash retention is disabled', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'agent-tui-host-release-'))
+    tempRoots.push(root)
+    const runtimeDir = join(root, 'runtime')
+    const workspace = join(root, 'workspace')
+    await mkdir(workspace, { recursive: true })
+    const manager = new SessionHostManager({ runtimeDir, hostEntry: HOST_ENTRY, leaseMs: 5_000, preserveOnLeaseExpiry: false })
+    managerRuntimeDirs.set(manager, runtimeDir)
+    const handle = await start(manager, workspace, 'running')
+    await nextMatching(handle, (event) => event.type === 'output' && event.data.includes('fake-agent>'))
+    handle.disconnect()
+    await expect.poll(() => manager.readLastExit(handle.hostId), { timeout: 9_000 }).toMatchObject({ hostId: handle.hostId, reason: 'manager-lease-expired' })
+  }, 12_000)
+
+  it('keeps a Host alive after an explicit normal-exit preserve and allows reconnect', async () => {
+    const { manager, runtimeDir, workspace } = await fixture()
+    const original = await start(manager, workspace, 'running')
+    await nextMatching(original, (event) => event.type === 'output' && event.data.includes('fake-agent>'))
+    await original.preserveOnDisconnect?.()
+    original.disconnect()
+    const replacement = new SessionHostManager({ runtimeDir, hostEntry: HOST_ENTRY })
+    await expect.poll(async () => (await replacement.listLiveHosts())[0]?.managerOwnership).toBe('preserved')
+    await new Promise((resolve) => setTimeout(resolve, 5_500))
+    expect((await replacement.listLiveHosts())[0]?.managerOwnership).toBe('preserved')
+    const reconnected = await replacement.reconnect(original.hostId)
+    handles.push(reconnected)
+    reconnected.write('preserved-reconnect\r')
+    await expect(nextMatching(reconnected, (event) => event.type === 'output' && event.data.includes('preserved-reconnect'))).resolves.toMatchObject({ type: 'output' })
+  }, 12_000)
+
   it('resolves one encrypted profile into only the target Host start command', async () => {
     const root = await mkdtemp(join(tmpdir(), 'agent-tui-host-config-'))
     tempRoots.push(root)

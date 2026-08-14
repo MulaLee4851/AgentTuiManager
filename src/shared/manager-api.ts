@@ -2,6 +2,24 @@ import type { HostEvent } from './protocol'
 import type { SessionState } from './session-state'
 
 export type AgentKind = 'generic' | 'codex' | 'claude' | 'pi'
+export type NpmRegistryChoice = 'configured' | 'official' | 'npmmirror' | 'tencent' | 'huawei'
+
+export interface AgentEnvironmentSummary {
+  agentKind: AgentKind
+  executable: string
+  packageName?: string
+  nodeAvailable: boolean
+  npmAvailable: boolean
+  nodeVersion?: string
+  npmVersion?: string
+  agentInstalled: boolean
+  executableVersion?: string
+  ripgrepAvailable?: boolean
+  ripgrepVersion?: string
+  ripgrepInstallCommand?: string
+  installCommand?: string
+  nodeInstallCommand?: string
+}
 export type AgentConfigSource = 'local' | 'custom' | 'ccswitch'
 
 export interface AgentConfigInput {
@@ -52,6 +70,54 @@ export interface ContinueKeywordSettings {
   enabled: boolean
   quietSeconds: number
   keywords: string[]
+}
+
+export interface SessionSafetySettings {
+  preserveWorkspaceOnCrash: boolean
+}
+
+export interface DingTalkSettingsInput {
+  enabled: boolean
+  clientId?: string
+  clientSecret?: string
+  clearClientSecret?: boolean
+  allowedWorkspaces: string[]
+  commandsPerMinute: number
+  agentModeEnabled: boolean
+  agentBaseUrl?: string
+  agentApiKey?: string
+  clearAgentApiKey?: boolean
+  agentModel?: string
+  agentRetryCount: number
+  agentProxyEnabled: boolean
+  agentProxyHost?: string
+  agentProxyPort?: number
+  agentProxyUsername?: string
+  agentProxyPassword?: string
+  clearAgentProxyPassword?: boolean
+}
+
+export interface DingTalkSettingsSummary {
+  enabled: boolean
+  clientId?: string
+  hasClientSecret: boolean
+  allowedWorkspaces: string[]
+  commandsPerMinute: number
+  bindingKey?: string
+  boundStaffId?: string
+  boundSenderName?: string
+  agentModeEnabled: boolean
+  agentBaseUrl?: string
+  hasAgentApiKey: boolean
+  agentModel?: string
+  agentRetryCount: number
+  agentProxyEnabled: boolean
+  agentProxyHost: string
+  agentProxyPort: number
+  agentProxyUsername?: string
+  hasAgentProxyPassword: boolean
+  connectionStatus?: 'disabled' | 'connecting' | 'connected' | 'error'
+  connectionError?: string
 }
 
 export interface CCSwitchProviderSummary {
@@ -123,6 +189,17 @@ export interface StartSessionRequest {
   agentProxy?: AgentProxyInput | AgentProxySummary
 }
 
+export interface ExternalTerminalDragProjection {
+  transactionId: string
+  phase: 'hovering' | 'dropped'
+  terminalTitle: string
+  terminalKind: 'windows-terminal' | 'console'
+  suggestedAgentKind?: 'codex' | 'claude'
+  suggestedWorkspace?: string
+  suggestedNativeSessionId?: string
+  issue?: string
+}
+
 export interface ApprovalRuleSuggestion {
   command: string
   approvalCount: number
@@ -142,6 +219,7 @@ export interface SessionSummary extends SessionState {
   pendingApprovalCount?: number
   approvalSuggestion?: ApprovalRuleSuggestion
   recoveryAction?: 'continue' | 'resume'
+  attentionKind?: 'abnormal-exit' | 'host-unresponsive'
   recoveryAttempted?: boolean
   recoveryRuleApplied?: boolean
   agentConfig?: AgentConfigSummary
@@ -150,7 +228,7 @@ export interface SessionSummary extends SessionState {
 }
 
 export type AuditLevel = 'info' | 'warning' | 'error'
-export type AuditCategory = 'session' | 'approval' | 'recovery' | 'rule'
+export type AuditCategory = 'session' | 'approval' | 'recovery' | 'rule' | 'remote'
 
 export interface AuditEntry {
   id: string
@@ -168,15 +246,27 @@ export interface TerminalReplaySnapshot {
   sequence: number
 }
 
+export interface AgentInstallProgress {
+  target: 'node' | 'agent' | 'dependency'
+  agentKind?: AgentKind
+  phase: 'starting' | 'running' | 'completed' | 'failed'
+  elapsedMs: number
+  message?: string
+  level?: 'info' | 'warning' | 'error'
+}
+
 export type ManagerEvent =
   | ({ sessionId: string; sequence?: number } & HostEvent)
   | { type: 'sessions-changed'; sessionId: string }
   | { type: 'audit-changed' }
+  | { type: 'external-terminal-drag'; projection: ExternalTerminalDragProjection | null }
+  | { type: 'agent-install-progress'; progress: AgentInstallProgress }
 
 export const IPC_CHANNELS = {
   listSessions: 'agent-manager:list-sessions',
   terminalReplay: 'agent-manager:terminal-replay',
   listAuditEntries: 'agent-manager:list-audit-entries',
+  exportAuditEntries: 'agent-manager:export-audit-entries',
   startSession: 'agent-manager:start-session',
   write: 'agent-manager:write',
   resize: 'agent-manager:resize',
@@ -187,6 +277,7 @@ export const IPC_CHANNELS = {
   acceptRecoverySuggestion: 'agent-manager:accept-recovery-suggestion',
   dismissRecoverySuggestion: 'agent-manager:dismiss-recovery-suggestion',
   removeSession: 'agent-manager:remove-session',
+  detachSession: 'agent-manager:detach-session',
   renameSession: 'agent-manager:rename-session',
   updateSessionConfig: 'agent-manager:update-session-config',
   updateSessionProxy: 'agent-manager:update-session-proxy',
@@ -194,6 +285,11 @@ export const IPC_CHANNELS = {
   listCCSwitchProviders: 'agent-manager:list-ccswitch-providers',
   getContinueKeywordSettings: 'agent-manager:get-continue-keyword-settings',
   updateContinueKeywordSettings: 'agent-manager:update-continue-keyword-settings',
+  getSessionSafetySettings: 'agent-manager:get-session-safety-settings',
+  updateSessionSafetySettings: 'agent-manager:update-session-safety-settings',
+  getDingTalkSettings: 'agent-manager:get-dingtalk-settings',
+  updateDingTalkSettings: 'agent-manager:update-dingtalk-settings',
+  resetDingTalkBinding: 'agent-manager:reset-dingtalk-binding',
   approveSession: 'agent-manager:approve-session',
   listPendingApprovals: 'agent-manager:list-pending-approvals',
   approveRequest: 'agent-manager:approve-request',
@@ -206,7 +302,12 @@ export const IPC_CHANNELS = {
   addApprovalRule: 'agent-manager:add-approval-rule',
   removeApprovalRule: 'agent-manager:remove-approval-rule',
   chooseWorkspace: 'agent-manager:choose-workspace',
+  chooseExecutable: 'agent-manager:choose-executable',
   discoverSessions: 'agent-manager:discover-sessions',
+  detectAgentEnvironment: 'agent-manager:detect-agent-environment',
+  installNodeAndNpm: 'agent-manager:install-node-and-npm',
+  installAgent: 'agent-manager:install-agent',
+  installRipgrep: 'agent-manager:install-ripgrep',
   readClipboardText: 'agent-manager:read-clipboard-text',
   writeClipboardText: 'agent-manager:write-clipboard-text',
   event: 'agent-manager:event',
@@ -216,6 +317,7 @@ export interface AgentManagerApi {
   listSessions(): Promise<SessionSummary[]>
   terminalReplay(sessionId: string): Promise<TerminalReplaySnapshot>
   listAuditEntries(): Promise<AuditEntry[]>
+  exportAuditEntries(entryIds: string[]): Promise<string | undefined>
   startSession(request: StartSessionRequest): Promise<SessionSummary>
   write(sessionId: string, data: string): Promise<void> | void
   resize(sessionId: string, cols: number, rows: number): Promise<void> | void
@@ -226,6 +328,7 @@ export interface AgentManagerApi {
   acceptRecoverySuggestion(sessionId: string): Promise<void>
   dismissRecoverySuggestion(sessionId: string): Promise<void> | void
   removeSession(sessionId: string): Promise<void>
+  detachSession(sessionId: string): Promise<void>
   renameSession(sessionId: string, displayName: string): Promise<void>
   updateSessionConfig(sessionId: string, config: AgentConfigInput): Promise<void>
   updateSessionProxy(sessionId: string, proxy: AgentProxyInput): Promise<void>
@@ -233,6 +336,11 @@ export interface AgentManagerApi {
   listCCSwitchProviders(agentKind: AgentKind): Promise<CCSwitchProviderSummary[]>
   getContinueKeywordSettings(): Promise<ContinueKeywordSettings>
   updateContinueKeywordSettings(settings: ContinueKeywordSettings): Promise<ContinueKeywordSettings>
+  getSessionSafetySettings(): Promise<SessionSafetySettings>
+  updateSessionSafetySettings(settings: SessionSafetySettings): Promise<SessionSafetySettings>
+  getDingTalkSettings(): Promise<DingTalkSettingsSummary>
+  updateDingTalkSettings(settings: DingTalkSettingsInput): Promise<DingTalkSettingsSummary>
+  resetDingTalkBinding(): Promise<DingTalkSettingsSummary>
   approveSession(sessionId: string): Promise<void>
   listPendingApprovals(): Promise<ApprovalRequest[]>
   approveRequest(requestId: string): Promise<void>
@@ -245,7 +353,12 @@ export interface AgentManagerApi {
   addApprovalRule(command: string): Promise<void>
   removeApprovalRule(command: string): Promise<void>
   chooseWorkspace(): Promise<string | undefined>
+  chooseExecutable?(agentKind: AgentKind): Promise<string | undefined>
   discoverSessions(agentKind: AgentKind, workspace: string): Promise<NativeSessionSummary[]>
+  detectAgentEnvironment?(agentKind: AgentKind, executable: string): Promise<AgentEnvironmentSummary>
+  installNodeAndNpm?(): Promise<void>
+  installAgent?(agentKind: AgentKind, registry?: NpmRegistryChoice): Promise<void>
+  installRipgrep?(): Promise<void>
   readClipboardText(): Promise<string>
   writeClipboardText(text: string): Promise<void>
   subscribe(listener: (event: ManagerEvent) => void): () => void

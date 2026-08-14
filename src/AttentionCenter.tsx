@@ -114,6 +114,7 @@ export default function AttentionCenter({
           {queue.length === 0 && <p className='attention-empty'>当前没有待处理项</p>}
           {queue.map((item) => {
             if (item.kind === 'recovery') {
+              const unresponsive = item.session.attentionKind === 'host-unresponsive'
               return <button
                 className={'attention-queue-item event' + (selected?.key === item.key ? ' active' : '')}
                 key={item.key}
@@ -121,7 +122,7 @@ export default function AttentionCenter({
                 onClick={() => setSelectedKey(item.key)}
               >
                 <i className='severity' />
-                <span><span className='queue-top'><strong>{item.session.displayName}</strong><em>异常退出</em></span>
+                  <span><span className='queue-top'><strong>{item.session.displayName}</strong><em>{unresponsive ? '终端无响应' : '异常退出'}</em></span>
                   <span className='queue-command'>{item.session.lastError ?? '未记录具体原因'}</span>
                   <span className='queue-meta'>{item.session.agentKind.toUpperCase()} · {item.session.workspace}</span>
                 </span>
@@ -239,10 +240,11 @@ function RecoveryDetail({
   onOpen: () => void
   onContinue: () => void
 }): JSX.Element {
+  const unresponsive = session.attentionKind === 'host-unresponsive'
   return <div className='attention-detail-inner'>
-    <p className='detail-kicker recovery'>异常恢复 · 已停止自动重试</p>
-    <h2>{session.displayName} 需要人工处理</h2>
-    <p className='detail-subtitle'>终端和原生会话仍然保留，Manager 不会主动关闭窗口。</p>
+    <p className='detail-kicker recovery'>{unresponsive ? '终端无响应 · 等待人工确认' : '异常恢复 · 已停止自动重试'}</p>
+    <h2>{session.displayName + (unresponsive ? ' 疑似卡死' : ' 需要人工处理')}</h2>
+    <p className='detail-subtitle'>{unresponsive ? 'Manager 不会自动重启，也不会发送 Continue。确认后才会释放当前受管终端并恢复会话。' : '终端和原生会话仍然保留，Manager 不会主动关闭窗口。'}</p>
     <section className='command-card'>
       <div className='command-label'><span>最近错误</span><span>{session.agentKind.toUpperCase()}</span></div>
       <pre>{session.lastError ?? '未记录具体错误'}</pre>
@@ -251,11 +253,11 @@ function RecoveryDetail({
     <div className='approval-facts'>
       <div><span>恢复次数</span><strong className='write'>{session.recoveryAttempts}</strong></div>
       <div><span>当前状态</span><strong className='write'>等待人工处理</strong></div>
-      <div><span>终端进程</span><strong className='read'>保持运行</strong></div>
+      <div><span>终端进程</span><strong className={unresponsive ? 'write' : 'read'}>{unresponsive ? '等待确认重启' : '保持运行'}</strong></div>
       <div><span>正常完成</span><strong className='read'>不会误触发</strong></div>
     </div>
     {error && <p className='form-error'>{error}</p>}
-    <div className='detail-actions'><span>本次只尝试恢复一次</span><button className='button-secondary' type='button' onClick={onOpen}>打开终端</button><button className='button-primary' type='button' disabled={busy} onClick={onContinue}>{busy ? '请稍后…' : '尝试恢复'}</button></div>
+    <div className='detail-actions'><span>{unresponsive ? '只有确认后才会结束旧进程' : '本次只尝试恢复一次'}</span><button className='button-secondary' type='button' onClick={onOpen}>打开终端</button><button className='button-primary' type='button' disabled={busy} onClick={onContinue}>{busy ? '请稍后…' : unresponsive ? '重启 Agent' : '尝试恢复'}</button></div>
   </div>
 }
 

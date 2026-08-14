@@ -1,10 +1,11 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, safeStorage, Tray, type IpcMainInvokeEvent } from 'electron'
 import { statSync } from 'node:fs'
-import { isAbsolute, join } from 'node:path'
+import { writeFile } from 'node:fs/promises'
+import { delimiter, isAbsolute, join } from 'node:path'
 
 import { SessionController } from './session-controller'
 import { SessionHostManager } from './session-host-manager'
-import { discoverNativeSessions } from './native-session-discovery'
+import { discoverNativeSessions, discoverRecentNativeSessions } from './native-session-discovery'
 import { canonicalNativeRecovery, terminalScrollbackArgs, validateExecutable } from './start-request-policy'
 import { ApprovalPolicyStore } from './approval-policy-store'
 import { resolveExecutableForPty } from './executable-resolution'
@@ -16,8 +17,18 @@ import { CCSwitchProviderReader } from './ccswitch-provider-reader'
 import { readCodexGlobalProvider } from './codex-global-config'
 import { AgentProxyStore, environmentForAgentProxy } from './agent-proxy-store'
 import { ContinueKeywordStore } from './continue-keyword-store'
+import { SessionSafetyStore } from './session-safety-store'
+import { ManagedSessionCatalog } from './managed-session-catalog'
+import { DingTalkSettingsStore } from './dingtalk-settings-store'
+import { DingTalkCommandRouter } from './dingtalk-command-router'
+import { DingTalkStreamService } from './dingtalk-stream-service'
+import { DingTalkAgentInterpreter } from './dingtalk-agent-interpreter'
 import { migrateCodexProviderOfficial, migrateCodexSessionProvider } from './codex-session-provider-migrator'
-import { IPC_CHANNELS, type AgentConfigInput, type AgentKind, type AgentProxyInput, type ApprovalRequest, type ContinueKeywordSettings, type ManagerEvent, type NativeSessionSummary, type RecoveryRecipe, type SessionSummary, type StartSessionRequest } from '../src/shared/manager-api'
+import { openNativeResumeTerminal } from './native-terminal'
+import { safeAuditExport } from './audit-export'
+import { NativeDragBridge, type NativeDragEvent } from './native-drag-bridge'
+import { detectAgentEnvironment, installAgent, installNodeAndNpm, installRipgrep } from './agent-environment-manager'
+import { IPC_CHANNELS, type AgentConfigInput, type AgentKind, type AgentProxyInput, type ApprovalRequest, type AuditEntry, type ContinueKeywordSettings, type DingTalkSettingsInput, type ExternalTerminalDragProjection, type ManagerEvent, type NativeSessionSummary, type NpmRegistryChoice, type RecoveryRecipe, type SessionSafetySettings, type SessionSummary, type StartSessionRequest } from '../src/shared/manager-api'
 
 let mainWindow: BrowserWindow | undefined
 let tray: Tray | undefined
@@ -26,15 +37,30 @@ let auditStore: ActivityAuditStore
 let agentConfigurationStore: AgentConfigurationStore
 let agentProxyStore: AgentProxyStore
 let continueKeywordStore: ContinueKeywordStore
+let sessionSafetyStore: SessionSafetyStore
+let sessionCatalog: ManagedSessionCatalog
+let dingTalkSettingsStore: DingTalkSettingsStore
+let dingTalkStreamService: DingTalkStreamService
+let nativeDragBridge: NativeDragBridge | undefined
 const ccSwitchProviderReader = new CCSwitchProviderReader()
 let quitting = false
+let quitPrepared = false
+let quitPromptActive = false
 const discoveryInFlight = new Map<string, Promise<NativeSessionSummary[]>>()
+const userSelectedExecutables = new Set<string>()
 const sessionSnapshots = new Map<string, SessionSummary>()
 const pendingOutputEvents = new Map<string, { sessionId: string; data: string; sequence?: number }>()
 let outputFlushTimer: ReturnType<typeof setTimeout> | undefined
+let externalDragProjection: ExternalTerminalDragProjection | null = null
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
 
 const MAX_TEXT = 4_096
 const MAX_TERMINAL_INPUT = 64 * 1024
+// External native-window drag-in remains a Beta capability. Keep the listener
+// completely dormant in normal builds until explicitly enabled for controlled
+// testing; managed Agent drag-out is independent of this bridge.
+const ENABLE_NATIVE_DRAG_IN_BETA = process.env.AGENT_TUI_ENABLE_NATIVE_DRAG_IN_BETA === '1'
+const APP_LOGO_PATH = join(app.getAppPath(), 'logo', 'AgentTuiManager.png')
 function text(value: unknown, name: string, max = MAX_TEXT): string {
   if (typeof value !== 'string' || value.length === 0 || value.length > max || value.includes('\0')) throw new Error(`Invalid ${name}`)
   return value
@@ -65,7 +91,8 @@ function maxContinueRetries(value: unknown): number {
 
 function executable(agentKind: AgentKind, value: unknown): string {
   const candidate = text(value, 'executable', 1_024)
-  const validated = validateExecutable(agentKind, candidate, process.env.AGENT_TUI_ALLOWED_EXECUTABLES ?? '')
+  const configured = [process.env.AGENT_TUI_ALLOWED_EXECUTABLES ?? '', ...userSelectedExecutables].filter(Boolean).join(delimiter)
+  const validated = validateExecutable(agentKind, candidate, configured)
   return resolveExecutableForPty(validated)
 }
 
@@ -147,6 +174,55 @@ function continueKeywordSettings(value: unknown): ContinueKeywordSettings {
     enabled: input.enabled === true,
     quietSeconds: Number(input.quietSeconds),
     keywords: input.keywords.map((keyword, index) => text(keyword, 'keywords[' + index + ']', 200)),
+  }
+}
+
+function sessionSafetySettings(value: unknown): SessionSafetySettings {
+  if (!value || typeof value !== 'object') throw new Error('会话安全设置格式无效')
+  return { preserveWorkspaceOnCrash: (value as Record<string, unknown>).preserveWorkspaceOnCrash !== false }
+}
+
+function dingTalkSettings(value: unknown): DingTalkSettingsInput {
+  if (!value || typeof value !== 'object') throw new Error('钉钉设置格式无效')
+  const input = value as Record<string, unknown>
+  const clientId = optionalConfigText(input.clientId, 'DingTalk Client ID', 256)
+  const clientSecret = optionalConfigText(input.clientSecret, 'DingTalk Client Secret', 2_048)
+  const normalizeList = (candidate: unknown, label: string, maxLength: number): string[] => {
+    if (!Array.isArray(candidate) || candidate.length > 100) throw new Error(`${label} 最多保存 100 项`)
+    return [...new Set(candidate.map((item, index) => text(item, `${label}[${index}]`, maxLength).trim()).filter(Boolean))]
+  }
+  const allowedWorkspaces = normalizeList(input.allowedWorkspaces, '工作区', 1_024).map(workspace)
+  if (!Number.isInteger(input.commandsPerMinute) || Number(input.commandsPerMinute) < 1 || Number(input.commandsPerMinute) > 120) {
+    throw new Error('每分钟命令上限必须是 1 到 120 的整数')
+  }
+  if (!Number.isInteger(input.agentRetryCount) || Number(input.agentRetryCount) < 0 || Number(input.agentRetryCount) > 10) {
+    throw new Error('Agent 失败重试次数必须是 0 到 10 的整数')
+  }
+  const agentBaseUrl = optionalConfigText(input.agentBaseUrl, 'Agent Base URL', 2_048)
+  const agentApiKey = optionalConfigText(input.agentApiKey, 'Agent API Key', 8_192)
+  const agentModel = optionalConfigText(input.agentModel, 'Agent Model', 256)
+  const agentProxyHost = optionalConfigText(input.agentProxyHost, 'Agent proxy host', 512)
+  const agentProxyUsername = optionalConfigText(input.agentProxyUsername, 'Agent proxy username', 512)
+  const agentProxyPassword = optionalConfigText(input.agentProxyPassword, 'Agent proxy password', 2_048)
+  return {
+    enabled: input.enabled === true,
+    ...(clientId ? { clientId } : {}),
+    ...(clientSecret ? { clientSecret } : {}),
+    ...(input.clearClientSecret === true ? { clearClientSecret: true } : {}),
+    allowedWorkspaces,
+    commandsPerMinute: Number(input.commandsPerMinute),
+    agentModeEnabled: input.agentModeEnabled === true,
+    agentRetryCount: Number(input.agentRetryCount),
+    ...(agentBaseUrl ? { agentBaseUrl } : {}),
+    ...(agentApiKey ? { agentApiKey } : {}),
+    ...(input.clearAgentApiKey === true ? { clearAgentApiKey: true } : {}),
+    ...(agentModel ? { agentModel } : {}),
+    agentProxyEnabled: input.agentProxyEnabled === true,
+    ...(agentProxyHost ? { agentProxyHost } : {}),
+    ...(Number.isInteger(input.agentProxyPort) && Number(input.agentProxyPort) >= 1 && Number(input.agentProxyPort) <= 65_535 ? { agentProxyPort: Number(input.agentProxyPort) } : {}),
+    ...(agentProxyUsername ? { agentProxyUsername } : {}),
+    ...(agentProxyPassword ? { agentProxyPassword } : {}),
+    ...(input.clearAgentProxyPassword === true ? { clearAgentProxyPassword: true } : {}),
   }
 }
 
@@ -248,11 +324,12 @@ function auditSessionTransition(sessionId: string): void {
   if (!previous || previous.status === current.status) return
   if (current.status === 'recovering') {
     const modelCapacity = current.lastError === 'Selected model is at capacity. Please try a different model.'
+    const hostUnresponsive = current.attentionKind === 'host-unresponsive'
     recordAudit({
       level: 'warning',
       category: 'recovery',
-      action: modelCapacity ? 'capacity_retry_started' : 'recovery_started',
-      message: current.displayName + (modelCapacity ? ' 模型暂时繁忙，稍后自动继续' : ' 异常退出，正在自动恢复'),
+      action: hostUnresponsive ? 'host_restart_confirmed' : modelCapacity ? 'capacity_retry_started' : 'recovery_started',
+      message: current.displayName + (hostUnresponsive ? ' 已确认重启，正在释放无响应终端并恢复会话' : modelCapacity ? ' 模型暂时繁忙，稍后自动继续' : ' 异常退出，正在自动恢复'),
       sessionId,
       details: { attempt: current.recoveryAttempts, ...(current.lastError ? { reason: current.lastError } : {}) },
     })
@@ -266,9 +343,10 @@ function auditSessionTransition(sessionId: string): void {
       details: { attempt: previous.recoveryAttempts, ...(previous.lastError ? { reason: previous.lastError } : {}) },
     })
   } else if (current.status === 'needs_attention') {
+    const hostUnresponsive = current.attentionKind === 'host-unresponsive'
     recordAudit({
-      level: 'warning', category: 'recovery', action: 'capacity_retry_exhausted',
-      message: `${current.displayName} 自动重试已达上限，终端保持运行`, sessionId,
+      level: 'warning', category: 'recovery', action: hostUnresponsive ? 'host_unresponsive_detected' : 'capacity_retry_exhausted',
+      message: hostUnresponsive ? `${current.displayName} 终端连续无响应，等待用户确认是否重启` : `${current.displayName} 自动重试已达上限，终端保持运行`, sessionId,
       details: { attempt: current.recoveryAttempts, ...(current.lastError ? { reason: current.lastError } : {}) },
     })
   } else if (current.status === 'completed') {
@@ -313,6 +391,134 @@ function broadcast(event: ManagerEvent): void {
   for (const window of BrowserWindow.getAllWindows()) {
     if (!window.isDestroyed()) window.webContents.send(IPC_CHANNELS.event, event)
   }
+}
+
+function suggestedAgentKind(title: string): 'codex' | 'claude' | undefined {
+  if (/claude/i.test(title)) return 'claude'
+  if (/codex/i.test(title)) return 'codex'
+  return undefined
+}
+
+function nativeDragInsideManager(event: NativeDragEvent): boolean {
+  const window = mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() ? mainWindow : undefined
+  const bounds = window?.getBounds()
+  return Boolean(bounds
+    && event.cursor.x >= bounds.x && event.cursor.x < bounds.x + bounds.width
+    && event.cursor.y >= bounds.y + 54 && event.cursor.y < bounds.y + bounds.height)
+}
+
+async function finishNativeDrop(event: NativeDragEvent): Promise<void> {
+  const inferredKind = suggestedAgentKind(event.title)
+  const managedNativeIds = new Set(controller.listSessions().map((session) => session.nativeSessionId).filter((id): id is string => Boolean(id)))
+  const kinds: Array<'codex' | 'claude'> = inferredKind ? [inferredKind] : ['codex', 'claude']
+  const discovered = (await Promise.all(kinds.map(async (agentKind) => (await discoverRecentNativeSessions(agentKind, Date.now() - 10 * 60_000))
+    .filter((candidate) => !managedNativeIds.has(candidate.id))
+    .map((candidate) => ({ ...candidate, agentKind }))))).flat()
+  const candidates = discovered.sort((left, right) => right.updatedAt - left.updatedAt)
+  const unique = candidates.length === 1 ? candidates[0] : undefined
+  let automaticIssue: string | undefined
+  if (unique && inferredKind === unique.agentKind && event.processName.toLocaleLowerCase('en-US') === 'windowsterminal' && event.structureVerified && event.tabCount === 1 && event.paneCount === 1) {
+    const interrupted = await nativeDragBridge?.sendGracefulInterrupt(event)
+    if (interrupted?.ok) {
+      const resumeArgs = unique.agentKind === 'codex' ? ['resume', unique.id] : ['--resume', unique.id]
+      const request: StartSessionRequest = {
+        displayName: unique.title || `${unique.agentKind === 'claude' ? 'Claude Code' : 'Codex'} · ${unique.id.slice(0, 8)}`,
+        agentKind: unique.agentKind,
+        workspace: unique.workspace,
+        executable: resolveExecutableForPty(unique.agentKind),
+        args: resumeArgs,
+        cols: 100,
+        rows: 30,
+        maxContinueRetries: 3,
+        nativeSessionId: unique.id,
+        recovery: { executable: resolveExecutableForPty(unique.agentKind), args: resumeArgs },
+        agentConfig: AgentConfigurationStore.localSummary(),
+      }
+      const deadline = Date.now() + 12_000
+      let started: SessionSummary | undefined
+      let lastError: unknown
+      for (let attempt = 0; Date.now() < deadline && !started && attempt < 3; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500))
+        try { started = await controller.startSession(request) } catch (error) { lastError = error }
+      }
+      if (started) {
+        const readyDeadline = Date.now() + 8_000
+        while (Date.now() < readyDeadline && !controller.isSessionReady(started.sessionId)) {
+          const status = controller.listSessions().find((session) => session.sessionId === started!.sessionId)?.status
+          if (!status || ['completed', 'stopped', 'failed', 'needs_attention'].includes(status)) break
+          await new Promise((resolve) => setTimeout(resolve, 100))
+        }
+        if (!controller.isSessionReady(started.sessionId)) {
+          lastError = new Error('目标 Agent 未确认恢复完成')
+          await controller.stopSession(started.sessionId).catch(() => undefined)
+          const cleanupDeadline = Date.now() + 2_000
+          while (Date.now() < cleanupDeadline) {
+            const status = controller.listSessions().find((session) => session.sessionId === started!.sessionId)?.status
+            if (!status || ['completed', 'stopped', 'failed'].includes(status)) break
+            await new Promise((resolve) => setTimeout(resolve, 100))
+          }
+          await controller.removeSession(started.sessionId).catch(() => undefined)
+        } else {
+          await controller.flushCatalog()
+          const closed = await nativeDragBridge?.closeSourceWindow(event).catch(() => undefined)
+          externalDragProjection = null
+          broadcast({ type: 'external-terminal-drag', projection: null })
+          if (!closed?.ok) {
+            recordAudit({ level: 'warning', category: 'session', action: 'external_source_close_failed', message: '外部会话已加入 Manager，但来源窗口未能安全关闭', sessionId: started.sessionId, details: { reason: closed?.reason ?? 'bridge unavailable' } })
+            return
+          }
+        recordAudit({ level: 'info', category: 'session', action: 'external_terminal_attached', message: `${started.displayName} 已从外部终端加入 Manager`, sessionId: started.sessionId, details: { agentKind: unique.agentKind, workspace: unique.workspace, nativeSessionId: unique.id } })
+        return
+        }
+      }
+      recordAudit({ level: 'error', category: 'session', action: 'external_terminal_attach_failed', message: '外部终端会话自动迁入失败，已保留迁移选择', details: { error: lastError instanceof Error ? lastError.message : String(lastError ?? 'unknown error'), agentKind: unique.agentKind, workspace: unique.workspace, nativeSessionId: unique.id } })
+      automaticIssue = '来源会话尚未释放，请在原终端正常退出后点击“迁入 Manager”'
+    } else {
+      automaticIssue = '来源窗口安全校验未通过，请在原终端正常退出后确认迁入'
+    }
+  }
+  const projection: ExternalTerminalDragProjection = {
+    transactionId: `${event.processId}-${event.hwnd}`,
+    phase: 'dropped', terminalTitle: event.title.slice(0, 200),
+    terminalKind: event.processName.toLocaleLowerCase('en-US') === 'windowsterminal' ? 'windows-terminal' : 'console',
+    ...(unique ? { suggestedAgentKind: unique.agentKind, suggestedWorkspace: unique.workspace, suggestedNativeSessionId: unique.id } : inferredKind ? { suggestedAgentKind: inferredKind } : {}),
+    ...(automaticIssue ? { issue: automaticIssue } : candidates.length > 1 ? { issue: '检测到多个最近会话，请确认要迁入的会话' } : candidates.length === 0 ? { issue: '没有检测到最近活跃的原生会话，请选择工作区后确认' } : {}),
+  }
+  externalDragProjection = projection
+  broadcast({ type: 'external-terminal-drag', projection })
+  recordAudit({ level: 'info', category: 'session', action: 'external_terminal_dropped', message: unique ? '已识别外部终端会话，正在准备迁入' : '检测到外部终端拖入，需要确认原生会话', details: { terminalKind: projection.terminalKind, terminalTitle: projection.terminalTitle, suggestedAgentKind: projection.suggestedAgentKind ?? 'unknown', candidateCount: candidates.length } })
+}
+
+function handleNativeDrag(event: NativeDragEvent): void {
+  const inside = nativeDragInsideManager(event)
+  if (!inside) {
+    if (externalDragProjection) {
+      externalDragProjection = null
+      broadcast({ type: 'external-terminal-drag', projection: null })
+    }
+    return
+  }
+  if (event.type === 'move-end') {
+    void finishNativeDrop(event).catch((error) => {
+      const projection: ExternalTerminalDragProjection = { transactionId: `${event.processId}-${event.hwnd}`, phase: 'dropped', terminalTitle: event.title.slice(0, 200), terminalKind: event.processName.toLocaleLowerCase('en-US') === 'windowsterminal' ? 'windows-terminal' : 'console', issue: error instanceof Error ? error.message : String(error) }
+      externalDragProjection = projection
+      broadcast({ type: 'external-terminal-drag', projection })
+    })
+    return
+  }
+  const inferredKind = suggestedAgentKind(event.title)
+  const projection: ExternalTerminalDragProjection = {
+    transactionId: `${event.processId}-${event.hwnd}`,
+    phase: 'hovering',
+    terminalTitle: event.title.slice(0, 200),
+    terminalKind: event.processName.toLocaleLowerCase('en-US') === 'windowsterminal' ? 'windows-terminal' : 'console',
+    ...(inferredKind ? { suggestedAgentKind: inferredKind } : {}),
+  }
+  if (externalDragProjection?.phase === projection.phase
+    && externalDragProjection.transactionId === projection.transactionId
+    && externalDragProjection.terminalTitle === projection.terminalTitle) return
+  externalDragProjection = projection
+  broadcast({ type: 'external-terminal-drag', projection })
 }
 
 function recordAudit(entry: NewAuditEntry): void {
@@ -372,6 +578,7 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
         : undefined
       createdProxyId = agentProxy?.proxyId
       const session = await controller.startSession({ ...validated, agentConfig, ...(agentProxy ? { agentProxy } : {}) })
+      await controller.flushCatalog()
       recordAudit({ level: 'info', category: 'session', action: 'session_started', message: `${session.displayName} 已启动`, sessionId: session.sessionId })
       return session
     } catch (error) {
@@ -403,6 +610,21 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
       })
     }
     return result
+  })
+  ipcMain.handle(IPC_CHANNELS.exportAuditEntries, async (event, ids: unknown) => {
+    trustedRenderer(event)
+    if (!Array.isArray(ids) || ids.length > 2_000 || ids.some((id) => typeof id !== 'string' || !/^[a-zA-Z0-9-]+$/.test(id))) throw new Error('审计导出范围无效')
+    const selected = new Set(ids)
+    const entries = auditStore.list().filter((entry) => selected.has(entry.id)).map(safeAuditExport)
+    const result = await dialog.showSaveDialog(mainWindow!, {
+      title: '导出活动审计',
+      defaultPath: `agent-tui-audit-${new Date().toISOString().slice(0, 10)}.json`,
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+    })
+    if (result.canceled || !result.filePath) return undefined
+    await writeFile(result.filePath, JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), entries }, null, 2), 'utf8')
+    recordAudit({ level: 'info', category: 'session', action: 'audit_exported', message: '已导出活动审计', details: { entryCount: entries.length } })
+    return result.filePath
   })
   ipcMain.handle(IPC_CHANNELS.resize, (event, id: unknown, cols: unknown, rows: unknown) => {
     trustedRenderer(event)
@@ -460,6 +682,20 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
       level: 'info', category: 'session', action: 'session_removed', message: 'Agent 已从总览删除', sessionId: target,
       ...(removed ? { details: { displayName: removed.displayName, agentKind: removed.agentKind, workspace: removed.workspace } } : {}),
     })
+  })
+  ipcMain.handle(IPC_CHANNELS.detachSession, async (event, id: unknown) => {
+    trustedRenderer(event)
+    const target = sessionId(id)
+    const detached = controller.listSessions().find((session) => session.sessionId === target)
+    if (!detached) throw new Error('Agent 不存在或已删除')
+    if ((detached.agentKind !== 'codex' && detached.agentKind !== 'claude') || !detached.nativeSessionId) throw new Error('只有已建立原生会话 ID 的 Codex 或 Claude Code 可以拖出到原生终端')
+    if (!['completed', 'stopped', 'failed'].includes(detached.status)) await controller.stopSession(target)
+    if (!await restoreNativeSessionProvider(detached)) throw new Error('原生会话配置尚未恢复，已保留 Manager 卡片，请稍后重试')
+    await openNativeResumeTerminal(detached.agentKind, detached.nativeSessionId, detached.workspace)
+    await controller.removeSession(target)
+    if (detached.agentConfig?.profileId) await agentConfigurationStore.remove(detached.agentConfig.profileId)
+    if (detached.agentProxy?.proxyId) await agentProxyStore.remove(detached.agentProxy.proxyId)
+    recordAudit({ level: 'info', category: 'session', action: 'session_detached', message: detached.displayName + ' 已脱离 Manager 并在原生终端恢复', details: { displayName: detached.displayName, agentKind: detached.agentKind, workspace: detached.workspace, nativeSessionId: detached.nativeSessionId } })
   })
   ipcMain.handle(IPC_CHANNELS.approveSession, async (event, id: unknown) => {
     trustedRenderer(event)
@@ -561,6 +797,46 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
       details: { enabled: settings.enabled, keywordCount: settings.keywords.length, quietSeconds: settings.quietSeconds },
     })
     return settings
+  })
+  ipcMain.handle(IPC_CHANNELS.getSessionSafetySettings, (event) => {
+    trustedRenderer(event)
+    return sessionSafetyStore.getSettings()
+  })
+  ipcMain.handle(IPC_CHANNELS.updateSessionSafetySettings, async (event, value: unknown) => {
+    trustedRenderer(event)
+    const saved = await sessionSafetyStore.update(sessionSafetySettings(value))
+    controller.updateCrashRetentionPolicy(saved.preserveWorkspaceOnCrash)
+    recordAudit({
+      level: 'info', category: 'session', action: 'crash_retention_changed',
+      message: saved.preserveWorkspaceOnCrash ? '异常退出后将保留运行中的 Agent 并在下次启动接管' : '异常退出后将停止 Agent、释放会话且不保留工作区记录',
+      details: { preserveWorkspaceOnCrash: saved.preserveWorkspaceOnCrash },
+    })
+    return saved
+  })
+  ipcMain.handle(IPC_CHANNELS.getDingTalkSettings, (event) => {
+    trustedRenderer(event)
+    return { ...dingTalkSettingsStore.getSummary(), ...dingTalkStreamService.getStatus() }
+  })
+  ipcMain.handle(IPC_CHANNELS.updateDingTalkSettings, async (event, value: unknown) => {
+    trustedRenderer(event)
+    const saved = await dingTalkSettingsStore.update(dingTalkSettings(value))
+    recordAudit({
+      level: 'warning', category: 'remote', action: 'remote_settings_changed',
+      message: saved.enabled ? '已更新并启用钉钉远程开发' : '已关闭钉钉远程开发',
+      details: { enabled: saved.enabled, bound: Boolean(saved.boundStaffId), agentModeEnabled: saved.agentModeEnabled, allowedWorkspaceCount: saved.allowedWorkspaces.length },
+    })
+    try {
+      await dingTalkStreamService.restart(dingTalkSettingsStore.getRuntimeSettings())
+    } catch (error) {
+      recordAudit({ level: 'error', category: 'remote', action: 'remote_connection_failed', message: '钉钉 Stream 连接失败', details: { error: error instanceof Error ? error.message : String(error) } })
+    }
+    return { ...dingTalkSettingsStore.getSummary(), ...dingTalkStreamService.getStatus() }
+  })
+  ipcMain.handle(IPC_CHANNELS.resetDingTalkBinding, async (event) => {
+    trustedRenderer(event)
+    const saved = await dingTalkSettingsStore.resetBinding()
+    recordAudit({ level: 'warning', category: 'remote', action: 'remote_binding_reset', message: '已解除钉钉账号绑定并生成新的初始化 Key' })
+    return { ...saved, ...dingTalkStreamService.getStatus() }
   })
   ipcMain.handle(IPC_CHANNELS.listPendingApprovals, (event) => {
     trustedRenderer(event)
@@ -669,6 +945,43 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
     trustedRenderer(event)
     return clipboard.readText('clipboard')
   })
+  ipcMain.handle(IPC_CHANNELS.chooseExecutable, async (event, kind: unknown) => {
+    trustedRenderer(event)
+    validatedAgentKind(kind)
+    const options: Electron.OpenDialogOptions = {
+      properties: ['openFile'],
+      filters: [{ name: '可执行命令', extensions: ['exe', 'cmd', 'bat', 'com'] }, { name: '所有文件', extensions: ['*'] }],
+    }
+    const result = mainWindow && !mainWindow.isDestroyed()
+      ? await dialog.showOpenDialog(mainWindow, options)
+      : await dialog.showOpenDialog(options)
+    if (result.canceled) return undefined
+    const selected = result.filePaths[0]
+    if (!selected || !isAbsolute(selected) || !statSync(selected).isFile()) return undefined
+    userSelectedExecutables.add(selected)
+    return selected
+  })
+  ipcMain.handle(IPC_CHANNELS.detectAgentEnvironment, async (event, kind: unknown, candidate: unknown) => {
+    trustedRenderer(event)
+    const agentKind = validatedAgentKind(kind)
+    const executableName = text(candidate, 'executable', 1_024)
+    return detectAgentEnvironment(agentKind, executableName)
+  })
+  ipcMain.handle(IPC_CHANNELS.installNodeAndNpm, async (event) => {
+    trustedRenderer(event)
+    await installNodeAndNpm((progress) => broadcast({ type: 'agent-install-progress', progress: { target: 'node', ...progress } }))
+  })
+  ipcMain.handle(IPC_CHANNELS.installAgent, async (event, kind: unknown, registry: unknown) => {
+    trustedRenderer(event)
+    const agentKind = validatedAgentKind(kind)
+    const registryChoice = registry === undefined ? 'configured' : text(registry, 'npm registry', 32)
+    if (!['configured', 'official', 'npmmirror', 'tencent', 'huawei'].includes(registryChoice)) throw new Error('不支持的 npm 镜像源')
+    await installAgent(agentKind, registryChoice as NpmRegistryChoice, (progress) => broadcast({ type: 'agent-install-progress', progress: { target: 'agent', agentKind, ...progress } }))
+  })
+  ipcMain.handle(IPC_CHANNELS.installRipgrep, async (event) => {
+    trustedRenderer(event)
+    await installRipgrep((progress) => broadcast({ type: 'agent-install-progress', progress: { target: 'dependency', agentKind: 'pi', ...progress } }))
+  })
   ipcMain.handle(IPC_CHANNELS.writeClipboardText, (event, value: unknown) => {
     trustedRenderer(event)
     clipboard.writeText(text(value, 'clipboard text', 4 * 1024 * 1024), 'clipboard')
@@ -677,7 +990,7 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
 
 function createWindow(): BrowserWindow {
   const window = new BrowserWindow({
-    width: 1280, height: 820, minWidth: 860, minHeight: 600, backgroundColor: '#111719', autoHideMenuBar: true,
+    width: 1280, height: 820, minWidth: 860, minHeight: 600, backgroundColor: '#111719', autoHideMenuBar: true, icon: APP_LOGO_PATH,
     webPreferences: { preload: join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   })
   window.setMenuBarVisibility(false)
@@ -691,7 +1004,7 @@ function createWindow(): BrowserWindow {
 }
 
 function createTray(): void {
-  const icon = nativeImage.createFromDataURL("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20'%3E%3Crect width='20' height='20' rx='4' fill='%235a7cff'/%3E%3Cpath d='M5 6l4 4-4 4m5 0h5' fill='none' stroke='white' stroke-width='2'/%3E%3C/svg%3E")
+  const icon = nativeImage.createFromPath(APP_LOGO_PATH)
   tray = new Tray(icon.resize({ width: 20, height: 20 }))
   tray.setToolTip('Agent TUI Manager')
   tray.setContextMenu(Menu.buildFromTemplate([
@@ -719,8 +1032,7 @@ function createTray(): void {
     {
       label: '退出 Manager',
       click: () => {
-        quitting = true
-        app.quit()
+        void requestManagerQuit()
       },
     },
   ]))
@@ -730,13 +1042,87 @@ function createTray(): void {
   })
 }
 
+async function requestManagerQuit(): Promise<void> {
+  if (quitPromptActive || quitPrepared) return
+  quitPromptActive = true
+  try {
+    const options: Electron.MessageBoxOptions = {
+      type: 'question',
+      title: '退出 Agent TUI Manager',
+      message: '退出后是否保留当前工作区？',
+      detail: '保留：Agent 继续运行，下次打开 Manager 自动恢复。\n不保留：停止受管 Agent 并释放原生会话；不会删除 Codex 或 Claude Code 的原生历史。',
+      buttons: ['保留并退出', '不保留并退出', '取消'],
+      defaultId: 0,
+      cancelId: 2,
+      noLink: true,
+    }
+    const result = mainWindow && !mainWindow.isDestroyed()
+      ? await dialog.showMessageBox(mainWindow, options)
+      : await dialog.showMessageBox(options)
+    if (result.response === 2) return
+    if (result.response === 0) {
+      const count = await controller.preserveAllSessions()
+      await controller.flushCatalog()
+      recordAudit({ level: 'info', category: 'session', action: 'manager_exit_preserved', message: `已保留 ${count} 个运行中的 Agent，退出后继续运行`, details: { count } })
+    } else {
+      const sessions = controller.listSessions()
+      await controller.stopAllSessions()
+      for (const session of sessions) await restoreNativeSessionProvider(session)
+      const count = await controller.clearAllSessions()
+      for (const session of sessions) {
+        if (session.agentConfig?.profileId) await agentConfigurationStore.remove(session.agentConfig.profileId).catch(() => undefined)
+        if (session.agentProxy?.proxyId) await agentProxyStore.remove(session.agentProxy.proxyId).catch(() => undefined)
+      }
+      recordAudit({ level: 'warning', category: 'session', action: 'manager_exit_released', message: `已释放并清除 ${count} 个受管 Agent`, details: { count } })
+    }
+    quitPrepared = true
+    quitting = true
+    app.quit()
+  } catch (error) {
+    quitting = false
+    quitPrepared = false
+    const message = error instanceof Error ? error.message : String(error)
+    recordAudit({ level: 'error', category: 'session', action: 'manager_exit_preserve_failed', message: '保留 Agent 失败，Manager 未退出', details: { error: message } })
+    const options: Electron.MessageBoxOptions = {
+      type: 'error',
+      title: '未退出 Manager',
+      message: '有 Agent 未确认保留状态，Manager 已取消退出。',
+      detail: message,
+      buttons: ['知道了'],
+      defaultId: 0,
+      noLink: true,
+    }
+    if (mainWindow && !mainWindow.isDestroyed()) await dialog.showMessageBox(mainWindow, options)
+    else await dialog.showMessageBox(options)
+  } finally {
+    quitPromptActive = false
+  }
+}
+
+if (!hasSingleInstanceLock) {
+  quitPrepared = true
+  quitting = true
+  app.quit()
+} else {
+app.on('second-instance', () => {
+  const window = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined
+  if (!window) return
+  if (window.isMinimized()) window.restore()
+  window.show()
+  window.focus()
+})
+
 void app.whenReady().then(async () => {
   agentConfigurationStore = await AgentConfigurationStore.load(join(app.getPath('userData'), 'agent-configurations.json'), safeStorage)
   agentProxyStore = await AgentProxyStore.load(join(app.getPath('userData'), 'agent-proxies.json'), safeStorage)
   continueKeywordStore = await ContinueKeywordStore.load(join(app.getPath('userData'), 'continue-keywords.json'))
+  sessionSafetyStore = await SessionSafetyStore.load(join(app.getPath('userData'), 'session-safety.json'))
+  sessionCatalog = await ManagedSessionCatalog.load(join(app.getPath('userData'), 'managed-sessions.json'))
+  dingTalkSettingsStore = await DingTalkSettingsStore.load(join(app.getPath('userData'), 'dingtalk-settings.json'), safeStorage)
   const manager = new SessionHostManager({
     runtimeDir: join(app.getPath('userData'), 'runtime', 'session-hosts'),
     hostEntry: join(__dirname, 'session-host.js'),
+    preserveOnLeaseExpiry: sessionSafetyStore.getSettings().preserveWorkspaceOnCrash,
     resolveAgentConfig: async (profileId, agentKind, args) => {
       const profile = agentConfigurationStore.get(profileId)
       if (!profile) throw new Error('找不到该 Agent 的独立配置，请重新保存配置')
@@ -808,14 +1194,69 @@ void app.whenReady().then(async () => {
       recordAudit({ level: 'warning', category: 'recovery', action: 'continue_keyword_sent', message: '输出持续静默，已按关键词规则尝试 Continue 一次', sessionId, details: { keyword, attempt: 1 } })
     },
   }
-  controller = new SessionController(manager, broadcast, { discover: discoverNativeSessions }, auditedApprovalPolicy, recoveryPolicy, fullAutoActivity, continueKeywordStore, recoveryActivity)
+  controller = new SessionController(manager, broadcast, { discover: discoverNativeSessions }, auditedApprovalPolicy, recoveryPolicy, fullAutoActivity, continueKeywordStore, recoveryActivity, sessionCatalog)
+  const remoteAudit = {
+    list: () => auditStore.list(),
+    record: (entry: { level: 'info' | 'warning' | 'error'; action: string; message: string; sessionId?: string; details?: Record<string, string | number | boolean> }) => {
+      recordAudit({ ...entry, category: 'remote' })
+    },
+  }
+  const remoteManager = {
+    listSessions: () => controller.listSessions(),
+    listPendingApprovals: () => controller.listPendingApprovals(),
+    terminalReplay: (id: string) => controller.terminalReplay(id),
+    approveRequest: (id: string) => controller.approveRequest(id),
+    approveAllPending: () => controller.approveAllPending(),
+    write: (id: string, data: string) => controller.write(id, data),
+    stopSession: async (id: string) => {
+      await controller.stopSession(id)
+      await restoreNativeSessionProvider(controller.listSessions().find((session) => session.sessionId === id))
+    },
+    restartSession: (id: string) => controller.restartSession(id),
+  }
+  const dingTalkRouter = new DingTalkCommandRouter(
+    remoteManager,
+    remoteAudit,
+    () => dingTalkSettingsStore.getRuntimeSettings(),
+    (key, staffId, senderName) => dingTalkSettingsStore.bind(key, staffId, senderName),
+    new DingTalkAgentInterpreter(),
+  )
+  dingTalkStreamService = new DingTalkStreamService(dingTalkRouter, {
+    connected: () => recordAudit({ level: 'info', category: 'remote', action: 'remote_connected', message: '钉钉 Stream 已连接' }),
+    disconnected: () => recordAudit({ level: 'warning', category: 'remote', action: 'remote_disconnected', message: '钉钉 Stream 连接已断开，正在等待 SDK 重连' }),
+    error: (error) => recordAudit({ level: 'error', category: 'remote', action: 'remote_error', message: '钉钉远程通道发生错误', details: { error } }),
+    message: (staffId, command) => recordAudit({ level: 'info', category: 'remote', action: 'remote_message_received', message: `收到钉钉命令 ${command}`, details: { staffId, command } }),
+  })
   registerIpc(approvalPolicy)
-  await controller.restoreLiveHosts()
+  await controller.restoreSessions(sessionSafetyStore.getSettings().preserveWorkspaceOnCrash)
+  for (const session of controller.listSessions()) {
+    if (session.status === 'stopped' || session.status === 'failed') {
+      await restoreNativeSessionProvider(session)
+    }
+  }
   createWindow(); createTray()
+  if (ENABLE_NATIVE_DRAG_IN_BETA) {
+    nativeDragBridge = new NativeDragBridge(handleNativeDrag, (message) => {
+      recordAudit({ level: 'warning', category: 'session', action: 'native_drag_bridge_warning', message: 'Windows 外部终端拖入监听不可用', details: { error: message } })
+    })
+    nativeDragBridge.start()
+  }
+  void dingTalkStreamService.restart(dingTalkSettingsStore.getRuntimeSettings()).catch((error) => {
+    recordAudit({ level: 'error', category: 'remote', action: 'remote_start_failed', message: '钉钉远程通道启动失败', details: { error: error instanceof Error ? error.message : String(error) } })
+  })
   app.on('activate', () => {
     const window = mainWindow && !mainWindow.isDestroyed() ? mainWindow : createWindow()
     window.show()
   })
 })
 
-app.on('before-quit', () => { quitting = true })
+app.on('before-quit', (event) => {
+  if (quitPrepared) { quitting = true; return }
+  // OS shutdown and fatal exits cannot safely wait for UI. Host leases release PTYs;
+  // the crash-retention setting controls whether the Manager metadata is restored.
+  if (quitPromptActive) event.preventDefault()
+  else quitting = true
+  if (quitting) dingTalkStreamService?.stop()
+  if (quitting) nativeDragBridge?.stop()
+})
+}
