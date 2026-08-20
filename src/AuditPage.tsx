@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 
-import type { AuditCategory, AuditEntry, AuditLevel, SessionSummary } from './shared/manager-api'
+import type { AuditCategory, AuditEntry, AuditLevel, LlmRuleAuditFinding, SessionSummary } from './shared/manager-api'
 
 const CATEGORY_LABEL: Record<AuditCategory, string> = {
-  session: '会话', approval: '授权', recovery: '恢复', rule: '规则', remote: '远程',
+  session: '会话', approval: '授权', recovery: '恢复', rule: '规则', review: '审查', remote: '远程',
 }
 
 const LEVEL_LABEL: Record<AuditLevel, string> = {
@@ -18,11 +18,73 @@ function detailText(entry: AuditEntry, key: string): string | undefined {
   return typeof value === 'string' && value ? value : undefined
 }
 
+const REVIEW_SEVERITY_LABEL: Record<LlmRuleAuditFinding['severity'], string> = {
+  low: '低风险', medium: '需要复核', high: '高风险', critical: '严重危险',
+}
+
+const REVIEW_LEVEL_LABEL: Record<string, string> = {
+  low: '低', medium: '中', high: '高',
+}
+
+const REVIEW_VERDICT_LABEL: Record<string, string> = {
+  allow: '建议放行', manual: '需要人工确认', deny: '建议拒绝', uncertain: '无法确定',
+}
+
+function displayedCategory(entry: AuditEntry): AuditCategory {
+  return entry.action.startsWith('llm_') ? 'review' : entry.category
+}
+
+function detailValue(entry: AuditEntry, key: string): string | number | boolean | undefined {
+  return entry.details?.[key]
+}
+
+function parsedStringList(entry: AuditEntry, key: string): string[] {
+  const value = detailText(entry, key)
+  if (!value) return []
+  try {
+    const parsed = JSON.parse(value) as unknown
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string' && Boolean(item)) : []
+  } catch { return [] }
+}
+
+function parsedFindings(entry: AuditEntry): LlmRuleAuditFinding[] {
+  const value = detailText(entry, 'findings')
+  if (!value) return []
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((item): item is LlmRuleAuditFinding => Boolean(item) && typeof item === 'object'
+      && typeof (item as LlmRuleAuditFinding).rule === 'string'
+      && typeof (item as LlmRuleAuditFinding).issue === 'string'
+      && typeof (item as LlmRuleAuditFinding).recommendation === 'string'
+      && ['low', 'medium', 'high', 'critical'].includes((item as LlmRuleAuditFinding).severity))
+  } catch { return [] }
+}
+
+function reviewFacts(entry: AuditEntry): Array<[string, string]> {
+  const facts: Array<[string, string]> = []
+  const add = (label: string, value: unknown): void => { if (value !== undefined && value !== '') facts.push([label, String(value)]) }
+  const source = detailValue(entry, 'source')
+  add('触发方式', source === 'manual' ? '手动审查' : source === 'scheduled' ? '定时审查' : source)
+  add('模型', detailValue(entry, 'model'))
+  const level = detailValue(entry, 'level')
+  add('审查等级', typeof level === 'string' ? REVIEW_LEVEL_LABEL[level] ?? level : level)
+  add('规则数量', detailValue(entry, 'ruleCount'))
+  add('发现问题', detailValue(entry, 'findingCount'))
+  add('风险分', detailValue(entry, 'riskScore'))
+  const verdict = detailValue(entry, 'verdict')
+  add('模型结论', typeof verdict === 'string' ? REVIEW_VERDICT_LABEL[verdict] ?? verdict : verdict)
+  const requiresHuman = detailValue(entry, 'requiresHumanApproval')
+  add('人工确认', requiresHuman === true ? '需要' : requiresHuman === false ? '不需要' : requiresHuman)
+  add('请求超时', detailValue(entry, 'timeoutSeconds') !== undefined ? `${detailValue(entry, 'timeoutSeconds')} 秒` : undefined)
+  return facts
+}
+
 function normalizedWorkspace(value: string): string {
   return value.replace(/\//g, '\\').replace(/[\\]+$/, '').toLocaleLowerCase('en-US')
 }
 
-export default function AuditPage({ sessions = [] }: { sessions?: SessionSummary[] }): JSX.Element {
+export default function AuditPage({ sessions = [], onOpenLlmReviewResults }: { sessions?: SessionSummary[]; onOpenLlmReviewResults?: () => void }): JSX.Element {
   const [entries, setEntries] = useState<AuditEntry[]>([])
   const [category, setCategory] = useState<AuditCategory | 'all'>('all')
   const [level, setLevel] = useState<AuditLevel | 'all'>('all')
@@ -59,6 +121,7 @@ export default function AuditPage({ sessions = [] }: { sessions?: SessionSummary
     const session = entry.sessionId ? sessionById.get(entry.sessionId) : undefined
     return {
       entry,
+      category: displayedCategory(entry),
       displayName: detailText(entry, 'displayName') ?? session?.displayName,
       workspace: detailText(entry, 'workspace') ?? session?.workspace,
     }
@@ -76,7 +139,7 @@ export default function AuditPage({ sessions = [] }: { sessions?: SessionSummary
   const filtered = useMemo(() => {
     const duration = timeRange === '24h' ? 86_400_000 : timeRange === '7d' ? 604_800_000 : timeRange === '30d' ? 2_592_000_000 : undefined
     const cutoff = duration ? Date.now() - duration : undefined
-    return decorated.filter((item) => (category === 'all' || item.entry.category === category)
+    return decorated.filter((item) => (category === 'all' || item.category === category)
       && (level === 'all' || item.entry.level === level)
       && (workspace === 'all' || Boolean(item.workspace && normalizedWorkspace(item.workspace) === workspace))
       && (agent === 'all' || item.entry.sessionId === agent)
@@ -86,6 +149,11 @@ export default function AuditPage({ sessions = [] }: { sessions?: SessionSummary
   const currentPage = Math.min(page, pageCount)
   const visibleEntries = useMemo(() => filtered.slice((currentPage - 1) * AUDIT_PAGE_SIZE, currentPage * AUDIT_PAGE_SIZE), [currentPage, filtered])
   const selected = visibleEntries.find((item) => item.entry.id === selectedId) ?? visibleEntries[0]
+  const selectedReviewFacts = selected?.category === 'review' ? reviewFacts(selected.entry) : []
+  const selectedFindings = selected?.category === 'review' ? parsedFindings(selected.entry) : []
+  const selectedReasons = selected?.category === 'review' ? parsedStringList(selected.entry, 'reasons') : []
+  const selectedHazards = selected?.category === 'review' ? parsedStringList(selected.entry, 'hazards') : []
+  const selectedAssumptions = selected?.category === 'review' ? parsedStringList(selected.entry, 'assumptions') : []
   useEffect(() => { setPage(1); setSelectedId(undefined) }, [agent, category, level, timeRange, workspace])
   useEffect(() => { if (page > pageCount) setPage(pageCount) }, [page, pageCount])
   const copySelected = async (): Promise<void> => {
@@ -120,11 +188,25 @@ export default function AuditPage({ sessions = [] }: { sessions?: SessionSummary
     <div className="audit-workbench"><div className="audit-list">
       {filtered.length === 0 ? <div className="audit-empty">还没有符合条件的活动记录</div> : visibleEntries.map(({ entry, displayName, workspace: entryWorkspace }) => <article className={`audit-row audit-${entry.level}${selected?.entry.id === entry.id ? ' active' : ''}`} key={entry.id} onClick={() => setSelectedId(entry.id)}>
         <time dateTime={new Date(entry.timestamp).toISOString()}>{new Date(entry.timestamp).toLocaleString()}</time>
-        <span className="audit-category">{CATEGORY_LABEL[entry.category]}</span>
+        <span className="audit-category">{CATEGORY_LABEL[displayedCategory(entry)]}</span>
         <div><strong>{entry.message}</strong><small>{[displayName, entryWorkspace, entry.action].filter(Boolean).join(' · ')}</small>{(detailText(entry, 'command') ?? detailText(entry, 'toolName') ?? detailText(entry, 'reason') ?? detailText(entry, 'error')) && <code>{detailText(entry, 'command') ?? detailText(entry, 'toolName') ?? detailText(entry, 'reason') ?? detailText(entry, 'error')}</code>}</div>
         <span className="audit-level">{LEVEL_LABEL[entry.level]}</span>
       </article>)}
       {filtered.length > AUDIT_PAGE_SIZE && <nav className="audit-pagination" aria-label="审计分页"><span>共 {filtered.length} 条 · 第 {currentPage}/{pageCount} 页</span><div><button className="button-secondary button-compact" type="button" disabled={currentPage === 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>上一页</button><button className="button-secondary button-compact" type="button" disabled={currentPage === pageCount} onClick={() => setPage((value) => Math.min(pageCount, value + 1))}>下一页</button></div></nav>}
-    </div>{selected && <aside className="audit-detail"><header><div><span className="eyebrow">{CATEGORY_LABEL[selected.entry.category]} · {LEVEL_LABEL[selected.entry.level]}</span><h3>{selected.entry.message}</h3></div><button type="button" className="button-secondary button-compact" onClick={() => { void copySelected() }}>复制详情</button></header><dl><div><dt>时间</dt><dd>{new Date(selected.entry.timestamp).toLocaleString()}</dd></div><div><dt>Agent</dt><dd>{selected.displayName ?? '全局事件'}</dd></div><div><dt>会话</dt><dd>{selected.entry.sessionId ?? '—'}</dd></div><div><dt>工作区</dt><dd>{selected.workspace ?? '—'}</dd></div><div><dt>动作</dt><dd>{selected.entry.action}</dd></div></dl><div className="audit-detail-fields">{Object.entries(selected.entry.details ?? {}).map(([key, value]) => <div key={key}><strong>{key}</strong><code>{String(value)}</code></div>)}</div></aside>}</div>
+    </div>{selected && <aside className="audit-detail">
+      <header><div><span className="eyebrow">{CATEGORY_LABEL[selected.category]} · {LEVEL_LABEL[selected.entry.level]}</span><h3>{selected.entry.message}</h3></div><div className="audit-detail-actions">{selected.category === 'review' && selected.entry.action.startsWith('llm_rule_audit_') && onOpenLlmReviewResults && <button type="button" className="button-primary button-compact" onClick={onOpenLlmReviewResults}>查看完整审查结果</button>}<button type="button" className="button-secondary button-compact" onClick={() => { void copySelected() }}>复制详情</button></div></header>
+      <dl><div><dt>时间</dt><dd>{new Date(selected.entry.timestamp).toLocaleString()}</dd></div><div><dt>Agent</dt><dd>{selected.displayName ?? '全局事件'}</dd></div><div><dt>会话</dt><dd>{selected.entry.sessionId ?? '—'}</dd></div><div><dt>工作区</dt><dd>{selected.workspace ?? '—'}</dd></div><div><dt>动作</dt><dd>{selected.entry.action}</dd></div></dl>
+      {selected.category === 'review' ? <div className="audit-review-detail">
+        {selectedReviewFacts.length > 0 && <dl className="audit-review-facts">{selectedReviewFacts.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>}
+        {detailText(selected.entry, 'summary') && <section><strong>审查结论</strong><p>{detailText(selected.entry, 'summary')}</p></section>}
+        {detailText(selected.entry, 'command') && <section><strong>被审查命令</strong><code>{detailText(selected.entry, 'command')}</code></section>}
+        {detailText(selected.entry, 'error') && <section className="danger"><strong>失败原因</strong><p>{detailText(selected.entry, 'error')}</p></section>}
+        {selectedReasons.length > 0 && <section><strong>判断理由</strong><ul>{selectedReasons.map((reason, index) => <li key={index}>{reason}</li>)}</ul></section>}
+        {selectedHazards.length > 0 && <section className="danger"><strong>危险点</strong><ul>{selectedHazards.map((hazard, index) => <li key={index}>{hazard}</li>)}</ul></section>}
+        {selectedAssumptions.length > 0 && <section><strong>环境与路径假设</strong><ul>{selectedAssumptions.map((assumption, index) => <li key={index}>{assumption}</li>)}</ul></section>}
+        {selectedFindings.length > 0 && <section className="audit-review-findings"><strong>命中的规则问题</strong>{selectedFindings.map((finding, index) => <article className={'severity-' + finding.severity} key={`${finding.rule}::${index}`}><header><span>{REVIEW_SEVERITY_LABEL[finding.severity]}</span><code>{finding.rule}</code></header><p>{finding.issue}</p><small>{finding.recommendation}</small></article>)}</section>}
+        {detailValue(selected.entry, 'findingsTruncated') === true && <p className="audit-review-truncated">这里只显示前 8 项，点击“查看完整审查结果”查看最新完整结果。</p>}
+      </div> : <div className="audit-detail-fields">{Object.entries(selected.entry.details ?? {}).map(([key, value]) => <div key={key}><strong>{key}</strong><code>{String(value)}</code></div>)}</div>}
+    </aside>}</div>
   </section>
 }

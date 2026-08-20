@@ -29,7 +29,15 @@ export default function DingTalkSettingsDialog({ sessions, onClose }: { sessions
 
   useEffect(() => {
     void window.agentManager.getDingTalkSettings().then(setSettings).catch((reason) => setError(readableError(reason))).finally(() => setBusy(false))
-    return () => { if (closeTimer.current) clearTimeout(closeTimer.current) }
+    const statusTimer = setInterval(() => {
+      void window.agentManager.getDingTalkSettings().then((next) => {
+        setSettings((current) => ({ ...current, connectionStatus: next.connectionStatus, connectionError: next.connectionError }))
+      }).catch(() => undefined)
+    }, 2_000)
+    return () => {
+      clearInterval(statusTimer)
+      if (closeTimer.current) clearTimeout(closeTimer.current)
+    }
   }, [])
 
   const armClose = (): void => {
@@ -95,7 +103,7 @@ export default function DingTalkSettingsDialog({ sessions, onClose }: { sessions
         </div></section>
       </div>
       <div className='launcher-config-security'><strong>可执行范围</strong><span>/agents、/pending、/approve、/approve-all、/status、/tail、/workspace、/send、/stop、/restart、/audit；自然语言最终也只会转换为这些操作。</span></div>
-      <div className='launcher-config-security'><strong>凭据保护</strong><span>Client Secret、Agent API Key 和代理密码使用 Windows 安全存储加密，不返回页面、不写审计。</span></div>
+      <div className='launcher-config-security'><strong>凭据保护</strong><span>Client Secret、Agent API Key 和代理密码使用系统安全存储加密，不返回页面、不写审计。</span></div>
       {error && <p className='form-error'>{error}</p>}{closeArmed && <p className='launcher-dismiss-hint rules-dismiss-hint'>再点击一次空白处关闭</p>}
       <footer><button type='button' className='button-secondary' onClick={onClose}>取消</button><button type='submit' className='button-primary' disabled={busy}>{busy ? '请稍后…' : '保存并连接'}</button></footer>
     </form>

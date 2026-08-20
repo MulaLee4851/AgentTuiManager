@@ -2,13 +2,14 @@ import { randomUUID } from 'node:crypto'
 
 import type { HostHandle, HostMetadataUpdate, HostRecord, SessionHostManager, StartHostOptions } from './session-host-manager'
 import type { HostEvent, HostExitFact } from '../src/shared/protocol'
-import type { AgentConfigSummary, AgentKind, AgentProxySummary, ApprovalRequest, BulkApprovalResult, ManagerEvent, NativeSessionSummary, SessionSummary, StartSessionRequest } from '../src/shared/manager-api'
+import type { AgentConfigSummary, AgentKind, AgentProxySummary, ApprovalRequest, BulkApprovalResult, LlmReviewConclusion, LlmReviewLevel, ManagerEvent, NativeSessionSummary, SessionSummary, StartSessionRequest } from '../src/shared/manager-api'
 import { reduceSession } from '../src/shared/session-state'
 import { createAgentAdapter, extractApprovalCommand, type AgentAdapter, type AgentObservation } from './agent-adapters'
 import { canBulkApproveCommand, canFullAutoApprove, type ApprovalDecision } from './approval-policy'
 import { TerminalReplayBuffer } from './terminal-replay-buffer'
 import { terminalScrollbackArgs } from './start-request-policy'
 import type { StoredManagedSession } from './managed-session-catalog'
+import { shouldReviewApproval } from './llm-security-reviewer'
 
 export interface SessionHostManagerPort {
   start(options: StartHostOptions): Promise<HostHandle>
@@ -30,6 +31,8 @@ export interface ApprovalPolicyPort {
   decide(command: string | undefined): ApprovalDecision
   noteManualApproval(command: string | undefined): { command: string; approvalCount: number } | undefined
   addRule(command: string): Promise<void> | void
+  canBulkApproveCommand?(command: string | undefined): boolean
+  canFullAutoApprove?(input: Parameters<typeof canFullAutoApprove>[0]): ReturnType<typeof canFullAutoApprove>
 }
 
 export interface RecoveryPolicyPort {
@@ -48,6 +51,7 @@ export interface ManagedSessionCatalogPort {
 export interface ContinueKeywordPolicyPort {
   getSettings(): { enabled: boolean; quietSeconds: number; keywords: string[] }
   match(value: string): string | undefined
+  matchIncremental?(previous: string, current: string): string | undefined
   maxKeywordLength(): number
 }
 
@@ -60,6 +64,14 @@ export interface FullAutoActivityPort {
   pending?(request: ApprovalRequest): void
   approved(request: ApprovalRequest): void
   blocked(request: ApprovalRequest, reason: string): void
+  reviewStarted?(request: ApprovalRequest): void
+  reviewed?(request: ApprovalRequest, conclusion: LlmReviewConclusion): void
+  reviewFailed?(request: ApprovalRequest, error: string): void
+}
+
+export interface LlmApprovalReviewPort {
+  getSettings(): { enabled: boolean; level: LlmReviewLevel }
+  reviewApproval(request: ApprovalRequest, hardBlockedReason?: string): Promise<LlmReviewConclusion>
 }
 
 interface NativeSessionCapture {
@@ -68,6 +80,19 @@ interface NativeSessionCapture {
   attempts: number
   inFlight: boolean
   timer?: ReturnType<typeof setTimeout>
+}
+
+interface ClaudeHookIdentity {
+  requestId: string
+  fingerprint: string
+  createdAt: number
+  toolUseId?: string
+  agentId?: string
+  agentType?: string
+}
+
+interface RecentClaudeHookApproval extends ClaudeHookIdentity {
+  approvedAt: number
 }
 
 interface ManagedSession {
@@ -89,13 +114,25 @@ interface ManagedSession {
   nativeCapture?: NativeSessionCapture
   pendingApprovalCommand?: string
   approvalRequests: ApprovalRequest[]
+  claudeHookIdentities?: Map<string, ClaudeHookIdentity>
+  claudeHookAliases?: Map<string, Set<string>>
+  recentClaudeHookApprovals?: RecentClaudeHookApproval[]
   pendingClaudeTerminalApproval?: {
     timer: ReturnType<typeof setTimeout>
     generation: number
     observation: AgentObservation
     eventData: string
   }
+  pendingTerminalAutoApproval?: {
+    command: string
+    generation: number
+    timer: ReturnType<typeof setTimeout>
+  }
   claudeTerminalFallbackBlockedUntil?: number
+  lastTerminalAutoApproval?: {
+    command: string
+    expiresAt: number
+  }
   transientRetry?: {
     timer: ReturnType<typeof setTimeout>
     generation: number
@@ -106,6 +143,7 @@ interface ManagedSession {
     generation: number
   }
   continueKeywordTail: string
+  continueKeywordSuppressedUntil?: number
   continueKeywordAttempted: Set<string>
   pendingKeywordContinue?: {
     timer: ReturnType<typeof setTimeout>
@@ -133,13 +171,39 @@ const CONTINUE_SUBMIT_DELAY_MS = 75
 const MAX_PENDING_HOST_INPUT = 64 * 1024
 const CLAUDE_TERMINAL_APPROVAL_FALLBACK_MS = 1_000
 const CLAUDE_TERMINAL_REDRAW_GUARD_MS = 3_000
+const CLAUDE_HOOK_DUPLICATE_WINDOW_MS = 3_000
+const TERMINAL_AUTO_APPROVAL_REDRAW_GUARD_MS = 3_000
+
+// Codex can paint the approval OSC marker before its raw-input prompt is ready.
+// Keep a single short fallback so a swallowed first Enter does not require a
+// resize/redraw to be discovered, while never retrying indefinitely.
+const TERMINAL_AUTO_APPROVAL_CONFIRM_MS = 250
+
+type ApprovalReviewSubject = Pick<ApprovalRequest, 'risk'>
+  & Partial<Pick<ApprovalRequest, 'toolName' | 'command' | 'inputSummary' | 'filePath' | 'targetPaths' | 'dangerRuleId'>>
+
+function sameApprovalReviewSubject(
+  left: ApprovalReviewSubject,
+  right: ApprovalReviewSubject,
+): boolean {
+  return left.risk === right.risk
+    && left.toolName === right.toolName
+    && left.command === right.command
+    && left.inputSummary === right.inputSummary
+    && left.filePath === right.filePath
+    && left.dangerRuleId === right.dangerRuleId
+    && JSON.stringify(left.targetPaths ?? []) === JSON.stringify(right.targetPaths ?? [])
+}
 
 function isTerminalProtocolResponse(data: string): boolean {
-  return /^(?:(?:\x1b\[\??\d+;\d+R|\x1b\[\??[\d;]*c|\x1b\[>[\d;]*c|\x1b\[\?[\d;]*u)|(?:\x1b\](?:10|11|12);rgb:[\da-f]{1,4}\/[\da-f]{1,4}\/[\da-f]{1,4}(?:\x07|\x1b\\)))+$/i.test(data)
+  // A user arrow key is ESC [ C/D. Require at least one parameter for the
+  // device-attribute responses ending in c so ESC [ C is never swallowed.
+  return /^(?:(?:\x1b\[\??\d+;\d+R|\x1b\[\??[\d;]+c|\x1b\[>[\d;]+c|\x1b\[\?[\d;]+u)|(?:\x1b\](?:10|11|12);rgb:[\da-f]{1,4}\/[\da-f]{1,4}\/[\da-f]{1,4}(?:\x07|\x1b\\)))+$/i.test(data)
 }
 
 export class SessionController {
   private readonly sessions = new Map<string, ManagedSession>()
+  private readonly nativeCaptureReservations = new Set<string>()
   private readonly manager: SessionHostManagerPort
   private readonly emit: Emit
   private readonly discovery?: NativeSessionDiscoveryPort
@@ -156,6 +220,7 @@ export class SessionController {
     private readonly continueKeywordPolicy?: ContinueKeywordPolicyPort,
     private readonly recoveryActivity?: RecoveryActivityPort,
     private readonly catalog?: ManagedSessionCatalogPort,
+    private readonly llmReview?: LlmApprovalReviewPort,
   ) {
     this.manager = manager
     this.emit = emit
@@ -165,18 +230,12 @@ export class SessionController {
   }
 
   listSessions(): SessionSummary[] {
-    return [...this.sessions.values()].map(({ summary }) => ({
-      ...summary,
-      ...(summary.agentConfig ? { agentConfig: { ...summary.agentConfig, extraArgs: [...summary.agentConfig.extraArgs] } } : {}),
-    }))
+    return [...this.sessions.values()].map(({ summary }) => this.copySessionSummary(summary))
   }
 
   listPendingApprovals(): ApprovalRequest[] {
     return [...this.sessions.values()]
-      .flatMap(({ approvalRequests }) => approvalRequests.map((request) => ({
-        ...request,
-        ...(request.targetPaths ? { targetPaths: [...request.targetPaths] } : {}),
-      })))
+      .flatMap(({ approvalRequests }) => approvalRequests.map((request) => this.copyApprovalRequest(request)))
       .sort((left, right) => left.createdAt - right.createdAt)
   }
 
@@ -244,6 +303,7 @@ export class SessionController {
       await this.manager.release?.(record.hostId).catch(() => undefined)
     }
     const storedEntries = this.catalog?.list() ?? []
+    const storedBySessionId = new Map(storedEntries.map((entry) => [entry.sessionId, entry]))
     if (!preserveWorkspaceOnCrash) {
       const preservedSessionIds = new Set(liveRecords.filter((record) => record.managerOwnership === 'preserved').map((record) => record.sessionId ?? record.hostId))
       for (const entry of storedEntries) {
@@ -252,6 +312,7 @@ export class SessionController {
     }
     for (const record of liveRecords.filter((candidate) => reconnectableHostIds.has(candidate.hostId))) {
       const restoredSessionId = record.sessionId ?? record.hostId
+      const stored = storedBySessionId.get(restoredSessionId)
       if (this.sessions.has(restoredSessionId)) continue
       try {
         const handle = await this.manager.reconnect(record.hostId)
@@ -271,7 +332,9 @@ export class SessionController {
             recoveryAttempts: 0,
             userStopRequested: false,
             ...(replayObservation.webUrl ? { webUrl: replayObservation.webUrl } : {}),
-            ...(record.nativeSessionId ? { nativeSessionId: record.nativeSessionId } : {}),
+            ...(record.nativeSessionId ?? stored?.summary.nativeSessionId
+              ? { nativeSessionId: record.nativeSessionId ?? stored!.summary.nativeSessionId }
+              : {}),
           ...(record.agentConfig ? { agentConfig: { ...record.agentConfig, extraArgs: [...record.agentConfig.extraArgs] } } : {}),
           ...(record.agentProxy ? { agentProxy: { ...record.agentProxy } } : {}),
             ...(record.fullAutoEnabled ? { fullAutoEnabled: true } : {}),
@@ -311,6 +374,16 @@ export class SessionController {
               args: [...record.recovery.args],
               ...(record.recovery.continueInput ? { continueInput: record.recovery.continueInput } : {}),
             },
+          }
+        } else if (stored?.request) {
+          managed.request = stored.request
+        }
+        if (!managed.summary.nativeSessionId && stored?.nativeCapture) {
+          managed.nativeCapture = {
+            baselineIds: new Set(stored.nativeCapture.baselineIds),
+            startedAt: stored.nativeCapture.startedAt,
+            attempts: 0,
+            inFlight: false,
           }
         }
         this.sessions.set(restoredSessionId, managed)
@@ -353,6 +426,14 @@ export class SessionController {
         approvalRequests: [],
         continueKeywordTail: '',
         continueKeywordAttempted: new Set(),
+        ...(!summary.nativeSessionId && entry.nativeCapture ? {
+          nativeCapture: {
+            baselineIds: new Set(entry.nativeCapture.baselineIds),
+            startedAt: entry.nativeCapture.startedAt,
+            attempts: 0,
+            inFlight: false,
+          },
+        } : {}),
       })
       this.changed(entry.sessionId)
     }
@@ -377,6 +458,7 @@ export class SessionController {
     let handledClaudeHookApproval = false
     if (data.length > 0) {
       this.cancelKeywordContinue(managed)
+      this.cancelPendingTerminalAutoApproval(managed)
       if (managed.summary.agentKind === 'claude') {
         this.cancelClaudeTerminalApproval(managed)
         managed.claudeTerminalFallbackBlockedUntil = 0
@@ -411,7 +493,7 @@ export class SessionController {
       if (claudeHookApproval) {
         managed.adapter.acknowledgeUserInput(true)
         managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
-        managed.handle.respondToPermission(claudeHookApproval.requestId, 'allow')
+        this.respondToClaudeHook(managed, claudeHookApproval.requestId, 'allow')
         this.completeManualApproval(managed, claudeHookApproval)
         handledClaudeHookApproval = true
       } else if (terminalApproval && /[\r\n]/.test(data)) {
@@ -434,6 +516,9 @@ export class SessionController {
   resize(sessionId: string, cols: number, rows: number): void {
     const managed = this.required(sessionId)
     if (isTerminalStatus(managed.summary.status)) return
+    this.cancelKeywordContinue(managed)
+    managed.continueKeywordTail = ''
+    managed.continueKeywordSuppressedUntil = Date.now() + 1_000
     managed.handle.resize(cols, rows)
   }
 
@@ -444,18 +529,18 @@ export class SessionController {
     this.approveRequest(request.requestId)
   }
 
-  approveRequest(requestId: string): void {
+  approveRequest(requestId: string, recordManualApproval = true): void {
     const { managed, request } = this.requiredApproval(requestId)
     if (request.source === 'claude-hook') {
       this.cancelClaudeTerminalApproval(managed)
       managed.adapter.acknowledgeUserInput(true)
       managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
-      managed.handle.respondToPermission(request.requestId, 'allow')
+      this.respondToClaudeHook(managed, request.requestId, 'allow')
     } else {
       managed.adapter.acknowledgeUserInput(true)
       managed.handle.write(managed.adapter.approvalInput())
     }
-    this.completeManualApproval(managed, request)
+    this.completeApproval(managed, request, recordManualApproval)
   }
 
   async approveAndRememberRequest(requestId: string): Promise<void> {
@@ -475,7 +560,7 @@ export class SessionController {
       this.cancelClaudeTerminalApproval(managed)
       managed.adapter.acknowledgeUserInput(true)
       managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
-      managed.handle.respondToPermission(request.requestId, 'deny')
+      this.respondToClaudeHook(managed, request.requestId, 'deny')
     } else {
       managed.adapter.acknowledgeUserInput(true)
       managed.handle.write(managed.adapter.rejectionInput())
@@ -488,7 +573,7 @@ export class SessionController {
   approveAllPending(): BulkApprovalResult {
     const result: BulkApprovalResult = { approved: 0, skipped: 0, failed: 0, skippedRequestIds: [] }
     for (const request of this.listPendingApprovals()) {
-      if (!canBulkApproveCommand(request.command)) {
+      if (!(this.approvalPolicy?.canBulkApproveCommand?.(request.command) ?? canBulkApproveCommand(request.command))) {
         result.skipped += 1
         result.skippedRequestIds.push(request.requestId)
         continue
@@ -619,10 +704,12 @@ export class SessionController {
     managed.summary = { ...managed.summary, fullAutoEnabled: enabled }
     if (enabled) {
       for (const request of [...managed.approvalRequests]) {
-        const result = canFullAutoApprove(request)
-        if (result.allowed) {
+        const result = this.approvalPolicy?.canFullAutoApprove?.(request) ?? canFullAutoApprove(request)
+        if (this.shouldReviewWithLlm(request)) {
+          this.scheduleLlmReview(managed, request, result)
+        } else if (result.allowed) {
+          this.approveRequest(request.requestId, false)
           this.fullAutoActivity?.approved(request)
-          this.approveRequest(request.requestId)
         } else {
           this.fullAutoActivity?.blocked(request, result.reason)
         }
@@ -680,6 +767,12 @@ export class SessionController {
     if (!isTerminalStatus(managed.summary.status)) throw new Error('Agent 仍在运行，无需重新启动')
     const request = managed.request
     if (!request) throw new Error('缺少该 Agent 的启动信息，无法重新启动')
+    if (!managed.summary.nativeSessionId && managed.adapter.supportsNativeSessions && managed.nativeCapture) {
+      await this.tryCaptureNativeSession(managed)
+    }
+    if (!managed.summary.nativeSessionId && managed.adapter.supportsNativeSessions) {
+      throw new Error('该窗口尚未绑定原生会话，已阻止启动新 Agent。请在“新增 Agent”中选择对应历史会话进行恢复。')
+    }
 
     const oldHostId = managed.handle.hostId
     const recipe = request.recovery
@@ -714,6 +807,7 @@ export class SessionController {
     managed.agentReady = false
     managed.suppressTransientRetryUntilReady = Boolean(managed.summary.nativeSessionId)
     managed.adapter.resetForRecovery()
+    delete managed.lastTerminalAutoApproval
     if (managed.nativeCapture?.timer) clearTimeout(managed.nativeCapture.timer)
     delete managed.nativeCapture
     const {
@@ -741,9 +835,11 @@ export class SessionController {
     }
     delete managed.pendingApprovalCommand
     managed.approvalRequests.length = 0
+    this.clearClaudeHookState(managed)
     this.changed(sessionId)
 
     try {
+      await this.releaseHostBeforeRestart(oldHostId)
       options.sessionId = sessionId
       const handle = await this.manager.start(options)
       managed.handle = handle
@@ -765,6 +861,22 @@ export class SessionController {
       }
       this.changed(sessionId)
       throw error
+    }
+  }
+
+  private async releaseHostBeforeRestart(hostId: string): Promise<void> {
+    if (!this.manager.release) return
+    try {
+      await this.manager.release(hostId)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+      if (!this.manager.forceRelease) throw error
+      try {
+        await this.manager.forceRelease(hostId)
+      } catch (forceError) {
+        if ((forceError as NodeJS.ErrnoException).code === 'ENOENT') return
+        throw forceError
+      }
     }
   }
 
@@ -825,11 +937,12 @@ export class SessionController {
       if (managed.generation !== generation) return
       managed.hostHealthFailures = 0
       if (event.type === 'output') {
-        this.cancelKeywordContinue(managed)
         managed.terminalReplay.append(event.data)
         managed.outputSequence += 1
         this.emit({ sessionId: managed.summary.sessionId, ...event, sequence: managed.outputSequence })
         const observation = managed.adapter.observeOutput(event.data)
+        this.observePendingTerminalAutoApproval(managed, observation)
+        if (observation.ready) delete managed.lastTerminalAutoApproval
         if (observation.webUrl && managed.summary.webUrl !== observation.webUrl) {
           managed.summary = { ...managed.summary, webUrl: observation.webUrl }
           this.changed(managed.summary.sessionId)
@@ -873,6 +986,12 @@ export class SessionController {
         this.cancelClaudeTerminalApproval(managed)
         this.removeTerminalApprovals(managed)
         managed.adapter.acknowledgeUserInput(true)
+        const hookIdentity = this.rememberClaudeHookIdentity(managed, event)
+        if (hookIdentity.agentId && this.resolveDuplicateClaudeHook(managed, hookIdentity)) {
+          this.syncApprovalSummary(managed)
+          this.changed(managed.summary.sessionId)
+          continue
+        }
         const toolName = /^[A-Za-z][\w-]{0,63}$/.test(event.toolName) ? event.toolName : 'Unknown'
         const approvalCommand = event.command ?? `tool:${toolName}`
         const decision = this.approvalPolicy?.decide(approvalCommand)
@@ -887,10 +1006,16 @@ export class SessionController {
           ...(event.filePath ? { filePath: event.filePath } : {}),
           ...(event.targetPaths?.length ? { targetPaths: [...event.targetPaths] } : {}),
         }
-        const fullAuto = managed.summary.fullAutoEnabled ? canFullAutoApprove(fullAutoInput) : undefined
-        if (decision?.action === 'auto-approve' || fullAuto?.allowed) {
+        const fullAuto = managed.summary.fullAutoEnabled
+          ? this.approvalPolicy?.canFullAutoApprove?.(fullAutoInput) ?? canFullAutoApprove(fullAutoInput)
+          : undefined
+        const llmReviewRequired = decision?.action !== 'auto-approve' && this.shouldReviewWithLlm({
+          risk: approvalRisk,
+          ...(decision?.matchedDangerRule ? { dangerRuleId: decision.matchedDangerRule.id } : {}),
+        })
+        if (decision?.action === 'auto-approve' || fullAuto?.allowed && !llmReviewRequired) {
           managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
-          managed.handle.respondToPermission(event.requestId, 'allow')
+          this.respondToClaudeHook(managed, event.requestId, 'allow')
           if (fullAuto?.allowed && decision?.action !== 'auto-approve') {
             this.fullAutoActivity?.approved(this.approvalForActivity(managed, {
               requestId: event.requestId, source: 'claude-hook', risk: approvalRisk,
@@ -907,15 +1032,24 @@ export class SessionController {
             requestId: event.requestId,
             source: 'claude-hook',
             risk: approvalRisk,
-            reason: event.reason ?? decision?.reason ?? '该工具请求没有命中现有自动批准规则，需要人工确认',
+            reason: decision?.matchedDangerRule
+              ? decision.reason
+              : event.reason ?? decision?.reason ?? '该工具请求没有命中现有自动批准规则，需要人工确认',
             toolName,
             command: approvalCommand,
             ...(event.filePath ? { filePath: event.filePath } : {}),
             ...(event.targetPaths?.length ? { targetPaths: [...event.targetPaths] } : {}),
             ...(event.toolInputSummary ? { inputSummary: event.toolInputSummary } : {}),
             ...(event.reason ? { agentReason: event.reason } : {}),
+            ...(decision?.matchedDangerRule ? {
+              dangerRuleId: decision.matchedDangerRule.id,
+              dangerRuleName: decision.matchedDangerRule.name,
+            } : {}),
           })
-          if (managed.summary.fullAutoEnabled && fullAuto && !fullAuto.allowed) this.fullAutoActivity?.blocked(queued, fullAuto.reason)
+          if (managed.summary.fullAutoEnabled && fullAuto) {
+            if (llmReviewRequired) this.scheduleLlmReview(managed, queued, fullAuto)
+            else if (!fullAuto.allowed) this.fullAutoActivity?.blocked(queued, fullAuto.reason)
+          }
         }
         this.changed(managed.summary.sessionId)
       } else if (event.type === 'exit') {
@@ -939,6 +1073,7 @@ export class SessionController {
     this.cancelPendingContinueSubmit(managed)
     this.cancelClaudeTerminalApproval(managed)
     managed.approvalRequests.length = 0
+    this.clearClaudeHookState(managed)
     this.syncApprovalSummary(managed)
     managed.handle.disconnect()
     if (managed.summary.userStopRequested) {
@@ -1032,6 +1167,7 @@ export class SessionController {
       managed.agentReady = false
       managed.suppressTransientRetryUntilReady = false
       managed.adapter.resetForRecovery()
+      delete managed.lastTerminalAutoApproval
       this.flushPendingHostInput(managed)
       void this.pump(managed, managed.generation)
     } catch (error) {
@@ -1235,17 +1371,27 @@ export class SessionController {
   private observeContinueKeyword(managed: ManagedSession, data: string, observation: AgentObservation): void {
     const policy = this.continueKeywordPolicy
     const settings = policy?.getSettings()
+    const continueSuppressed = (managed.continueKeywordSuppressedUntil ?? 0) > Date.now()
     if (!policy || !settings?.enabled || settings.keywords.length === 0
+      || continueSuppressed
       || managed.pendingUserInterrupt || managed.summary.userStopRequested
       || managed.summary.status !== 'running' || observation.approvalRequired
       || observation.recoverableError || managed.awaitingRecoveryReady) {
+      this.cancelKeywordContinue(managed)
       managed.continueKeywordTail = ''
       return
     }
+    delete managed.continueKeywordSuppressedUntil
     const maximum = Math.max(256, policy.maxKeywordLength() * 2)
-    managed.continueKeywordTail = (managed.continueKeywordTail + data).slice(-maximum)
-    const keyword = policy.match(managed.continueKeywordTail)
+    const previousTail = managed.continueKeywordTail
+    managed.continueKeywordTail = (previousTail + data).slice(-maximum)
+    const current = managed.pendingKeywordContinue
+    const matchedKeyword = policy.matchIncremental
+      ? policy.matchIncremental(previousTail, data)
+      : policy.match(managed.continueKeywordTail)
+    const keyword = matchedKeyword ?? current?.keyword
     if (!keyword || managed.continueKeywordAttempted.has(keyword)) return
+    const newlyMatched = !current || current.keyword !== keyword
     this.cancelKeywordContinue(managed)
     const generation = managed.generation
     const outputSequence = managed.outputSequence
@@ -1264,7 +1410,7 @@ export class SessionController {
     }, settings.quietSeconds * 1_000)
     timer.unref?.()
     managed.pendingKeywordContinue = { timer, generation, keyword, outputSequence }
-    this.recoveryActivity?.keywordMatched(managed.summary.sessionId, keyword)
+    if (newlyMatched) this.recoveryActivity?.keywordMatched(managed.summary.sessionId, keyword)
   }
 
   private cancelKeywordContinue(managed: ManagedSession): boolean {
@@ -1336,7 +1482,7 @@ export class SessionController {
   private scheduleNativeCapture(managed: ManagedSession): void {
     const capture = managed.nativeCapture
     if (!capture || capture.inFlight || capture.timer || managed.summary.nativeSessionId || !this.discovery) return
-    const delays = [0, 250, 750, 2_000, 5_000]
+    const delays = [0, 250, 750, 2_000, 5_000, 10_000, 20_000, 30_000]
     const delay = delays[capture.attempts]
     if (delay === undefined) return
     capture.timer = setTimeout(() => {
@@ -1354,20 +1500,33 @@ export class SessionController {
     capture.attempts += 1
     try {
       const sessions = await discovery.discover(managed.summary.agentKind, managed.summary.workspace)
+      const claimed = new Set([...this.sessions.values()]
+        .map((session) => session.summary.nativeSessionId)
+        .filter((id): id is string => Boolean(id)))
       const candidates = sessions.filter((session) => !capture.baselineIds.has(session.id)
-        && session.updatedAt >= capture.startedAt - 5_000)
-      if (candidates.length !== 1) return
-      const nativeSessionId = candidates[0]!.id
+        && !claimed.has(session.id) && !this.nativeCaptureReservations.has(session.id)
+        && session.updatedAt >= capture.startedAt - 5_000
+        && session.updatedAt <= capture.startedAt + 5 * 60_000)
+        .sort((left, right) => Math.abs(left.updatedAt - capture.startedAt) - Math.abs(right.updatedAt - capture.startedAt)
+          || left.updatedAt - right.updatedAt || left.id.localeCompare(right.id))
+      const candidate = candidates[0]
+      if (!candidate) return
+      const nativeSessionId = candidate.id
       const request = managed.request
       if (!request) return
       const recovery = managed.adapter.recoveryRecipe(request.executable, nativeSessionId)
       if (!recovery) return
-      await this.manager.updateMetadata(managed.handle.hostId, { nativeSessionId, recovery })
-      request.nativeSessionId = nativeSessionId
-      request.recovery = recovery
-      managed.summary = { ...managed.summary, nativeSessionId }
-      delete managed.nativeCapture
-      this.changed(managed.summary.sessionId)
+      this.nativeCaptureReservations.add(nativeSessionId)
+      try {
+        await this.manager.updateMetadata(managed.handle.hostId, { nativeSessionId, recovery })
+        request.nativeSessionId = nativeSessionId
+        request.recovery = recovery
+        managed.summary = { ...managed.summary, nativeSessionId }
+        delete managed.nativeCapture
+        this.changed(managed.summary.sessionId)
+      } finally {
+        this.nativeCaptureReservations.delete(nativeSessionId)
+      }
     } catch {
       // Native history is advisory. A failed read must not interrupt the live Agent.
     } finally {
@@ -1420,29 +1579,63 @@ export class SessionController {
       const approvalCommand = observation.approvalCommand ?? extractApprovalCommand(eventData)
       const decision = this.approvalPolicy?.decide(approvalCommand)
       const fullAuto = managed.summary.fullAutoEnabled
-        ? canFullAutoApprove({ command: approvalCommand, risk: decision?.risk ?? 'unknown', workspace: managed.summary.workspace })
+        ? this.approvalPolicy?.canFullAutoApprove?.({ command: approvalCommand, risk: decision?.risk ?? 'unknown', workspace: managed.summary.workspace })
+          ?? canFullAutoApprove({ command: approvalCommand, risk: decision?.risk ?? 'unknown', workspace: managed.summary.workspace })
         : undefined
-      if (decision?.action === 'auto-approve' || fullAuto?.allowed) {
-        if (fullAuto?.allowed && decision?.action !== 'auto-approve') {
-          this.fullAutoActivity?.approved(this.approvalForActivity(managed, {
+      const llmReviewRequired = decision?.action !== 'auto-approve' && this.shouldReviewWithLlm({
+        risk: decision?.risk ?? 'unknown',
+        ...(decision?.matchedDangerRule ? { dangerRuleId: decision.matchedDangerRule.id } : {}),
+      })
+      if (decision?.action === 'auto-approve' || fullAuto?.allowed && !llmReviewRequired) {
+        const duplicate = this.isDuplicateTerminalAutoApproval(managed, approvalCommand)
+        const activityRequest = !duplicate && fullAuto?.allowed && decision?.action !== 'auto-approve'
+          ? this.approvalForActivity(managed, {
             requestId: 'terminal:auto-' + randomUUID(), source: 'terminal',
             risk: decision?.risk ?? 'unknown', reason: observation.approvalReason ?? fullAuto.reason,
             ...(approvalCommand ? { command: approvalCommand } : {}),
             ...(observation.approvalReason ? { agentReason: observation.approvalReason } : {}),
-          }))
-        }
+          })
+          : undefined
         managed.adapter.acknowledgeUserInput(true)
-        managed.handle.write(managed.adapter.approvalInput())
+        if (!duplicate) {
+          try {
+            managed.handle.write(managed.adapter.approvalInput())
+          } catch {
+            // Keep the request queued when the host rejects input.
+            this.queueApproval(managed, {
+              requestId: 'terminal:' + randomUUID(), source: 'terminal',
+              risk: decision?.risk ?? 'unknown',
+              reason: observation.approvalReason ?? fullAuto?.reason ?? '终端未确认自动批准，请人工确认',
+              ...(approvalCommand ? { command: approvalCommand } : {}),
+            })
+            this.changed(managed.summary.sessionId)
+            return
+          }
+          this.removeTerminalApproval(managed, approvalCommand)
+          // Record only after the write was accepted by the live host socket.
+          if (activityRequest) this.fullAutoActivity?.approved(activityRequest)
+          this.schedulePendingTerminalAutoApproval(managed, approvalCommand)
+        }
         managed.summary = reduceSession(managed.summary, { type: 'started' }) as SessionSummary
+        this.emit({ type: 'terminal-refresh-requested', sessionId: managed.summary.sessionId })
       } else {
         const queued = this.queueApproval(managed, {
           requestId: 'terminal:' + randomUUID(), source: 'terminal',
           risk: decision?.risk ?? 'unknown',
-          reason: observation.approvalReason ?? decision?.reason ?? '未能识别授权请求的具体影响，需要人工确认',
+          reason: decision?.matchedDangerRule
+            ? decision.reason
+            : observation.approvalReason ?? decision?.reason ?? '未能识别授权请求的具体影响，需要人工确认',
           ...(approvalCommand ? { command: approvalCommand } : {}),
           ...(observation.approvalReason ? { agentReason: observation.approvalReason } : {}),
+          ...(decision?.matchedDangerRule ? {
+            dangerRuleId: decision.matchedDangerRule.id,
+            dangerRuleName: decision.matchedDangerRule.name,
+          } : {}),
         })
-        if (managed.summary.fullAutoEnabled && fullAuto && !fullAuto.allowed) this.fullAutoActivity?.blocked(queued, fullAuto.reason)
+        if (managed.summary.fullAutoEnabled && fullAuto) {
+          if (llmReviewRequired) this.scheduleLlmReview(managed, queued, fullAuto)
+          else if (!fullAuto.allowed) this.fullAutoActivity?.blocked(queued, fullAuto.reason)
+        }
       }
       this.changed(managed.summary.sessionId)
     }
@@ -1451,31 +1644,235 @@ export class SessionController {
       if (approvalCommand && approvalCommand !== managed.pendingApprovalCommand) {
         const decision = this.approvalPolicy?.decide(approvalCommand)
         const fullAuto = managed.summary.fullAutoEnabled
-          ? canFullAutoApprove({ command: approvalCommand, risk: decision?.risk ?? 'unknown', workspace: managed.summary.workspace })
+          ? this.approvalPolicy?.canFullAutoApprove?.({ command: approvalCommand, risk: decision?.risk ?? 'unknown', workspace: managed.summary.workspace })
+            ?? canFullAutoApprove({ command: approvalCommand, risk: decision?.risk ?? 'unknown', workspace: managed.summary.workspace })
           : undefined
-        if (decision?.action === 'auto-approve' || fullAuto?.allowed) {
-          if (fullAuto?.allowed && decision?.action !== 'auto-approve') {
-            this.fullAutoActivity?.approved(this.approvalForActivity(managed, {
+        const llmReviewRequired = decision?.action !== 'auto-approve' && this.shouldReviewWithLlm({
+          risk: decision?.risk ?? 'unknown',
+          ...(decision?.matchedDangerRule ? { dangerRuleId: decision.matchedDangerRule.id } : {}),
+        })
+        if (decision?.action === 'auto-approve' || fullAuto?.allowed && !llmReviewRequired) {
+          const duplicate = this.isDuplicateTerminalAutoApproval(managed, approvalCommand)
+          const activityRequest = !duplicate && fullAuto?.allowed && decision?.action !== 'auto-approve'
+            ? this.approvalForActivity(managed, {
               requestId: 'terminal:auto-' + randomUUID(), source: 'terminal',
               risk: decision?.risk ?? 'unknown', reason: observation.approvalReason ?? fullAuto.reason,
               command: approvalCommand,
               ...(observation.approvalReason ? { agentReason: observation.approvalReason } : {}),
-            }))
-          }
+            })
+            : undefined
           managed.adapter.acknowledgeUserInput(true)
-          managed.handle.write(managed.adapter.approvalInput())
+          if (!duplicate) {
+            try {
+              managed.handle.write(managed.adapter.approvalInput())
+            } catch {
+              // Keep the request queued when the host rejects input.
+              this.queueApproval(managed, {
+                requestId: 'terminal:' + randomUUID(), source: 'terminal',
+                risk: decision?.risk ?? 'unknown',
+                reason: observation.approvalReason ?? fullAuto?.reason ?? '终端未确认自动批准，请人工确认',
+                ...(approvalCommand ? { command: approvalCommand } : {}),
+              })
+              this.changed(managed.summary.sessionId)
+              return
+            }
+            this.removeTerminalApproval(managed, approvalCommand)
+            // Record only after the write was accepted by the live host socket.
+            if (activityRequest) this.fullAutoActivity?.approved(activityRequest)
+            this.schedulePendingTerminalAutoApproval(managed, approvalCommand)
+          }
+          this.emit({ type: 'terminal-refresh-requested', sessionId: managed.summary.sessionId })
         } else {
           const queued = this.queueApproval(managed, {
             requestId: 'terminal:' + randomUUID(), source: 'terminal',
             risk: decision?.risk ?? 'unknown',
-            reason: observation.approvalReason ?? decision?.reason ?? managed.summary.approvalReason ?? '未能识别授权请求的具体影响，需要人工确认',
+            reason: decision?.matchedDangerRule
+              ? decision.reason
+              : observation.approvalReason ?? decision?.reason ?? managed.summary.approvalReason ?? '未能识别授权请求的具体影响，需要人工确认',
             command: approvalCommand,
+            ...(decision?.matchedDangerRule ? {
+              dangerRuleId: decision.matchedDangerRule.id,
+              dangerRuleName: decision.matchedDangerRule.name,
+            } : {}),
           })
-          if (managed.summary.fullAutoEnabled && fullAuto && !fullAuto.allowed) this.fullAutoActivity?.blocked(queued, fullAuto.reason)
+          if (managed.summary.fullAutoEnabled && fullAuto) {
+            if (llmReviewRequired) this.scheduleLlmReview(managed, queued, fullAuto)
+            else if (!fullAuto.allowed) this.fullAutoActivity?.blocked(queued, fullAuto.reason)
+          }
         }
         this.changed(managed.summary.sessionId)
       }
     }
+  }
+
+  private schedulePendingTerminalAutoApproval(managed: ManagedSession, command: string | undefined): void {
+    if (!command) return
+    this.cancelPendingTerminalAutoApproval(managed)
+    const generation = managed.generation
+    const pending: ManagedSession['pendingTerminalAutoApproval'] = {
+      command,
+      generation,
+      timer: setTimeout(() => {
+        if (managed.pendingTerminalAutoApproval !== pending) return
+        delete managed.pendingTerminalAutoApproval
+        if (managed.generation !== generation || isTerminalStatus(managed.summary.status)
+          || managed.summary.userStopRequested) return
+        // A Codex OSC notification can arrive just before the raw-input prompt
+        // starts reading. One bounded retry avoids relying on a later resize.
+        try { managed.handle.write(managed.adapter.approvalInput()) } catch { /* host pump reports connection failures */ }
+      }, TERMINAL_AUTO_APPROVAL_CONFIRM_MS),
+    }
+    pending.timer.unref?.()
+    managed.pendingTerminalAutoApproval = pending
+  }
+
+  private observePendingTerminalAutoApproval(managed: ManagedSession, observation: AgentObservation): void {
+    const pending = managed.pendingTerminalAutoApproval
+    if (!pending) return
+    if (observation.ready
+      || (observation.approvalRequired && observation.approvalCommand !== undefined
+        && observation.approvalCommand !== pending.command)) {
+      this.cancelPendingTerminalAutoApproval(managed)
+    }
+  }
+
+  private cancelPendingTerminalAutoApproval(managed: ManagedSession): void {
+    const pending = managed.pendingTerminalAutoApproval
+    if (!pending) return
+    clearTimeout(pending.timer)
+    delete managed.pendingTerminalAutoApproval
+  }
+  private isDuplicateTerminalAutoApproval(managed: ManagedSession, command: string | undefined): boolean {
+    const now = Date.now()
+    const key = command ?? 'approval:unknown'
+    const previous = managed.lastTerminalAutoApproval
+    managed.lastTerminalAutoApproval = {
+      command: key,
+      expiresAt: now + TERMINAL_AUTO_APPROVAL_REDRAW_GUARD_MS,
+    }
+    return Boolean(previous && previous.command === key && previous.expiresAt > now)
+  }
+
+  private rememberClaudeHookIdentity(
+    managed: ManagedSession,
+    event: Extract<HostEvent, { type: 'permission-request' }>,
+  ): ClaudeHookIdentity {
+    const structuredFingerprint = /^[a-f0-9]{64}$/i.test(event.toolInputFingerprint ?? '')
+      ? event.toolInputFingerprint!.toLowerCase()
+      : undefined
+    const fingerprint = JSON.stringify({
+      toolName: event.toolName,
+      ...(structuredFingerprint
+        ? { toolInputFingerprint: structuredFingerprint }
+        : {
+            command: event.command ?? null,
+            filePath: event.filePath ?? null,
+            targetPaths: event.targetPaths ?? null,
+            toolInputSummary: event.toolInputSummary ?? null,
+          }),
+    })
+    const identity: ClaudeHookIdentity = {
+      requestId: event.requestId,
+      fingerprint,
+      createdAt: Date.now(),
+      ...(event.toolUseId ? { toolUseId: event.toolUseId } : {}),
+      ...(event.agentId ? { agentId: event.agentId } : {}),
+      ...(event.agentType ? { agentType: event.agentType } : {}),
+    }
+    const identities = managed.claudeHookIdentities ?? new Map<string, ClaudeHookIdentity>()
+    identities.set(identity.requestId, identity)
+    managed.claudeHookIdentities = identities
+    return identity
+  }
+
+  private resolveDuplicateClaudeHook(managed: ManagedSession, identity: ClaudeHookIdentity): boolean {
+    const now = Date.now()
+    const recent = (managed.recentClaudeHookApprovals ?? [])
+      .filter((approval) => approval.approvedAt + CLAUDE_HOOK_DUPLICATE_WINDOW_MS > now)
+    managed.recentClaudeHookApprovals = recent
+    const approved = recent.find((approval) => this.sameClaudeHookIdentity(
+      { ...approval, createdAt: approval.approvedAt },
+      identity,
+      true,
+    ))
+    if (approved) {
+      this.respondToClaudeHook(managed, identity.requestId, 'allow')
+      return true
+    }
+
+    for (const request of managed.approvalRequests) {
+      if (request.source !== 'claude-hook') continue
+      const pendingIdentity = managed.claudeHookIdentities?.get(request.requestId)
+      if (!pendingIdentity || !this.sameClaudeHookIdentity(pendingIdentity, identity, true)) continue
+      const aliases = managed.claudeHookAliases ?? new Map<string, Set<string>>()
+      const requestAliases = aliases.get(request.requestId) ?? new Set<string>()
+      requestAliases.add(identity.requestId)
+      aliases.set(request.requestId, requestAliases)
+      managed.claudeHookAliases = aliases
+      return true
+    }
+    return false
+  }
+
+  private sameClaudeHookIdentity(
+    existing: ClaudeHookIdentity,
+    candidate: ClaudeHookIdentity,
+    allowMainToSubagentClone: boolean,
+  ): boolean {
+    if (Math.abs(existing.createdAt - candidate.createdAt) > CLAUDE_HOOK_DUPLICATE_WINDOW_MS) return false
+    if (existing.toolUseId && candidate.toolUseId) return existing.toolUseId === candidate.toolUseId
+    if (existing.fingerprint !== candidate.fingerprint) return false
+    if (existing.agentId && candidate.agentId) return existing.agentId === candidate.agentId
+    return allowMainToSubagentClone && !existing.agentId && Boolean(candidate.agentId)
+  }
+
+  private respondToClaudeHook(
+    managed: ManagedSession,
+    requestId: string,
+    action: 'allow' | 'deny',
+  ): void {
+    const identities = managed.claudeHookIdentities
+    const aliases = managed.claudeHookAliases
+    const primaryIdentity = identities?.get(requestId)
+    const responseIds = new Set<string>([requestId, ...(aliases?.get(requestId) ?? [])])
+
+    if (primaryIdentity && !primaryIdentity.agentId) {
+      for (const request of [...managed.approvalRequests]) {
+        if (request.requestId === requestId || request.source !== 'claude-hook') continue
+        const candidate = identities?.get(request.requestId)
+        if (!candidate?.agentId || !this.sameClaudeHookIdentity(primaryIdentity, candidate, true)) continue
+        responseIds.add(request.requestId)
+        for (const alias of aliases?.get(request.requestId) ?? []) responseIds.add(alias)
+        this.removeApproval(managed, request.requestId)
+      }
+    }
+
+    const approvedAt = Date.now()
+    for (const responseId of responseIds) {
+      managed.handle.respondToPermission(responseId, action)
+      const identity = identities?.get(responseId)
+      if (action === 'allow' && identity) this.rememberApprovedClaudeHook(managed, identity, approvedAt)
+      identities?.delete(responseId)
+      aliases?.delete(responseId)
+    }
+    aliases?.delete(requestId)
+  }
+
+  private rememberApprovedClaudeHook(
+    managed: ManagedSession,
+    identity: ClaudeHookIdentity,
+    approvedAt: number,
+  ): void {
+    const recent = (managed.recentClaudeHookApprovals ?? [])
+      .filter((approval) => approval.approvedAt + CLAUDE_HOOK_DUPLICATE_WINDOW_MS > approvedAt)
+    recent.push({ ...identity, approvedAt })
+    managed.recentClaudeHookApprovals = recent.slice(-32)
+  }
+
+  private clearClaudeHookState(managed: ManagedSession): void {
+    delete managed.claudeHookIdentities
+    delete managed.claudeHookAliases
+    delete managed.recentClaudeHookApprovals
   }
 
   private required(sessionId: string): ManagedSession {
@@ -1495,15 +1892,16 @@ export class SessionController {
   private queueApproval(
     managed: ManagedSession,
     input: Pick<ApprovalRequest, 'requestId' | 'source' | 'risk' | 'reason'>
-      & Partial<Pick<ApprovalRequest, 'toolName' | 'command' | 'inputSummary' | 'filePath' | 'targetPaths' | 'agentReason'>>,
+      & Partial<Pick<ApprovalRequest, 'toolName' | 'command' | 'inputSummary' | 'filePath' | 'targetPaths' | 'agentReason' | 'dangerRuleId' | 'dangerRuleName'>>,
   ): ApprovalRequest {
     const terminalIndex = input.source === 'terminal'
-      ? managed.approvalRequests.findIndex((request) => request.source === 'terminal')
+      ? this.findTerminalApprovalToUpdate(managed, input.command)
       : -1
     const requestIndex = terminalIndex >= 0
       ? terminalIndex
       : managed.approvalRequests.findIndex((request) => request.requestId === input.requestId)
     const previous = requestIndex >= 0 ? managed.approvalRequests[requestIndex] : undefined
+    const preserveLlmReview = Boolean(previous && sameApprovalReviewSubject(previous, input))
     const request: ApprovalRequest = {
       requestId: previous?.requestId ?? input.requestId,
       sessionId: managed.summary.sessionId,
@@ -1520,8 +1918,13 @@ export class SessionController {
       ...(input.inputSummary ? { inputSummary: input.inputSummary } : {}),
       ...(input.filePath ? { filePath: input.filePath } : {}),
       ...(input.targetPaths?.length ? { targetPaths: [...input.targetPaths] } : {}),
+      ...(input.dangerRuleId ? { dangerRuleId: input.dangerRuleId } : {}),
+      ...(input.dangerRuleName ? { dangerRuleName: input.dangerRuleName } : {}),
+      ...(preserveLlmReview && previous?.llmReviewStatus ? { llmReviewStatus: previous.llmReviewStatus } : {}),
+      ...(preserveLlmReview && previous?.llmReview ? { llmReview: previous.llmReview } : {}),
+      ...(preserveLlmReview && previous?.llmReviewError ? { llmReviewError: previous.llmReviewError } : {}),
       createdAt: previous?.createdAt ?? Date.now(),
-      canBulkApprove: canBulkApproveCommand(input.command),
+      canBulkApprove: this.approvalPolicy?.canBulkApproveCommand?.(input.command) ?? canBulkApproveCommand(input.command),
     }
     if (requestIndex >= 0) managed.approvalRequests[requestIndex] = request
     else managed.approvalRequests.push(request)
@@ -1530,10 +1933,39 @@ export class SessionController {
     return request
   }
 
+  private findTerminalApprovalToUpdate(managed: ManagedSession, command: string | undefined): number {
+    const terminalRequests = managed.approvalRequests
+      .map((request, index) => ({ request, index }))
+      .filter(({ request }) => request.source === 'terminal')
+    if (terminalRequests.length === 0) return -1
+
+    // Repaints of the same command update the existing entry. This also keeps
+    // LLM review state attached to the request while its reason/details refine.
+    const exact = terminalRequests.find(({ request }) => request.command === command)
+    if (exact) return exact.index
+
+    // Codex may first emit an OSC notification without the full command. Once
+    // the complete line arrives, refine that placeholder instead of creating a
+    // second entry. Never replace an already complete command with a placeholder.
+    const isPlaceholder = !command || command === 'tool:Shell'
+    if (!isPlaceholder) {
+      const placeholder = terminalRequests.find(({ request }) => !request.command || request.command === 'tool:Shell')
+      if (placeholder) return placeholder.index
+    }
+    return -1
+  }
+
+  private removeTerminalApproval(managed: ManagedSession, command: string | undefined): void {
+    const index = this.findTerminalApprovalToUpdate(managed, command)
+    if (index < 0) return
+    managed.approvalRequests.splice(index, 1)
+    this.syncApprovalSummary(managed)
+  }
+
   private approvalForActivity(
     managed: ManagedSession,
     input: Pick<ApprovalRequest, 'requestId' | 'source' | 'risk' | 'reason'>
-      & Partial<Pick<ApprovalRequest, 'toolName' | 'command' | 'inputSummary' | 'filePath' | 'targetPaths' | 'agentReason'>>,
+      & Partial<Pick<ApprovalRequest, 'toolName' | 'command' | 'inputSummary' | 'filePath' | 'targetPaths' | 'agentReason' | 'dangerRuleId' | 'dangerRuleName'>>,
   ): ApprovalRequest {
     return {
       requestId: input.requestId,
@@ -1551,8 +1983,10 @@ export class SessionController {
       ...(input.inputSummary ? { inputSummary: input.inputSummary } : {}),
       ...(input.filePath ? { filePath: input.filePath } : {}),
       ...(input.targetPaths?.length ? { targetPaths: [...input.targetPaths] } : {}),
+      ...(input.dangerRuleId ? { dangerRuleId: input.dangerRuleId } : {}),
+      ...(input.dangerRuleName ? { dangerRuleName: input.dangerRuleName } : {}),
       createdAt: Date.now(),
-      canBulkApprove: canBulkApproveCommand(input.command),
+      canBulkApprove: this.approvalPolicy?.canBulkApproveCommand?.(input.command) ?? canBulkApproveCommand(input.command),
     }
   }
 
@@ -1596,11 +2030,64 @@ export class SessionController {
   }
 
   private completeManualApproval(managed: ManagedSession, request: ApprovalRequest): void {
-    const suggestion = this.approvalPolicy?.noteManualApproval(request.command)
+    this.completeApproval(managed, request, true)
+  }
+
+  private completeApproval(managed: ManagedSession, request: ApprovalRequest, recordManualApproval: boolean): void {
+    const suggestion = recordManualApproval ? this.approvalPolicy?.noteManualApproval(request.command) : undefined
     this.removeApproval(managed, request.requestId)
     this.syncApprovalSummary(managed)
     if (suggestion) managed.summary = { ...managed.summary, approvalSuggestion: suggestion }
     this.changed(managed.summary.sessionId)
+  }
+
+  private shouldReviewWithLlm(request: Pick<ApprovalRequest, 'risk' | 'dangerRuleId'>): boolean {
+    const settings = this.llmReview?.getSettings()
+    return Boolean(settings?.enabled && shouldReviewApproval(settings.level, request))
+  }
+
+  private scheduleLlmReview(
+    managed: ManagedSession,
+    request: ApprovalRequest,
+    hardDecision: { allowed: boolean; reason: string },
+  ): void {
+    if (!this.llmReview || request.llmReviewStatus === 'pending') return
+    request.llmReviewStatus = 'pending'
+    delete request.llmReview
+    delete request.llmReviewError
+    const generation = managed.generation
+    const reviewSnapshot: ApprovalRequest = {
+      ...request,
+      ...(request.targetPaths ? { targetPaths: [...request.targetPaths] } : {}),
+    }
+    this.syncApprovalSummary(managed)
+    this.fullAutoActivity?.reviewStarted?.(request)
+    this.changed(managed.summary.sessionId)
+    void this.llmReview.reviewApproval(reviewSnapshot, hardDecision.allowed ? undefined : hardDecision.reason).then((conclusion) => {
+      const current = managed.approvalRequests.find((item) => item.requestId === request.requestId)
+      if (!current || managed.generation !== generation || !sameApprovalReviewSubject(current, reviewSnapshot)) return
+      current.llmReviewStatus = 'completed'
+      current.llmReview = conclusion
+      delete current.llmReviewError
+      this.fullAutoActivity?.reviewed?.(current, conclusion)
+      if (managed.summary.fullAutoEnabled && this.llmReview?.getSettings().enabled && hardDecision.allowed
+        && conclusion.verdict === 'allow' && !conclusion.requiresHumanApproval) {
+        this.approveRequest(current.requestId, false)
+        this.fullAutoActivity?.approved(current)
+        return
+      }
+      this.fullAutoActivity?.blocked(current, hardDecision.allowed ? conclusion.summary : hardDecision.reason)
+      this.changed(managed.summary.sessionId)
+    }).catch((error) => {
+      const current = managed.approvalRequests.find((item) => item.requestId === request.requestId)
+      if (!current || managed.generation !== generation || !sameApprovalReviewSubject(current, reviewSnapshot)) return
+      const message = error instanceof Error ? error.message : String(error)
+      current.llmReviewStatus = 'failed'
+      current.llmReviewError = message
+      this.fullAutoActivity?.reviewFailed?.(current, message)
+      this.fullAutoActivity?.blocked(current, 'LLM 审查失败，已转人工处理')
+      this.changed(managed.summary.sessionId)
+    })
   }
 
   private changed(sessionId: string): void {
@@ -1611,10 +2098,45 @@ export class SessionController {
         hostId: managed.handle.hostId,
         summary: this.catalogSummary(managed.summary),
         ...(managed.request ? { request: this.catalogRequest(managed.request) } : {}),
+        ...(managed.nativeCapture ? {
+          nativeCapture: {
+            baselineIds: [...managed.nativeCapture.baselineIds],
+            startedAt: managed.nativeCapture.startedAt,
+          },
+        } : {}),
         updatedAt: new Date().toISOString(),
       }).catch(() => undefined)
     }
-    this.emit({ type: 'sessions-changed', sessionId })
+    this.emit({
+      type: 'sessions-changed',
+      sessionId,
+      session: managed ? this.copySessionSummary(managed.summary) : null,
+      approvals: managed
+        ? managed.approvalRequests.map((request) => this.copyApprovalRequest(request))
+        : [],
+    })
+  }
+
+  private copySessionSummary(summary: SessionSummary): SessionSummary {
+    return {
+      ...summary,
+      ...(summary.agentConfig ? { agentConfig: { ...summary.agentConfig, extraArgs: [...summary.agentConfig.extraArgs] } } : {}),
+    }
+  }
+
+  private copyApprovalRequest(request: ApprovalRequest): ApprovalRequest {
+    return {
+      ...request,
+      ...(request.targetPaths ? { targetPaths: [...request.targetPaths] } : {}),
+      ...(request.llmReview ? {
+        llmReview: {
+          ...request.llmReview,
+          reasons: [...request.llmReview.reasons],
+          hazards: [...request.llmReview.hazards],
+          assumptions: [...request.llmReview.assumptions],
+        },
+      } : {}),
+    }
   }
 
   private catalogSummary(summary: SessionSummary): SessionSummary {

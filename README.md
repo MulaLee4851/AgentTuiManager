@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>Windows 上的多 Agent 终端工作台</strong><br />
+  <strong>跨平台多 Agent 终端工作台</strong><br />
   并排跑 Claude Code / Codex / Pi，统一审批、恢复与远程值班<br />
   <em>不抢走会话，不改写原生工作流</em>
 </p>
@@ -92,11 +92,12 @@
 
 ## 运行要求
 
-- Windows 10 / 11 x64  
+- Windows 10 / 11 x64，或 macOS 12+（Intel / Apple Silicon）
 - Node.js 20+ 与 npm（开发或从源码运行时）  
 - 至少一个受支持的 Agent CLI：`Codex`、`Claude Code` 或 `Pi`  
+- macOS 使用一键安装 Node.js / ripgrep 时需要 Homebrew；已自行安装则不需要
 
-CLI 未进 `PATH` 时，可在新建 Agent 的高级设置里选择 `.exe` / `.cmd` / `.bat` / `.com`。
+CLI 未进 `PATH` 时，可在新建 Agent 的高级设置里选择完整可执行文件；Windows 支持 `.exe` / `.cmd` / `.bat` / `.com`，macOS 支持 POSIX 可执行文件。
 
 ---
 
@@ -124,6 +125,15 @@ npm run dev
 ```
 
 > `start.cmd` 在依赖未安装时默认走本机 `127.0.0.1:7897` HTTP 代理下载。若没有该代理，请直接 `npm install`，或按自己的网络配置 npm。
+
+macOS 从源码运行：
+
+```bash
+npm install
+npm run dev
+```
+
+从 Finder 启动时，Manager 会读取登录 Shell 的 `PATH`，兼容 Homebrew 的 `/opt/homebrew/bin` 和 `/usr/local/bin`。
 
 ---
 
@@ -188,6 +198,17 @@ npm run dist:win
 
 默认产物在 `release/`（NSIS x64）。本地若 `release\win-unpacked` 被旧进程占用，可先退出全部 Manager 再打包。
 
+
+## 构建 macOS 安装包
+
+在 macOS 机器上安装依赖后执行：
+
+```bash
+npm run dist:mac
+```
+
+默认生成 DMG 和 ZIP。由于 `node-pty` 包含原生模块，macOS 包必须在对应架构的 Mac 上安装依赖并构建；不支持直接复用 Windows 的 `node_modules` 交叉打包。当前配置未包含 Apple Developer 签名和公证，正式对外分发前仍需配置证书与 notarization。
+
 ---
 
 ## 开发验证
@@ -222,7 +243,7 @@ claude --resume <session-id>
 
 ## 当前限制
 
-- 仅支持 **Windows**（架构上预留扩展，但首版不承诺 macOS / Linux）  
+- Windows 已完成真实运行验证；macOS 第一阶段兼容代码已接入，仍需在真实 Intel / Apple Silicon 设备上验收 PTY、审批 Hook、会话保留和打包产物
 - 外部终端**拖入**仍为 Beta，默认关闭；**拖出**可用  
 - 代理目前支持 **HTTP**；HTTPS / SOCKS5 配置尚未开放  
 
@@ -230,7 +251,7 @@ claude --resume <session-id>
 
 ## 技术栈
 
-Electron · React · TypeScript · xterm.js · node-pty (ConPTY) · 本地 Session Host IPC · Electron safeStorage · 钉钉 Stream SDK  
+Electron · React · TypeScript · xterm.js · node-pty（Windows ConPTY / macOS PTY）· 本地 Session Host IPC · Electron safeStorage · 钉钉 Stream SDK
 
 ---
 

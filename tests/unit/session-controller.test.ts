@@ -743,6 +743,33 @@ describe('SessionController recovery evidence', () => {
     expect(activity.approved).toHaveBeenCalledTimes(2)
   })
 
+  it('retries a Codex full-auto Enter once when the approval prompt does not advance', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const activity = { approved: vi.fn(), blocked: vi.fn() }
+      const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine(), undefined, activity)
+      const session = await controller.startSession(request())
+      await controller.setFullAutoMode(session.sessionId, true)
+
+      base.handles[0]!.emit({
+        type: 'output',
+        data: '\x1b]9;Approval requested: build\x07Would you like to run the following command?\r\n$ pnpm --dir frontend build\r\n1. Yes, proceed\r\n2. No',
+      })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(base.handles[0]!.writes).toEqual(['\r'])
+      expect(activity.approved).toHaveBeenCalledTimes(1)
+
+      await vi.advanceTimersByTimeAsync(249)
+      expect(base.handles[0]!.writes).toEqual(['\r'])
+      await vi.advanceTimersByTimeAsync(1)
+      expect(base.handles[0]!.writes).toEqual(['\r', '\r'])
+      await vi.advanceTimersByTimeAsync(2_000)
+      expect(base.handles[0]!.writes).toEqual(['\r', '\r'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
   it('immediately processes eligible pending requests when full-auto is enabled', async () => {
     const base = fixture()
     const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
@@ -872,6 +899,52 @@ describe('SessionController recovery evidence', () => {
     }
   })
 
+  it('does not start keyword Continue from output repainted immediately after resize', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const keywordPolicy = {
+        getSettings: () => ({ enabled: true, quietSeconds: 3, keywords: ['exceeded retry limit, last status: 429 too many requests'] }),
+        match: (value: string) => value.toLowerCase().includes('exceeded retry limit, last status: 429 too many requests')
+          ? 'exceeded retry limit, last status: 429 too many requests' : undefined,
+        maxKeywordLength: () => 58,
+      }
+      const controller = new SessionController(base.manager, undefined, undefined, undefined, undefined, undefined, keywordPolicy)
+      const session = await controller.startSession(request(true))
+
+      controller.resize(session.sessionId, 140, 45)
+      base.handles[0]!.emit({ type: 'output', data: 'exceeded retry limit, last status: 429 too many requests' })
+      await vi.advanceTimersByTimeAsync(10_000)
+
+      expect(base.handles[0]!.writes).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+  it('does not start keyword Continue from a full-screen terminal clear/redraw frame', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const keywordPolicy = {
+        getSettings: () => ({ enabled: true, quietSeconds: 3, keywords: ['exceeded retry limit, last status: 429 too many requests'] }),
+        match: (value: string) => value.toLowerCase().includes('exceeded retry limit, last status: 429 too many requests')
+          ? 'exceeded retry limit, last status: 429 too many requests' : undefined,
+        maxKeywordLength: () => 58,
+      }
+      const controller = new SessionController(base.manager, undefined, undefined, undefined, undefined, undefined, keywordPolicy)
+      const session = await controller.startSession(request(true))
+      controller.resize(session.sessionId, 140, 45)
+
+      // A resize/full-screen repaint may deliver old scrollback through PTY.
+      // It must never be treated as fresh progress for Continue rules.
+      base.handles[0]!.emit({ type: 'output', data: '\x1b[2J\x1b[Hexceeded retry limit, last status: 429 too many requests' })
+      await vi.advanceTimersByTimeAsync(10_000)
+
+      expect(base.handles[0]!.writes).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
   it('defers keyword Continue while the Agent keeps producing output', async () => {
     vi.useFakeTimers()
     try {

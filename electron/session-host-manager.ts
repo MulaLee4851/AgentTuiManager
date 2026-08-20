@@ -74,6 +74,7 @@ export interface HostHandle {
 
 export interface SessionHostManagerOptions {
   runtimeDir: string
+  socketDir?: string
   hostEntry: string
   nodeExecutable?: string
   timeoutMs?: number
@@ -301,6 +302,7 @@ class PipeHostHandle implements HostHandle {
 
 export class SessionHostManager {
   private readonly runtimeDir: string
+  private readonly socketDir: string
   private readonly hostEntry: string
   private readonly nodeExecutable: string
   private readonly timeoutMs: number
@@ -312,6 +314,7 @@ export class SessionHostManager {
 
   constructor(options: SessionHostManagerOptions) {
     this.runtimeDir = options.runtimeDir
+    this.socketDir = options.socketDir ?? options.runtimeDir
     this.hostEntry = options.hostEntry
     this.nodeExecutable = options.nodeExecutable ?? process.execPath
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
@@ -327,6 +330,7 @@ export class SessionHostManager {
 
   async start(options: StartHostOptions): Promise<HostHandle> {
     await mkdir(this.runtimeDir, { recursive: true })
+    if (this.socketDir !== this.runtimeDir) await mkdir(this.socketDir, { recursive: true, mode: 0o700 })
     const hostId = randomUUID()
     const endpoint = this.endpointFor(hostId)
     const exitPath = this.exitPath(hostId)
@@ -524,13 +528,13 @@ export class SessionHostManager {
       unlink(this.registryPath(hostId)).catch(() => undefined),
       unlink(this.exitPath(hostId)).catch(() => undefined),
       unlink(`${this.exitPath(hostId)}.claude-settings.json`).catch(() => undefined),
-      ...(process.platform === 'win32' ? [] : [unlink(join(this.runtimeDir, `${hostId}.sock`)).catch(() => undefined)]),
+      ...(process.platform === 'win32' ? [] : [unlink(join(this.socketDir, `${hostId}.sock`)).catch(() => undefined)]),
     ])
   }
 
   private endpointFor(hostId: string): string {
     if (process.platform === 'win32') return `\\\\.\\pipe\\agent-tui-host-${process.pid}-${hostId}`
-    return join(this.runtimeDir, `${hostId}.sock`)
+    return join(this.socketDir, `${hostId}.sock`)
   }
 
   private async connect(hostId: string, endpoint: string, timeoutMs = this.timeoutMs): Promise<PipeHostHandle> {

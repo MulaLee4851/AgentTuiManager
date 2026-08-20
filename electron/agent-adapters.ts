@@ -42,12 +42,33 @@ function terminalText(value: string): string {
     .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' ')
 }
 
+function completeTerminalOutput(value: string): { complete: string; remainder: string } {
+  const escapeIndex = value.lastIndexOf('\x1b')
+  if (escapeIndex < 0) return { complete: value, remainder: '' }
+  if (escapeIndex === value.length - 1) {
+    return { complete: value.slice(0, escapeIndex), remainder: value.slice(escapeIndex) }
+  }
+
+  const type = value[escapeIndex + 1]
+  if (type === '[') {
+    const finalByte = value.slice(escapeIndex + 2).search(/[@-~]/)
+    if (finalByte < 0) return { complete: value.slice(0, escapeIndex), remainder: value.slice(escapeIndex) }
+  } else if (type === ']') {
+    const payload = value.slice(escapeIndex + 2)
+    if (!payload.includes('\x07') && !payload.includes('\x1b\\')) {
+      return { complete: value.slice(0, escapeIndex), remainder: value.slice(escapeIndex) }
+    }
+  }
+  return { complete: value, remainder: '' }
+}
+
 abstract class EvidenceAdapter implements AgentAdapter {
   abstract readonly kind: AgentKind
   abstract readonly supportsNativeSessions: boolean
   private evidence = ''
   private recoverableTail = ''
   private classificationTail = ''
+  private terminalControlRemainder = ''
   private handledApprovalSubject: string | undefined
   private lastApprovalSubject: string | undefined
   // The command reported for the approval that is currently on screen. Candidate
@@ -59,7 +80,9 @@ abstract class EvidenceAdapter implements AgentAdapter {
   private pendingApprovalCommand: string | undefined
 
   observeOutput(data: string): AgentObservation {
-    const output = terminalText(data)
+    const raw = completeTerminalOutput(`${this.terminalControlRemainder}${data}`)
+    this.terminalControlRemainder = raw.remainder
+    const output = terminalText(raw.complete)
     const recoverableWindow = `${this.recoverableTail}${output}`
     const transientError = this.kind === 'deepseek' ? undefined : recoverableError(recoverableWindow)
     this.recoverableTail = recoverableWindow.slice(-(MODEL_CAPACITY_ERROR.length - 1))
@@ -69,12 +92,17 @@ abstract class EvidenceAdapter implements AgentAdapter {
     let observation = this.hasClassificationSignal(classificationWindow)
       ? this.classify(this.evidence)
       : { ready: false, approvalRequired: false }
-    const freshApprovalSignal = /\x1b\]9;(?:Approval requested:|Codex wants to edit|Approval requested by)/i.test(data)
+    const freshApprovalSignal = /\x1b\]9;(?:Approval requested:|Codex wants to edit|Approval requested by)[^\x07]*(?:\x07|\x1b\\)/i.test(raw.complete)
     if (!observation.approvalRequired) {
       this.pendingApprovalCommand = undefined
     } else if (freshApprovalSignal) {
       this.pendingApprovalCommand = observation.approvalCommand
     } else if (this.pendingApprovalCommand !== undefined) {
+      if (this.pendingApprovalCommand === 'tool:Shell'
+        && observation.approvalCommand !== undefined
+        && observation.approvalCommand !== 'tool:Shell') {
+        this.pendingApprovalCommand = observation.approvalCommand
+      }
       observation = { ...observation, approvalCommand: this.pendingApprovalCommand }
     } else if (observation.approvalCommand !== undefined) {
       this.pendingApprovalCommand = observation.approvalCommand
@@ -104,6 +132,7 @@ abstract class EvidenceAdapter implements AgentAdapter {
     this.evidence = ''
     this.recoverableTail = ''
     this.classificationTail = ''
+    this.terminalControlRemainder = ''
     this.lastApprovalSubject = undefined
     this.pendingApprovalCommand = undefined
   }
@@ -112,6 +141,7 @@ abstract class EvidenceAdapter implements AgentAdapter {
     this.evidence = ''
     this.recoverableTail = ''
     this.classificationTail = ''
+    this.terminalControlRemainder = ''
     this.handledApprovalSubject = undefined
     this.lastApprovalSubject = undefined
     this.pendingApprovalCommand = undefined
@@ -122,7 +152,8 @@ abstract class EvidenceAdapter implements AgentAdapter {
 
   private hasClassificationSignal(value: string): boolean {
     if (this.kind === 'generic' || this.kind === 'pi' || this.kind === 'deepseek') return value.trim().length > 0
-    if (/approval|permission|would you|do you want|allow|proceed|press enter|\[[yY](?:\/[nN])?\]/i.test(value)) return true
+    if (/approval|permission|would you|do you want|allow|proceed|press enter|\[[yY](?:\/[nN])?\]/i.test(value)
+      || /(?:^|\n)\s*(?:[›❯>]\s*)?\d+[.)]\s*(?:yes|allow|no|cancel)\b/im.test(value)) return true
     if (this.kind === 'codex') {
       return /AGENT_MANAGER_CODEX_APPROVAL_|(?:openai\s+)?codex|type \/ to select a command|[›❯]/i.test(value)
     }
@@ -165,8 +196,14 @@ export function extractApprovalCommand(evidence: string): string | undefined {
   const execTitle = normalizedEvidence.lastIndexOf('would you like to run the following command?')
   const execApproval = Math.max(execNotification, execTitle)
   const mcpApproval = evidence.lastIndexOf('AGENT_MANAGER_CODEX_APPROVAL_MCP:')
-  const latestCodexApproval = Math.max(editApproval, execApproval, mcpApproval)
+  const mcpBodyMatches = [...evidence.matchAll(/allow\s+(?:the\s+)?([\w.-]+)\s+mcp\s+server\s+to\s+run\s+tool\s+["']([^"'\r\n]+)["']/gi)]
+  const mcpBody = mcpBodyMatches.at(-1)
+  const mcpBodyApproval = mcpBody?.index ?? -1
+  const latestCodexApproval = Math.max(editApproval, execApproval, mcpApproval, mcpBodyApproval)
   if (latestCodexApproval === editApproval && editApproval >= 0) return 'tool:Edit'
+  if (latestCodexApproval === mcpBodyApproval && mcpBody?.[1] && mcpBody[2]) {
+    return `mcp:${mcpBody[1]}/${mcpBody[2]}`
+  }
   if (latestCodexApproval === mcpApproval && mcpApproval >= 0) return 'tool:MCP'
   if (/would you like to grant these permissions\?/i.test(evidence)) return 'tool:Permissions'
 
@@ -217,6 +254,7 @@ class CodexAdapter extends EvidenceAdapter {
     const approvalPhrase = includesAny(evidence, [
       ...EXPLICIT_APPROVAL,
       /AGENT_MANAGER_CODEX_APPROVAL_(?:EXEC|EDIT|MCP):/i,
+      /allow\s+(?:the\s+)?[\w.-]+\s+mcp\s+server\s+to\s+run\s+tool\s+["'][^"'\r\n]+["']/i,
       /would you like to run the following command/i,
       /would you like to make the following edits/i,
       /would you like to grant these permissions/i,
@@ -228,7 +266,7 @@ class CodexAdapter extends EvidenceAdapter {
     const approvalCommand = approvalPhrase ? extractApprovalCommand(evidence) : undefined
     const approvalReason = approvalPhrase ? extractApprovalReason(evidence) : undefined
     const approvalRequired = approvalPhrase
-      && ((approvalCommand !== undefined && approvalCommand !== 'tool:Shell') || hasApprovalInteraction(evidence))
+      && (approvalCommand !== undefined || hasApprovalInteraction(evidence))
     const hasIdentity = /(?:openai\s+)?codex/i.test(evidence)
     const hasPrompt = /(?:^|[\r\n])\s*[›❯]\s*(?:$|[\r\n])/m.test(evidence)
       || /type \/ to select a command/i.test(evidence)

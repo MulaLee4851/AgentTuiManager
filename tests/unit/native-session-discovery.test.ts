@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   discoverNativeSessions,
   discoverRecentNativeSessions,
+  normalizeWorkspace,
   type NativeSessionDiscoveryReader,
 } from '../../electron/native-session-discovery'
 
@@ -33,6 +34,17 @@ function memoryReader(
 }
 
 describe('discoverNativeSessions', () => {
+  it('normalizes POSIX workspaces on macOS without changing separators', () => {
+    expect(normalizeWorkspace('/Users/me/project///', 'darwin')).toBe('/Users/me/project')
+    expect(normalizeWorkspace('\\Users\\me\\project\\', 'darwin')).toBe('/Users/me/project')
+    expect(normalizeWorkspace('/Users/Me/Project/', 'darwin')).toBe('/Users/Me/Project')
+  })
+
+  it('keeps Windows drive and UNC paths case-insensitive on every host platform', () => {
+    expect(normalizeWorkspace('B:/Work/Demo/', 'darwin')).toBe('b:\\work\\demo')
+    expect(normalizeWorkspace('\\\\Server\\Share\\Demo\\', 'linux')).toBe('\\\\server\\share\\demo')
+  })
+
   const tempRoots: string[] = []
 
   afterEach(async () => {

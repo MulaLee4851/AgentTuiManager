@@ -114,4 +114,33 @@ describe('DingTalkCommandRouter', () => {
     await expect(router.execute('现在有几个运行中的 agent', { staffId: 'staff-1' })).resolves.toContain('Claude Agent')
     expect(interpreter.translate).toHaveBeenCalledWith(expect.any(String), expect.any(Object), expect.objectContaining({ sessions }))
   })
+
+  it('executes multiple Agent-mode operations from one natural-language message', async () => {
+    const interpreter = { translate: vi.fn(async () => ({
+      commands: ['/auto 40f5c044 on', '/auto Review Agent off'],
+    })) }
+    const sessions = [
+      { sessionId: '40f5c044-de04-40ac-b8d3-9b8d98985b60', displayName: 'Code Agent', status: 'running', agentKind: 'codex', workspace: 'B:/allowed' } as SessionSummary,
+      { sessionId: 'review-123456789', displayName: 'Review Agent', status: 'running', agentKind: 'claude', workspace: 'B:/allowed' } as SessionSummary,
+    ]
+    const { manager, audit } = createRouter({ sessions })
+    const router = new DingTalkCommandRouter(manager, audit, () => ({ ...settings, agentModeEnabled: true, agentBaseUrl: 'https://model.example/v1', agentApiKey: 'secret', agentModel: 'model-x' }), undefined, interpreter as never)
+
+    const result = await router.execute('打开 40f5c044 的全自动模式，关闭 review agent 的全自动模式', { staffId: 'staff-1' })
+    expect(result).toContain('已为 Code Agent 开启全自动模式')
+    expect(result).toContain('已为 Review Agent 关闭全自动模式')
+    expect(manager.setFullAutoMode).toHaveBeenNthCalledWith(1, sessions[0]!.sessionId, true)
+    expect(manager.setFullAutoMode).toHaveBeenNthCalledWith(2, sessions[1]!.sessionId, false)
+  })
+
+  it('explains why Agent mode could not determine an operation before showing help', async () => {
+    const interpreter = { translate: vi.fn(async () => ({
+      commands: ['/help'],
+      reason: '没有找到用户提到的 Agent',
+    })) }
+    const { manager, audit } = createRouter()
+    const router = new DingTalkCommandRouter(manager, audit, () => ({ ...settings, agentModeEnabled: true, agentBaseUrl: 'https://model.example/v1', agentApiKey: 'secret', agentModel: 'model-x' }), undefined, interpreter as never)
+
+    await expect(router.execute('处理那个任务', { staffId: 'staff-1' })).resolves.toContain('未执行：没有找到用户提到的 Agent')
+  })
 })

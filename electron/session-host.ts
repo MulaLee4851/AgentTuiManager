@@ -8,6 +8,7 @@ import * as pty from 'node-pty'
 
 import type { HostCommand, HostEvent, HostExitFact } from '../src/shared/protocol'
 import { environmentForAgent } from './agent-environment'
+import { ensureMacPtySpawnHelper } from './macos-pty-helper'
 import { TerminalReplayBuffer } from './terminal-replay-buffer'
 import { TerminalStateReplay } from './terminal-state-replay'
 
@@ -184,9 +185,10 @@ function spawnAgentTerminal(
   agentKind: Extract<HostCommand, { type: 'start' }>['agentKind'],
   executable: string,
   args: string[],
-  options: pty.IWindowsPtyForkOptions,
+  options: pty.IPtyForkOptions,
 ): pty.IPty {
-  if (agentKind !== 'codex') return pty.spawn(executable, args, options)
+  if (process.platform === 'darwin') ensureMacPtySpawnHelper()
+  if (agentKind !== 'codex' || process.platform !== 'win32') return pty.spawn(executable, args, options)
   try {
     return pty.spawn(executable, args, { ...options, useConptyDll: true })
   } catch {
@@ -208,7 +210,7 @@ function startTerminal(socket: Socket, command: Extract<HostCommand, { type: 'st
       : command.agentKind === 'codex'
         ? codexArgs(command.args)
         : command.args
-    const spawnOptions: pty.IWindowsPtyForkOptions = {
+    const spawnOptions: pty.IPtyForkOptions = {
       cwd: command.cwd,
       cols: command.cols,
       rows: command.rows,
@@ -221,7 +223,7 @@ function startTerminal(socket: Socket, command: Extract<HostCommand, { type: 'st
       name: 'xterm-256color',
       // Codex's Windows inline viewport needs ConPTY to inherit the cursor anchor;
       // without this it falls back to a 30-row repaint with no terminal scrollback.
-      ...(command.agentKind === 'codex' ? { conptyInheritCursor: true } : {}),
+      ...(process.platform === 'win32' && command.agentKind === 'codex' ? { conptyInheritCursor: true } : {}),
     }
     terminal = spawnAgentTerminal(command.agentKind, command.executable, args, spawnOptions)
     terminalStateReplay = command.agentKind === 'codex'
@@ -271,6 +273,10 @@ function handleCommand(socket: Socket, command: HostCommand): void {
         ...(command.targetPaths ? { targetPaths: command.targetPaths } : {}),
         ...(command.toolInputSummary ? { toolInputSummary: command.toolInputSummary } : {}),
         ...(command.reason ? { reason: command.reason } : {}),
+        ...(command.toolUseId ? { toolUseId: command.toolUseId } : {}),
+        ...(command.agentId ? { agentId: command.agentId } : {}),
+        ...(command.agentType ? { agentType: command.agentType } : {}),
+        ...(command.toolInputFingerprint ? { toolInputFingerprint: command.toolInputFingerprint } : {}),
       })
       break
     case 'permission-response': {

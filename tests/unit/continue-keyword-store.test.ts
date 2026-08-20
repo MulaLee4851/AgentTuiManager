@@ -17,6 +17,15 @@ describe('ContinueKeywordStore', () => {
     expect(JSON.parse(await readFile(path, 'utf8'))).toMatchObject({ version: 1, enabled: true, quietSeconds: 7 })
   })
 
+  it('matches only when a keyword intersects the newly received output', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'continue-keyword-'))
+    const store = await ContinueKeywordStore.load(join(root, 'settings.json'))
+    await store.update({ enabled: true, quietSeconds: 10, keywords: ['model busy'] })
+
+    expect(store.matchIncremental('old model busy message', 'unrelated redraw')).toBeUndefined()
+    expect(store.matchIncremental('the model ', 'BUSY now')).toBe('model busy')
+    expect(store.matchIncremental('', '\x1b[31mMODEL BUSY\x1b[0m')).toBe('model busy')
+  })
   it('matches case-insensitively across ANSI output', async () => {
     const root = await mkdtemp(join(tmpdir(), 'continue-keyword-'))
     const store = await ContinueKeywordStore.load(join(root, 'settings.json'))

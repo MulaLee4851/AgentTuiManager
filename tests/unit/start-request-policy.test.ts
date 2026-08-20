@@ -11,14 +11,17 @@ describe('start request policy', () => {
     expect(validateExecutable('deepseek', 'dsh.cmd', '')).toBe('dsh.cmd')
     expect(validateExecutable('generic', 'cmd.exe', '')).toBe('cmd.exe')
     expect(validateExecutable('generic', 'pwsh.exe', '')).toBe('pwsh.exe')
+    expect(validateExecutable('generic', 'zsh', '', 'darwin')).toBe('zsh')
+    expect(validateExecutable('generic', 'bash', '', 'linux')).toBe('bash')
     expect(() => validateExecutable('codex', 'claude.cmd', '')).toThrow(/allowed/i)
     expect(() => validateExecutable('generic', 'node.exe', '')).toThrow(/allowed/i)
     expect(() => validateExecutable('codex', 'C:\\tools\\codex.exe', '')).toThrow(/allowed/i)
   })
 
   it('allows only an exactly configured normalized absolute executable path', () => {
-    expect(validateExecutable('codex', 'C:\\Tools\\agent-wrapper.exe', 'c:\\tools\\agent-wrapper.exe')).toBe('C:\\Tools\\agent-wrapper.exe')
-    expect(() => validateExecutable('codex', 'C:\\Other\\agent-wrapper.exe', 'c:\\tools\\agent-wrapper.exe')).toThrow(/allowed/i)
+    expect(validateExecutable('codex', 'C:\\Tools\\agent-wrapper.exe', 'c:\\tools\\agent-wrapper.exe', 'win32')).toBe('C:\\Tools\\agent-wrapper.exe')
+    expect(() => validateExecutable('codex', 'C:\\Other\\agent-wrapper.exe', 'c:\\tools\\agent-wrapper.exe', 'win32')).toThrow(/allowed/i)
+    expect(validateExecutable('codex', '/opt/custom/codex', '/usr/bin/other:/opt/custom/codex', 'darwin')).toBe('/opt/custom/codex')
     expect(() => validateExecutable('codex', 'agent-wrapper.exe', 'agent-wrapper.exe')).toThrow(/allowed/i)
   })
 

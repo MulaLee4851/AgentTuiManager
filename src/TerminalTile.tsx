@@ -66,7 +66,8 @@ export function terminalCellSize(terminal: Terminal): { width: number; height: n
 }
 
 export function isTerminalProtocolResponse(data: string): boolean {
-  return /^(?:(?:\x1b\[\??\d+;\d+R|\x1b\[\??[\d;]*c|\x1b\[>[\d;]*c|\x1b\[\?[\d;]*u)|(?:\x1b\](?:10|11|12);rgb:[\da-f]{1,4}\/[\da-f]{1,4}\/[\da-f]{1,4}(?:\x07|\x1b\\)))+$/i.test(data)
+  // ESC [ C/D are normal right/left arrow input, not device responses.
+  return /^(?:(?:\x1b\[\??\d+;\d+R|\x1b\[\??[\d;]+c|\x1b\[>[\d;]+c|\x1b\[\?[\d;]+u)|(?:\x1b\](?:10|11|12);rgb:[\da-f]{1,4}\/[\da-f]{1,4}\/[\da-f]{1,4}(?:\x07|\x1b\\)))+$/i.test(data)
 }
 
 function isClosedPreviousHostError(message: string): boolean {
@@ -147,6 +148,8 @@ export default function TerminalTile({ session, detail = false, embedded = false
     let pendingTerminalInput = ''
     let inputFrame = 0
     let disposed = false
+    let terminalRefreshTimer: ReturnType<typeof setTimeout> | undefined
+    let terminalRefreshPending = false
     // How far above the newest line the user has scrolled, counted from the bottom rather
     // than as an absolute row. Once the scrollback is full xterm drops the oldest line on
     // every new one, which shifts every absolute index down; pinning to one dragged the
@@ -235,6 +238,14 @@ export default function TerminalTile({ session, detail = false, embedded = false
         writeInFlight = false
         replayProtocolResponsesBlocked = false
         restoreUserScroll()
+        if (terminalRefreshPending) {
+          terminalRefreshPending = false
+          if (terminalRefreshTimer) {
+            clearTimeout(terminalRefreshTimer)
+            terminalRefreshTimer = undefined
+          }
+          terminal.refresh(0, Math.max(0, terminal.rows - 1))
+        }
         if (synchronizedResizeRedraw) {
           if (resizeWasAtBottom && userScrollOffset === undefined) programmaticScroll(() => terminal.scrollToBottom())
           requestAnimationFrame(() => requestAnimationFrame(hideResizeCover))
@@ -397,6 +408,20 @@ export default function TerminalTile({ session, detail = false, embedded = false
         pendingOutput += event.data
         if (resizeRedrawActive) scheduleResizeRedrawFlush()
         else if (!outputFrame) outputFrame = requestAnimationFrame(flushOutput)
+      } else if ('sessionId' in event && event.sessionId === session.sessionId && event.type === 'terminal-refresh-requested') {
+        // Auto-approval can leave xterm's canvas one paint behind even though the PTY and
+        // buffer are already progressing. Repaint the existing viewport only: never fit,
+        // resize, remount, or scroll, since those actions reflow native TUIs and can move a
+        // user who is reading history. Prefer the next completed write so the repaint sees
+        // the newest frame; the timer also recovers a canvas when no further output arrives.
+        terminalRefreshPending = true
+        if (terminalRefreshTimer) clearTimeout(terminalRefreshTimer)
+        terminalRefreshTimer = setTimeout(() => {
+          terminalRefreshTimer = undefined
+          if (!terminalRefreshPending || disposed) return
+          terminalRefreshPending = false
+          terminal.refresh(0, Math.max(0, terminal.rows - 1))
+        }, 180)
       }
     })
     void window.agentManager.terminalReplay(session.sessionId).then((snapshot) => {
@@ -493,6 +518,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
       if (ptyResizeTimer) clearTimeout(ptyResizeTimer)
       if (resizeRedrawTimer) clearTimeout(resizeRedrawTimer)
       if (resizeCoverFailsafeTimer) clearTimeout(resizeCoverFailsafeTimer)
+      if (terminalRefreshTimer) clearTimeout(terminalRefreshTimer)
       if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer)
       resizeCover?.remove()
       pendingOutput = ''

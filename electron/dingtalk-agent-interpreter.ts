@@ -4,6 +4,7 @@ import type { ApprovalRequest, SessionSummary } from '../src/shared/manager-api'
 import type { StoredDingTalkSettings } from './dingtalk-settings-store'
 
 export interface DingTalkAgentSnapshot { sessions: SessionSummary[]; approvals: ApprovalRequest[] }
+export interface DingTalkAgentTranslation { commands: string[]; reason?: string }
 
 const ACTIONS = new Set(['help', 'agents', 'pending', 'approve', 'approve_all', 'status', 'tail', 'workspace', 'send', 'stop', 'restart', 'auto_on', 'auto_off', 'audit'])
 const BASE_RETRY_DELAY_MS = 500
@@ -69,15 +70,30 @@ export function commandFromAgentResponse(value: unknown): string {
   }
 }
 
+export function commandsFromAgentResponse(value: unknown): DingTalkAgentTranslation {
+  if (!value || typeof value !== 'object') throw new Error('模型没有返回有效操作')
+  const object = value as Record<string, unknown>
+  const actions = Array.isArray(object.actions) ? object.actions : [value]
+  if (actions.length === 0) throw new Error('模型没有返回任何操作')
+  if (actions.length > 8) throw new Error('模型一次返回的操作过多，最多支持 8 个')
+  const commands = actions.map(commandFromAgentResponse)
+  const suppliedReason = typeof object.reason === 'string' ? object.reason.trim().slice(0, 1_000) : ''
+  const needsReason = commands.every((command) => command === '/help')
+  return {
+    commands,
+    ...(suppliedReason ? { reason: suppliedReason } : needsReason ? { reason: '没有识别到明确且受支持的 Manager 操作' } : {}),
+  }
+}
+
 export class DingTalkAgentInterpreter {
-  async translate(input: string, settings: StoredDingTalkSettings, snapshot: DingTalkAgentSnapshot): Promise<string> {
+  async translate(input: string, settings: StoredDingTalkSettings, snapshot: DingTalkAgentSnapshot): Promise<DingTalkAgentTranslation> {
     if (!settings.agentBaseUrl || !settings.agentApiKey || !settings.agentModel) throw new Error('Agent 模式配置不完整')
     const request = () => axios.post(endpoint(settings.agentBaseUrl!), {
       model: settings.agentModel,
       temperature: 0,
       response_format: { type: 'json_object' },
       messages: [
-        { role: 'system', content: '你是 Agent TUI Manager 的远程操作转换器。只返回一个 JSON 对象，不要解释。字段：action（help|agents|pending|approve|approve_all|status|tail|workspace|send|stop|restart|auto_on|auto_off|audit），可选 target、content、requestId。auto_on/auto_off 用于开启或关闭指定 Agent 的全自动审批模式。只能选择一个动作，禁止生成 shell 命令、路径写入或未列出的动作。用户意图不明确时返回 {"action":"help"}。' },
+        { role: 'system', content: '你是 Agent TUI Manager 的远程操作转换器。只返回一个 JSON 对象，不要解释。格式：{"actions":[{"action":"动作名","target":"可选目标","content":"可选内容","requestId":"可选审批ID"}],"reason":"可选说明"}。动作名只能是 help|agents|pending|approve|approve_all|status|tail|workspace|send|stop|restart|auto_on|auto_off|audit。必须把用户一条消息中的每个明确意图按原顺序放入 actions，最多 8 个，不得遗漏；例如同时开启 A、关闭 B，应返回两个动作。auto_on/auto_off 用于开启或关闭指定 Agent 的全自动审批模式。禁止生成 shell 命令、路径写入或未列出的动作。若无法确定目标、意图不明确或没有受支持的动作，只返回一个 help 动作，并在 reason 中用中文明确说明为什么没有执行，不能只返回 help。' },
         { role: 'user', content: JSON.stringify({ request: input, agents: snapshot.sessions.map((item) => ({ id: item.sessionId.slice(0, 8), name: item.displayName, status: item.status, workspace: item.workspace })), pending: snapshot.approvals.map((item) => ({ requestId: item.requestId, agent: item.displayName, tool: item.toolName, risk: item.risk })) }) },
       ],
     }, {
@@ -94,6 +110,6 @@ export class DingTalkAgentInterpreter {
     if (typeof content !== 'string' || content.length > 20_000) throw new Error('模型响应格式无效')
     let parsed: unknown
     try { parsed = JSON.parse(content) } catch { throw new Error('模型没有返回合法 JSON') }
-    return commandFromAgentResponse(parsed)
+    return commandsFromAgentResponse(parsed)
   }
 }

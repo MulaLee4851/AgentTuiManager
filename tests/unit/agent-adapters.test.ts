@@ -118,6 +118,54 @@ describe('native agent adapters', () => {
     })
   })
 
+  it('recognizes the Codex MCP approval form without relying on an OSC notification', () => {
+    const adapter = createAgentAdapter('codex')
+    expect(adapter.observeOutput([
+      'Field 1/1',
+      'Allow the codegraph MCP server to run tool "codegraph_explore"?',
+      '',
+      'maxFiles: 12',
+      'projectPath: B:\AiDemo\AgentTuiManager',
+    ].join('\r\n'))).toMatchObject({
+      approvalRequired: true,
+      approvalCommand: 'mcp:codegraph/codegraph_explore',
+      ready: false,
+    })
+  })
+  it('refines an on-screen Codex shell placeholder when the command arrives without another OSC notification', () => {
+    const adapter = createAgentAdapter('codex')
+    expect(adapter.observeOutput([
+      '\x1b]9;Approval requested: npm run typecheck\x07',
+      'Would you like to run the following command?',
+      '1. Yes, proceed',
+      '2. No',
+    ].join('\r\n'))).toMatchObject({
+      approvalRequired: true,
+      approvalCommand: 'tool:Shell',
+    })
+
+    expect(adapter.observeOutput('\r\n$ npm run typecheck\r\n')).toMatchObject({
+      approvalRequired: true,
+      approvalCommand: 'npm run typecheck',
+    })
+  })
+
+  it('recognizes a Codex approval when OSC and ANSI sequences span output chunks', () => {
+    const adapter = createAgentAdapter('codex')
+    expect(adapter.observeOutput('\x1b]9;Codex wants to ed').approvalRequired).toBe(false)
+    expect(adapter.observeOutput('it src/App.tsx\x07')).toMatchObject({
+      approvalRequired: true,
+      approvalCommand: 'tool:Edit',
+    })
+
+    adapter.acknowledgeUserInput(true)
+    expect(adapter.observeOutput('Would you like to run the following command?\r\n$ Get-Content -LiteralPath \x1b[38;2;').approvalRequired).toBe(false)
+    expect(adapter.observeOutput('243;139;168mfile.txt\x1b[0m\r\n1. Yes, proceed')).toMatchObject({
+      approvalRequired: true,
+      approvalCommand: 'Get-Content -LiteralPath file.txt',
+    })
+  })
+
   it('uses only the official DeepSeek Harness readiness URL and never guesses approvals', () => {
     const adapter = createAgentAdapter('deepseek')
     expect(adapter.observeOutput('starting web server…\r\n')).toEqual({ approvalRequired: false, ready: false })
@@ -131,10 +179,10 @@ describe('native agent adapters', () => {
     expect(adapter.recoveryRecipe('dsh', 'not-used')).toBeUndefined()
   })
 
-  it('uses Exec OSC only as a signal and waits for the full modal command', () => {
+  it('surfaces an Exec OSC immediately while waiting for the full modal command', () => {
     const adapter = createAgentAdapter('codex')
     expect(adapter.observeOutput('\x1b]9;Approval requested: Remove-Item -Recurse very-lon\x07')).toMatchObject({
-      approvalRequired: false,
+      approvalRequired: true,
       approvalCommand: 'tool:Shell',
     })
     expect(adapter.observeOutput([
@@ -147,6 +195,18 @@ describe('native agent adapters', () => {
     })
   })
 
+  it('recognizes option-only modal output after a long Codex repaint', () => {
+    const adapter = createAgentAdapter('codex')
+    expect(adapter.observeOutput('\x1b]9;Approval requested: npm test\x07')).toMatchObject({
+      approvalRequired: true,
+      approvalCommand: 'tool:Shell',
+    })
+    expect(adapter.observeOutput(`\x1b[12;1H${'.'.repeat(700)}`).approvalRequired).toBe(true)
+    expect(adapter.observeOutput('\r\n1. Yes, proceed\r\n2. No')).toMatchObject({
+      approvalRequired: true,
+      approvalCommand: 'tool:Shell',
+    })
+  })
   it('recognizes the other official Codex approval titles', () => {
     expect(createAgentAdapter('codex').observeOutput(
       'Would you like to grant these permissions?\r\n1. Yes, proceed\r\n2. No',

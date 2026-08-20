@@ -1,5 +1,6 @@
 import type { AgentKind } from '../src/shared/manager-api'
-import { environmentWithFreshWindowsPath, type WindowsPathRefreshOptions } from './windows-environment'
+import { environmentWithFreshPath } from './platform-environment'
+import type { WindowsPathRefreshOptions } from './windows-environment'
 
 const CODEX_PARENT_MARKERS = [
   'CODEX_THREAD_ID',
@@ -55,7 +56,7 @@ function applyManagedTerminalCapabilities(environment: NodeJS.ProcessEnv, agentK
   // launches have no WT_SESSION and no TERM; fill only the missing keys.
   if (keyOf(environment, 'WT_SESSION')) return
   fillMissing(environment, MANAGED_TERMINAL_CAPABILITIES)
-  if (agentKind === 'claude') fillMissing(environment, CLAUDE_WINDOWS_VT_IDENTITY)
+  if (agentKind === 'claude' && process.platform === 'win32') fillMissing(environment, CLAUDE_WINDOWS_VT_IDENTITY)
   if (agentKind === 'codex') fillMissing(environment, CODEX_TERMINAL_CAPABILITIES)
 }
 
@@ -64,8 +65,8 @@ export function environmentForAgent(
   source: NodeJS.ProcessEnv = process.env,
   pathRefreshOptions: WindowsPathRefreshOptions = {},
 ): Record<string, string> {
-  const environment: NodeJS.ProcessEnv = agentKind === 'pi'
-    ? environmentWithFreshWindowsPath(source, pathRefreshOptions)
+  const environment: NodeJS.ProcessEnv = agentKind === 'pi' || process.platform === 'darwin'
+    ? environmentWithFreshPath(source, pathRefreshOptions)
     : { ...source }
   if (agentKind === 'codex' && CODEX_PARENT_MARKERS.some((name) => keyOf(source, name) !== undefined)) {
     for (const name of CODEX_PARENT_MARKERS) remove(environment, name)

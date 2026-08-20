@@ -136,9 +136,9 @@ export default function AttentionCenter({
               onClick={() => setSelectedKey(item.key)}
             >
               <i className='severity' />
-              <span><span className='queue-top'><strong>{item.request.displayName}</strong><em>{risk.label}</em></span>
+              <span><span className='queue-top'><strong>{item.request.displayName}</strong><em>{item.request.llmReviewStatus === 'pending' ? 'LLM 审查中' : risk.label}</em></span>
                 <span className='queue-command'>{item.request.toolName ? item.request.toolName + ' · ' : ''}{approvalDisplay(item.request)}</span>
-                <span className='queue-meta'>{item.request.agentKind.toUpperCase()} · {item.request.workspace}</span>
+                <span className='queue-meta'>{item.request.agentKind.toUpperCase()} · {item.request.workspace}{item.request.dangerRuleName ? ' · 命中：' + item.request.dangerRuleName : ''}</span>
               </span>
             </button>
           })}
@@ -197,7 +197,7 @@ function ApprovalDetail({
   const highRisk = request.risk === 'delete' || request.risk === 'write' || request.risk === 'unknown'
   const targets = approvalTargets(request)
   return <div className='attention-detail-inner'>
-    <p className={'detail-kicker ' + risk.tone}>{risk.label} · 需要本次确认</p>
+    <p className={'detail-kicker ' + risk.tone}>{risk.label} · 需要本次确认{request.dangerRuleName ? ' · 命中 ' + request.dangerRuleName : ''}</p>
     <h2>{approvalTitle(request)}</h2>
     <p className='detail-subtitle'>请求来自“{request.displayName}”会话 · {request.workspace} · 会话 {request.nativeSessionId ?? request.sessionId}</p>
     <section className='command-card'>
@@ -209,12 +209,25 @@ function ApprovalDetail({
       <div><span>文件影响</span><strong className={risk.tone}>{targets.length ? targets.length + ' 个目标' : risk.impact}</strong></div>
       <div><span>工具名称</span><strong>{request.toolName ?? '未提供'}</strong></div>
       <div><span>可恢复性</span><strong className={highRisk ? 'delete' : 'read'}>{risk.reversibility}</strong></div>
-      <div><span>自动学习</span><strong className={highRisk ? 'delete' : 'read'}>{risk.learning}</strong></div>
+      <div><span>{request.dangerRuleName ? '命中规则' : '自动学习'}</span><strong className={highRisk ? 'delete' : 'read'}>{request.dangerRuleName ?? risk.learning}</strong></div>
     </div>
     <div className={'approval-reason ' + (highRisk ? 'danger' : '')}>
-      <strong>{highRisk ? '为什么必须人工确认？' : '为什么这次仍需确认？'}</strong>
+      <strong>{request.dangerRuleName ? '命中高危规则「' + request.dangerRuleName + '」' : highRisk ? '为什么必须人工确认？' : '为什么这次仍需确认？'}</strong>
       <p>{request.reason}</p>
     </div>
+    {request.llmReviewStatus && <section className={'llm-approval-review status-' + request.llmReviewStatus}>
+      <header><div><strong>LLM 安全审查</strong><span>{request.llmReviewStatus === 'pending' ? '正在分析命令、路径和环境假设' : request.llmReviewStatus === 'failed' ? '审查失败 · 已转人工' : request.llmReview?.requiresHumanApproval ? '建议人工确认' : '可由全自动模式放行'}</span></div>{request.llmReview && <em>风险 {request.llmReview.riskScore}/100</em>}</header>
+      {request.llmReviewStatus === 'pending' && <p>本地硬规则仍然优先；等待期间不会自动执行。</p>}
+      {request.llmReviewError && <p>{request.llmReviewError}</p>}
+      {request.llmReview && <>
+        <h3>{request.llmReview.summary}</h3>
+        {request.llmReview.reasons.length > 0 && <div><strong>判断理由</strong><ul>{request.llmReview.reasons.map((reason, index) => <li key={index}>{reason}</li>)}</ul></div>}
+        {request.llmReview.hazards.length > 0 && <div className='hazards'><strong>风险点</strong><ul>{request.llmReview.hazards.map((hazard, index) => <li key={index}>{hazard}</li>)}</ul></div>}
+        {request.llmReview.assumptions.length > 0 && <div><strong>路径与环境假设</strong><ul>{request.llmReview.assumptions.map((assumption, index) => <li key={index}>{assumption}</li>)}</ul></div>}
+        <footer><span>{request.llmReview.model}</span><span>{new Date(request.llmReview.reviewedAt).toLocaleString('zh-CN')}</span></footer>
+      </>}
+      <small>LLM 仅提供安全辅助判断，不能覆盖本地高危规则。</small>
+    </section>}
     {error && <p className='form-error'>{error}</p>}
     <div className='detail-actions'>
       <span>请求键：{request.requestId}</span>

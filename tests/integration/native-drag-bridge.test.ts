@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest'
 
 const execFileAsync = promisify(execFile)
 
-describe('native drag bridge', () => {
+describe.skipIf(process.platform !== 'win32')('native drag bridge', () => {
   it('builds and reports a versioned Windows protocol', async () => {
     await execFileAsync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', resolve('scripts/build-native-bridge.ps1')])
     const { stdout } = await execFileAsync(resolve('build/native/AgentTui.NativeBridge.exe'), ['--self-test'])

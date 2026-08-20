@@ -9,6 +9,10 @@ export interface StoredManagedSession {
   hostId: string
   summary: SessionSummary
   request?: StartSessionRequest
+  nativeCapture?: {
+    baselineIds: string[]
+    startedAt: number
+  }
   updatedAt: string
 }
 

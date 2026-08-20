@@ -3,6 +3,7 @@ import { contextBridge, ipcRenderer } from 'electron'
 import { IPC_CHANNELS, type AgentManagerApi, type ManagerEvent, type StartSessionRequest } from '../src/shared/manager-api'
 
 const api: AgentManagerApi = {
+  platform: process.platform,
   listSessions: () => ipcRenderer.invoke(IPC_CHANNELS.listSessions),
   terminalReplay: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.terminalReplay, sessionId),
   listAuditEntries: () => ipcRenderer.invoke(IPC_CHANNELS.listAuditEntries),
@@ -41,6 +42,14 @@ const api: AgentManagerApi = {
   listApprovalRules: () => ipcRenderer.invoke(IPC_CHANNELS.listApprovalRules),
   addApprovalRule: (command) => ipcRenderer.invoke(IPC_CHANNELS.addApprovalRule, command),
   removeApprovalRule: (command) => ipcRenderer.invoke(IPC_CHANNELS.removeApprovalRule, command),
+  listDangerRules: () => ipcRenderer.invoke(IPC_CHANNELS.listDangerRules),
+  addDangerRule: (input) => ipcRenderer.invoke(IPC_CHANNELS.addDangerRule, input),
+  setDangerRuleEnabled: (ruleId, enabled) => ipcRenderer.invoke(IPC_CHANNELS.setDangerRuleEnabled, ruleId, enabled),
+  removeDangerRule: (ruleId) => ipcRenderer.invoke(IPC_CHANNELS.removeDangerRule, ruleId),
+  testDangerCommand: (command) => ipcRenderer.invoke(IPC_CHANNELS.testDangerCommand, command),
+  getLlmReviewSettings: () => ipcRenderer.invoke(IPC_CHANNELS.getLlmReviewSettings),
+  updateLlmReviewSettings: (settings) => ipcRenderer.invoke(IPC_CHANNELS.updateLlmReviewSettings, settings),
+  reviewApprovalRules: () => ipcRenderer.invoke(IPC_CHANNELS.reviewApprovalRules),
   chooseWorkspace: () => ipcRenderer.invoke(IPC_CHANNELS.chooseWorkspace),
   chooseExecutable: (agentKind) => ipcRenderer.invoke(IPC_CHANNELS.chooseExecutable, agentKind),
   discoverSessions: (agentKind, workspace) => ipcRenderer.invoke(IPC_CHANNELS.discoverSessions, agentKind, workspace),

@@ -1,10 +1,12 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import net from 'node:net'
 
 interface HookInput {
   tool_name?: unknown
   tool_input?: unknown
   tool_use_id?: unknown
+  agent_id?: unknown
+  agent_type?: unknown
 }
 
 type ApprovalRisk = 'read' | 'write' | 'delete' | 'unknown'
@@ -37,6 +39,20 @@ function boundedText(value: unknown, maxLength: number): string | undefined {
   return typeof value === 'string' && value.length > 0 && value.length <= maxLength && !value.includes('\0')
     ? value
     : undefined
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value && typeof value === 'object') {
+    const input = value as Record<string, unknown>
+    return `{${Object.keys(input).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(input[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
+}
+
+function toolInputFingerprint(input: HookInput): string | undefined {
+  if (input.tool_input === undefined) return undefined
+  return createHash('sha256').update(canonicalJson(input.tool_input)).digest('hex')
 }
 
 function permissionDetails(input: HookInput): PermissionDetails {
@@ -84,6 +100,7 @@ async function main(): Promise<void> {
 
   const requestId = randomUUID()
   const details = permissionDetails(input)
+  const fingerprint = toolInputFingerprint(input)
   const response = await new Promise<'allow' | 'ask' | 'deny'>((resolve) => {
     const socket = net.createConnection(endpoint)
     let buffer = ''
@@ -99,6 +116,10 @@ async function main(): Promise<void> {
     socket.setEncoding('utf8')
     socket.once('connect', () => socket.write(`${JSON.stringify({
       type: 'permission-hook', token, requestId, toolName: input.tool_name,
+      ...(boundedText(input.tool_use_id, 256) ? { toolUseId: boundedText(input.tool_use_id, 256) } : {}),
+      ...(boundedText(input.agent_id, 256) ? { agentId: boundedText(input.agent_id, 256) } : {}),
+      ...(boundedText(input.agent_type, 128) ? { agentType: boundedText(input.agent_type, 128) } : {}),
+      ...(fingerprint ? { toolInputFingerprint: fingerprint } : {}),
       ...details,
     })}\n`))
     socket.on('data', (chunk) => {

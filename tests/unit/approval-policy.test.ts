@@ -156,8 +156,59 @@ describe('ApprovalPolicyEngine', () => {
     { command: 'sudo whoami', risk: 'unknown' as const, workspace: 'B:\\work' },
     { command: 'tool:Delete', toolName: 'Delete', risk: 'unknown' as const, workspace: 'B:\\work' },
     { command: 'tool:Shell', toolName: 'Shell', risk: 'unknown' as const, workspace: 'B:\\work' },
+    { command: 'tool:MCP', risk: 'unknown' as const, workspace: 'B:\\work' },
     { command: undefined, toolName: 'Bash', risk: 'unknown' as const, workspace: 'B:\\work' },
   ])('blocks unsafe or unbounded full-auto request: $command', (request) => {
     expect(canFullAutoApprove(request).allowed).toBe(false)
+  })
+
+  it('lists named built-in danger rules and explains every match for a command', () => {
+    const policy = new ApprovalPolicyEngine()
+    const rules = policy.listDangerRules()
+    expect(rules.find((rule) => rule.id === 'recursive-force-remove')).toMatchObject({
+      name: '递归或强制删除',
+      origin: 'built-in',
+      enabled: true,
+      scopes: ['safe-rule', 'bulk-approval', 'full-auto'],
+    })
+    expect(policy.testDangerCommand('rm -rf fixtures').matches.map((rule) => rule.id)).toContain('recursive-force-remove')
+    expect(policy.decide('rm -rf fixtures')).toMatchObject({
+      action: 'manual',
+      matchedDangerRule: { id: 'recursive-force-remove', name: '递归或强制删除' },
+      reason: expect.stringContaining('递归或强制删除'),
+    })
+    expect(() => policy.setDangerRuleEnabled('recursive-force-remove', false)).toThrow(/内置安全底线/)
+  })
+
+  it('uses enabled custom keyword rules for learning, bulk approval, and full-auto', () => {
+    const policy = new ApprovalPolicyEngine()
+    policy.addDangerRule({ id: 'custom-production', name: '生产环境', keyword: 'prod-db', enabled: true })
+    expect(policy.testDangerCommand('deploy prod-db --force').matches).toEqual([
+      expect.objectContaining({ id: 'custom-production', origin: 'custom' }),
+    ])
+    expect(policy.decide('deploy prod-db --force')).toMatchObject({
+      action: 'manual',
+      matchedDangerRule: { id: 'custom-production' },
+    })
+    expect(policy.canBulkApproveCommand('deploy prod-db --force')).toBe(false)
+    expect(policy.canFullAutoApprove({
+      command: 'deploy prod-db --force', risk: 'unknown', workspace: 'B:\\work',
+    })).toMatchObject({ allowed: false, reason: expect.stringContaining('生产环境') })
+    expect(() => policy.addRule('deploy prod-db --force')).toThrow(/生产环境/)
+
+    policy.setDangerRuleEnabled('custom-production', false)
+    expect(policy.testDangerCommand('deploy prod-db --force').matches).toEqual([])
+    expect(policy.canBulkApproveCommand('deploy prod-db --force')).toBe(true)
+    expect(policy.canFullAutoApprove({
+      command: 'deploy prod-db --force', risk: 'unknown', workspace: 'B:\\work',
+    }).allowed).toBe(true)
+    expect(() => policy.addRule('deploy prod-db --force')).not.toThrow()
+  })
+
+  it('rejects duplicate or invalid custom danger keywords', () => {
+    const policy = new ApprovalPolicyEngine()
+    policy.addDangerRule({ id: 'first', name: '生产环境', keyword: 'prod-db', enabled: true })
+    expect(() => policy.addDangerRule({ id: 'second', name: '重复', keyword: 'PROD-DB', enabled: true })).toThrow(/已由/)
+    expect(() => policy.addDangerRule({ id: 'third', name: '太短', keyword: 'x', enabled: true })).toThrow(/至少 2 个字符/)
   })
 })

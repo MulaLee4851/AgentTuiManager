@@ -12,6 +12,12 @@ interface StoredContinueKeywordSettings {
 }
 
 const DEFAULT_SETTINGS: ContinueKeywordSettings = { enabled: false, quietSeconds: 10, keywords: [] }
+function normalizeForMatch(value: string): string {
+  return value.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, ' ')
+    .replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])/g, '')
+    .replace(/\s+/g, ' ')
+    .toLocaleLowerCase('en-US')
+}
 const MAX_KEYWORDS = 50
 const MAX_KEYWORD_LENGTH = 200
 const MAX_FILE_BYTES = 128 * 1024
@@ -61,11 +67,26 @@ export class ContinueKeywordStore {
 
   match(value: string): string | undefined {
     if (!this.settings.enabled || this.settings.keywords.length === 0) return undefined
-    const normalized = value.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, ' ')
-      .replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])/g, '')
-      .replace(/\s+/g, ' ')
-      .toLocaleLowerCase('en-US')
-    return this.settings.keywords.find((keyword) => normalized.includes(keyword))
+    return this.settings.keywords.find((keyword) => normalizeForMatch(value).includes(keyword))
+  }
+
+  // Only return a match whose occurrence intersects the newly received chunk.
+  // This prevents a keyword left in the rolling tail from being re-triggered by
+  // an unrelated redraw or a later output chunk.
+  matchIncremental(previous: string, current: string): string | undefined {
+    if (!this.settings.enabled || this.settings.keywords.length === 0) return undefined
+    const previousNormalized = normalizeForMatch(previous)
+    const currentNormalized = normalizeForMatch(current)
+    const combined = previousNormalized + currentNormalized
+    return this.settings.keywords.find((keyword) => {
+      let start = combined.indexOf(keyword)
+      while (start >= 0) {
+        const end = start + keyword.length
+        if (start >= previousNormalized.length || end > previousNormalized.length) return true
+        start = combined.indexOf(keyword, start + 1)
+      }
+      return false
+    })
   }
 
   maxKeywordLength(): number {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { installCommandForAgent, installedExecutableVersion, packageForAgent, registryUrl, supportsDeepSeekNode } from '../../electron/agent-environment-manager'
+import { installCommandForAgent, installedExecutableVersion, needsMacNpmCompatibility, npmCompatibilityArchiveUrl, packageForAgent, registryUrl, supportsDeepSeekNode } from '../../electron/agent-environment-manager'
 import { mergeWindowsPaths } from '../../electron/windows-environment'
 
 describe('Agent environment installation catalog', () => {
@@ -17,15 +17,23 @@ describe('Agent environment installation catalog', () => {
     expect(registryUrl('tencent')).toBe('https://mirrors.cloud.tencent.com/npm/')
     expect(registryUrl('huawei')).toBe('https://repo.huaweicloud.com/repository/npm/')
   })
+
+  it('uses a temporary npm 10 installer only for npm 11 on macOS', () => {
+    expect(needsMacNpmCompatibility('11.6.2', 'darwin')).toBe(true)
+    expect(needsMacNpmCompatibility('10.9.2', 'darwin')).toBe(false)
+    expect(needsMacNpmCompatibility('11.6.2', 'win32')).toBe(false)
+    expect(npmCompatibilityArchiveUrl('https://registry.npmmirror.com/'))
+      .toBe('https://registry.npmmirror.com/npm/-/npm-10.9.2.tgz')
+  })
 })
 
-describe('Pi Windows PATH refresh', () => {
+describe('Agent executable detection fallback', () => {
   it('preserves inherited entries and appends newly installed locations once', () => {
     expect(mergeWindowsPaths(['C:\\existing;C:\\Shared', 'c:\\shared;D:\\new']))
       .toBe('C:\\existing;C:\\Shared;D:\\new')
   })
 
-  it('keeps Pi installed when its executable exists but the version probe does not exit', () => {
+  it('keeps any Agent installed when its executable exists but the version probe does not exit', () => {
     expect(installedExecutableVersion(undefined, true)).toBe('已检测到可执行文件（版本查询未结束）')
     expect(installedExecutableVersion(undefined, false)).toBeUndefined()
   })

@@ -1,5 +1,5 @@
 import { statSync } from 'node:fs'
-import { delimiter, win32 } from 'node:path'
+import { delimiter, posix, win32 } from 'node:path'
 
 export interface ExecutableResolutionOptions {
   platform?: NodeJS.Platform
@@ -22,7 +22,18 @@ function environmentValue(name: string): string | undefined {
 }
 
 export function resolveExecutableForPty(candidate: string, options: ExecutableResolutionOptions = {}): string {
-  if ((options.platform ?? process.platform) !== 'win32' || win32.isAbsolute(candidate)) return candidate
+  const platform = options.platform ?? process.platform
+  if (platform !== 'win32') {
+    if (platform !== 'darwin' || posix.isAbsolute(candidate) || candidate.includes('/')) return candidate
+    const isFile = options.isFile ?? existingFile
+    const path = options.path ?? environmentValue('PATH') ?? ''
+    for (const directory of path.split(':').map((value) => value.trim()).filter(Boolean)) {
+      const resolved = posix.join(directory.replace(/^"|"$/g, ''), candidate)
+      if (isFile(resolved)) return resolved
+    }
+    throw new Error(`Executable not found in PATH: ${candidate}`)
+  }
+  if (win32.isAbsolute(candidate)) return candidate
   if (candidate.includes('/') || candidate.includes('\\')) return candidate
 
   const isFile = options.isFile ?? existingFile

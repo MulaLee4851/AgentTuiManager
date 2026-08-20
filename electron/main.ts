@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, safeStorage, Tray, type IpcMainInvokeEvent } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, net, safeStorage, Tray, type IpcMainInvokeEvent } from 'electron'
 import { statSync } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { delimiter, isAbsolute, join } from 'node:path'
@@ -8,6 +8,7 @@ import { SessionHostManager } from './session-host-manager'
 import { discoverNativeSessions, discoverRecentNativeSessions } from './native-session-discovery'
 import { canonicalNativeRecovery, terminalScrollbackArgs, validateExecutable } from './start-request-policy'
 import { ApprovalPolicyStore } from './approval-policy-store'
+import { classifyApprovalRisk } from './approval-policy'
 import { resolveExecutableForPty } from './executable-resolution'
 import { ActivityAuditStore, type NewAuditEntry } from './activity-audit-store'
 import { RecoveryPolicyStore } from './recovery-policy-store'
@@ -28,8 +29,10 @@ import { openNativeResumeTerminal } from './native-terminal'
 import { safeAuditExport } from './audit-export'
 import { NativeDragBridge, type NativeDragEvent } from './native-drag-bridge'
 import { detectAgentEnvironment, installAgent, installNodeAndNpm, installRipgrep } from './agent-environment-manager'
-import { environmentWithFreshWindowsPath, pathFromEnvironment } from './windows-environment'
-import { IPC_CHANNELS, type AgentConfigInput, type AgentKind, type AgentProxyInput, type ApprovalRequest, type AuditEntry, type ContinueKeywordSettings, type DingTalkSettingsInput, type ExternalTerminalDragProjection, type ManagerEvent, type NativeSessionSummary, type NpmRegistryChoice, type RecoveryRecipe, type SessionSafetySettings, type SessionSummary, type StartSessionRequest } from '../src/shared/manager-api'
+import { environmentWithFreshPath, pathFromEnvironment } from './platform-environment'
+import { LlmReviewSettingsStore } from './llm-review-settings-store'
+import { LlmSecurityReviewer } from './llm-security-reviewer'
+import { IPC_CHANNELS, type AgentConfigInput, type AgentKind, type AgentProxyInput, type ApprovalRequest, type AuditEntry, type ContinueKeywordSettings, type DingTalkSettingsInput, type ExternalTerminalDragProjection, type LlmReviewSettingsInput, type LlmRuleAuditFinding, type LlmRuleAuditResult, type LlmRuleAuditState, type ManagerEvent, type NativeSessionSummary, type NpmRegistryChoice, type RecoveryRecipe, type SessionSafetySettings, type SessionSummary, type StartSessionRequest } from '../src/shared/manager-api'
 
 let mainWindow: BrowserWindow | undefined
 let tray: Tray | undefined
@@ -42,6 +45,11 @@ let sessionSafetyStore: SessionSafetyStore
 let sessionCatalog: ManagedSessionCatalog
 let dingTalkSettingsStore: DingTalkSettingsStore
 let dingTalkStreamService: DingTalkStreamService
+let llmReviewSettingsStore: LlmReviewSettingsStore
+const llmSecurityReviewer = new LlmSecurityReviewer()
+let llmRuleAuditTimer: ReturnType<typeof setTimeout> | undefined
+let llmRuleAuditInFlight: Promise<LlmRuleAuditResult> | undefined
+let llmRuleAuditState: LlmRuleAuditState = { status: 'idle' }
 let nativeDragBridge: NativeDragBridge | undefined
 const ccSwitchProviderReader = new CCSwitchProviderReader()
 let quitting = false
@@ -61,6 +69,7 @@ const MAX_TERMINAL_INPUT = 64 * 1024
 // completely dormant in normal builds until explicitly enabled for controlled
 // testing; managed Agent drag-out is independent of this bridge.
 const ENABLE_NATIVE_DRAG_IN_BETA = process.env.AGENT_TUI_ENABLE_NATIVE_DRAG_IN_BETA === '1'
+const DINGTALK_APPROVAL_NOTIFICATION_DELAY_MS = 300
 const APP_LOGO_PATH = join(app.getAppPath(), 'logo', 'AgentTuiManager.png')
 function text(value: unknown, name: string, max = MAX_TEXT): string {
   if (typeof value !== 'string' || value.length === 0 || value.length > max || value.includes('\0')) throw new Error(`Invalid ${name}`)
@@ -94,7 +103,7 @@ function executable(agentKind: AgentKind, value: unknown): string {
   const candidate = text(value, 'executable', 1_024)
   const configured = [process.env.AGENT_TUI_ALLOWED_EXECUTABLES ?? '', ...userSelectedExecutables].filter(Boolean).join(delimiter)
   const validated = validateExecutable(agentKind, candidate, configured)
-  const environment = agentKind === 'generic' ? process.env : environmentWithFreshWindowsPath()
+  const environment = agentKind === 'generic' ? process.env : environmentWithFreshPath()
   return resolveExecutableForPty(validated, { path: pathFromEnvironment(environment) })
 }
 
@@ -226,6 +235,40 @@ function dingTalkSettings(value: unknown): DingTalkSettingsInput {
     ...(agentProxyUsername ? { agentProxyUsername } : {}),
     ...(agentProxyPassword ? { agentProxyPassword } : {}),
     ...(input.clearAgentProxyPassword === true ? { clearAgentProxyPassword: true } : {}),
+  }
+}
+
+function llmReviewSettings(value: unknown): LlmReviewSettingsInput {
+  if (!value || typeof value !== 'object') throw new Error('LLM 审查设置格式无效')
+  const input = value as Record<string, unknown>
+  const level = input.level
+  if (level !== 'low' && level !== 'medium' && level !== 'high') throw new Error('LLM 审查等级无效')
+  if (!Number.isInteger(input.retryCount) || Number(input.retryCount) < 0 || Number(input.retryCount) > 10) throw new Error('LLM 审查失败重试次数必须是 0 到 10 的整数')
+  if (!Number.isInteger(input.timeoutSeconds) || Number(input.timeoutSeconds) < 5 || Number(input.timeoutSeconds) > 600) throw new Error('LLM 审查单次请求超时必须是 5 到 600 秒的整数')
+  if (!Number.isInteger(input.scheduledRuleAuditHours) || Number(input.scheduledRuleAuditHours) < 1 || Number(input.scheduledRuleAuditHours) > 720) throw new Error('定时审查周期必须是 1 到 720 小时的整数')
+  const baseUrl = optionalConfigText(input.baseUrl, 'LLM review Base URL', 2_048)
+  const apiKey = optionalConfigText(input.apiKey, 'LLM review API Key', 8_192)
+  const model = optionalConfigText(input.model, 'LLM review Model', 256)
+  const proxyHost = optionalConfigText(input.proxyHost, 'LLM review proxy host', 512)
+  const proxyUsername = optionalConfigText(input.proxyUsername, 'LLM review proxy username', 512)
+  const proxyPassword = optionalConfigText(input.proxyPassword, 'LLM review proxy password', 2_048)
+  return {
+    enabled: input.enabled === true,
+    level,
+    ...(baseUrl ? { baseUrl } : {}),
+    ...(apiKey ? { apiKey } : {}),
+    ...(input.clearApiKey === true ? { clearApiKey: true } : {}),
+    ...(model ? { model } : {}),
+    retryCount: Number(input.retryCount),
+    timeoutSeconds: Number(input.timeoutSeconds),
+    scheduledRuleAuditEnabled: input.scheduledRuleAuditEnabled === true,
+    scheduledRuleAuditHours: Number(input.scheduledRuleAuditHours),
+    proxyEnabled: input.proxyEnabled === true,
+    ...(proxyHost ? { proxyHost } : {}),
+    ...(Number.isInteger(input.proxyPort) && Number(input.proxyPort) >= 1 && Number(input.proxyPort) <= 65_535 ? { proxyPort: Number(input.proxyPort) } : {}),
+    ...(proxyUsername ? { proxyUsername } : {}),
+    ...(proxyPassword ? { proxyPassword } : {}),
+    ...(input.clearProxyPassword === true ? { clearProxyPassword: true } : {}),
   }
 }
 
@@ -533,6 +576,102 @@ function recordAudit(entry: NewAuditEntry): void {
     : entry.details
   auditStore.append({ ...entry, ...(details ? { details } : {}) })
   broadcast({ type: 'audit-changed' })
+}
+
+function deterministicRuleFindings(approvalPolicy: ApprovalPolicyStore): LlmRuleAuditFinding[] {
+  const findings: LlmRuleAuditFinding[] = []
+  for (const rule of approvalPolicy.listRules()) {
+    const dangerMatches = approvalPolicy.testDangerCommand(rule).matches.filter((match) => match.scopes.includes('safe-rule'))
+    const risk = classifyApprovalRisk(rule)
+    if (dangerMatches.length > 0) {
+      findings.push({
+        rule,
+        severity: risk === 'delete' ? 'critical' : 'high',
+        issue: '确定性扫描命中高危规则：' + dangerMatches.map((match) => match.name).join('、'),
+        recommendation: '立即人工复核并从自动批准规则中移除；LLM 结论不能覆盖该命中。',
+      })
+    } else if (risk === 'write' || risk === 'delete') {
+      findings.push({
+        rule,
+        severity: risk === 'delete' ? 'critical' : 'high',
+        issue: `确定性扫描将该规则识别为${risk === 'delete' ? '删除' : '写入'}操作。`,
+        recommendation: '从自动批准规则中移除并改为逐次人工确认。',
+      })
+    }
+  }
+  return findings
+}
+
+async function runLlmRuleAudit(approvalPolicy: ApprovalPolicyStore, source: 'manual' | 'scheduled'): Promise<LlmRuleAuditResult> {
+  if (llmRuleAuditInFlight) return llmRuleAuditInFlight
+  const operation = (async () => {
+    const settings = llmReviewSettingsStore.getRuntimeSettings()
+    const approvalRules = approvalPolicy.listRules()
+    const startedAt = Date.now()
+    llmRuleAuditState = { status: 'running', source, startedAt }
+    recordAudit({
+      level: 'info', category: 'review', action: 'llm_rule_audit_started',
+      message: source === 'manual' ? '已手动启动 LLM 批准规则审查' : '已按计划启动 LLM 批准规则审查',
+      details: { source, ruleCount: approvalRules.length, model: settings.model ?? 'not-configured' },
+    })
+    try {
+      const result = await llmSecurityReviewer.reviewRuleSet(
+        approvalRules,
+        approvalPolicy.listDangerRules(),
+        deterministicRuleFindings(approvalPolicy),
+        settings,
+      )
+      await llmReviewSettingsStore.recordRuleAudit(result)
+      llmRuleAuditState = { status: 'completed', source, startedAt, completedAt: result.reviewedAt }
+      recordAudit({
+        level: result.findings.some((finding) => finding.severity === 'critical' || finding.severity === 'high') ? 'warning' : 'info',
+        category: 'review', action: 'llm_rule_audit_completed',
+        message: `LLM 批准规则审查完成：发现 ${result.findings.length} 项问题`,
+        details: {
+          source, ruleCount: result.ruleCount, findingCount: result.findings.length,
+          model: result.model, summary: result.summary,
+          findings: JSON.stringify(result.findings.slice(0, 8).map((finding) => ({
+            rule: finding.rule.slice(0, 500), severity: finding.severity,
+            issue: finding.issue.slice(0, 500), recommendation: finding.recommendation.slice(0, 500),
+          }))),
+          findingsTruncated: result.findings.length > 8,
+        },
+      })
+      return result
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      llmRuleAuditState = { status: 'failed', source, startedAt, completedAt: Date.now(), error: message }
+      recordAudit({
+        level: 'error', category: 'review', action: 'llm_rule_audit_failed',
+        message: 'LLM 批准规则审查失败，规则未被修改',
+        details: { source, error: message },
+      })
+      throw error
+    }
+  })()
+  llmRuleAuditInFlight = operation
+  try { return await operation } finally { llmRuleAuditInFlight = undefined }
+}
+
+function scheduleLlmRuleAudit(approvalPolicy: ApprovalPolicyStore): void {
+  if (llmRuleAuditTimer) clearTimeout(llmRuleAuditTimer)
+  llmRuleAuditTimer = undefined
+  const settings = llmReviewSettingsStore.getRuntimeSettings()
+  if (!settings.scheduledRuleAuditEnabled) return
+  const intervalMs = settings.scheduledRuleAuditHours * 60 * 60 * 1_000
+  const dueAt = (settings.lastRuleAudit?.reviewedAt ?? Date.now()) + intervalMs
+  const arm = (): void => {
+    const remaining = dueAt - Date.now()
+    if (remaining <= 0) {
+      void runLlmRuleAudit(approvalPolicy, 'scheduled')
+        .catch(() => undefined)
+        .finally(() => scheduleLlmRuleAudit(approvalPolicy))
+      return
+    }
+    llmRuleAuditTimer = setTimeout(arm, Math.min(remaining, 2_000_000_000))
+    llmRuleAuditTimer.unref?.()
+  }
+  arm()
 }
 
 async function restoreNativeSessionProvider(session: SessionSummary | undefined): Promise<boolean> {
@@ -930,6 +1069,79 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
     await approvalPolicy.removeRule(text(command, 'approval rule', 2_048))
     recordAudit({ level: 'info', category: 'rule', action: 'rule_removed', message: '已撤销自动批准规则' })
   })
+  ipcMain.handle(IPC_CHANNELS.listDangerRules, (event) => {
+    trustedRenderer(event)
+    return approvalPolicy.listDangerRules()
+  })
+  ipcMain.handle(IPC_CHANNELS.addDangerRule, async (event, value: unknown) => {
+    trustedRenderer(event)
+    if (!value || typeof value !== 'object') throw new Error('高危规则内容无效')
+    const input = value as Record<string, unknown>
+    const rule = await approvalPolicy.addDangerRule({
+      name: text(input.name, 'danger rule name', 80),
+      keyword: text(input.keyword, 'danger rule keyword', 256),
+    })
+    recordAudit({
+      level: 'warning', category: 'rule', action: 'danger_rule_added',
+      message: '已添加自定义高危规则「' + rule.name + '」',
+      details: { ruleId: rule.id, keyword: rule.pattern },
+    })
+    return rule
+  })
+  ipcMain.handle(IPC_CHANNELS.setDangerRuleEnabled, async (event, id: unknown, enabled: unknown) => {
+    trustedRenderer(event)
+    if (typeof enabled !== 'boolean') throw new Error('高危规则启用状态无效')
+    const ruleId = text(id, 'danger rule id', 128)
+    await approvalPolicy.setDangerRuleEnabled(ruleId, enabled)
+    recordAudit({
+      level: 'warning', category: 'rule', action: enabled ? 'danger_rule_enabled' : 'danger_rule_disabled',
+      message: enabled ? '已启用自定义高危规则' : '已停用自定义高危规则',
+      details: { ruleId },
+    })
+  })
+  ipcMain.handle(IPC_CHANNELS.removeDangerRule, async (event, id: unknown) => {
+    trustedRenderer(event)
+    const ruleId = text(id, 'danger rule id', 128)
+    await approvalPolicy.removeDangerRule(ruleId)
+    recordAudit({
+      level: 'warning', category: 'rule', action: 'danger_rule_removed',
+      message: '已删除自定义高危规则',
+      details: { ruleId },
+    })
+  })
+  ipcMain.handle(IPC_CHANNELS.testDangerCommand, (event, command: unknown) => {
+    trustedRenderer(event)
+    return approvalPolicy.testDangerCommand(text(command, 'danger command test', 2_048))
+  })
+  ipcMain.handle(IPC_CHANNELS.getLlmReviewSettings, (event) => {
+    trustedRenderer(event)
+    return { ...llmReviewSettingsStore.getSummary(), ruleAuditState: { ...llmRuleAuditState } }
+  })
+  ipcMain.handle(IPC_CHANNELS.updateLlmReviewSettings, async (event, value: unknown) => {
+    trustedRenderer(event)
+    const saved = await llmReviewSettingsStore.update(llmReviewSettings(value))
+    scheduleLlmRuleAudit(approvalPolicy)
+    recordAudit({
+      level: saved.enabled || saved.scheduledRuleAuditEnabled ? 'warning' : 'info',
+      category: 'review', action: 'llm_review_settings_changed',
+      message: saved.enabled ? `已启用 LLM 安全审查（${saved.level}）` : '已关闭运行时 LLM 安全审查',
+      details: {
+        enabled: saved.enabled, level: saved.level,
+        scheduledRuleAuditEnabled: saved.scheduledRuleAuditEnabled,
+        scheduledRuleAuditHours: saved.scheduledRuleAuditHours,
+        timeoutSeconds: saved.timeoutSeconds,
+        model: saved.model ?? 'not-configured', proxyEnabled: saved.proxyEnabled,
+      },
+    })
+    return { ...saved, ruleAuditState: { ...llmRuleAuditState } }
+  })
+  ipcMain.handle(IPC_CHANNELS.reviewApprovalRules, (event) => {
+    trustedRenderer(event)
+    void runLlmRuleAudit(approvalPolicy, 'manual')
+      .catch(() => undefined)
+      .finally(() => scheduleLlmRuleAudit(approvalPolicy))
+    return { ...llmRuleAuditState }
+  })
   ipcMain.handle(IPC_CHANNELS.chooseWorkspace, async (event) => {
     trustedRenderer(event)
     const options: Electron.OpenDialogOptions = { properties: ['openDirectory'] }
@@ -1122,8 +1334,17 @@ void app.whenReady().then(async () => {
   sessionSafetyStore = await SessionSafetyStore.load(join(app.getPath('userData'), 'session-safety.json'))
   sessionCatalog = await ManagedSessionCatalog.load(join(app.getPath('userData'), 'managed-sessions.json'))
   dingTalkSettingsStore = await DingTalkSettingsStore.load(join(app.getPath('userData'), 'dingtalk-settings.json'), safeStorage)
+  llmReviewSettingsStore = await LlmReviewSettingsStore.load(join(app.getPath('userData'), 'llm-review-settings.json'), safeStorage)
+  const lastLlmRuleAudit = llmReviewSettingsStore.getRuntimeSettings().lastRuleAudit
+  llmRuleAuditState = lastLlmRuleAudit
+    ? { status: 'completed', completedAt: lastLlmRuleAudit.reviewedAt }
+    : { status: 'idle' }
+  const hostSocketDir = process.platform === 'darwin'
+    ? join('/tmp', `agent-tui-${typeof process.getuid === 'function' ? process.getuid() : 'user'}`)
+    : undefined
   const manager = new SessionHostManager({
     runtimeDir: join(app.getPath('userData'), 'runtime', 'session-hosts'),
+    ...(hostSocketDir ? { socketDir: hostSocketDir } : {}),
     hostEntry: join(__dirname, 'session-host.js'),
     preserveOnLeaseExpiry: sessionSafetyStore.getSettings().preserveWorkspaceOnCrash,
     resolveAgentConfig: async (profileId, agentKind, args) => {
@@ -1146,12 +1367,14 @@ void app.whenReady().then(async () => {
       const subject = approvalSubject(command)
       recordAudit({ level: 'warning', category: 'approval', action: 'approval_detected', message: `检测到 ${subject} 授权请求`, details: { subject, ...(command ? { command } : {}) } })
       const decision = approvalPolicy.decide(command)
-      recordAudit(decision.action === 'auto-approve'
-        ? { level: 'info', category: 'approval', action: 'approval_auto', message: `${subject} 已按安全规则自动批准`, details: { subject, ...(command ? { command } : {}), risk: decision.risk, rule: decision.matchedRule ?? 'built-in' } }
-        : { level: 'warning', category: 'approval', action: 'approval_waiting', message: `${subject} 正在等待人工处理`, details: { subject, ...(command ? { command } : {}), risk: decision.risk, reason: decision.reason } })
+      if (decision.action === 'auto-approve') {
+        recordAudit({ level: 'info', category: 'approval', action: 'approval_auto', message: `${subject} 已按安全规则自动批准`, details: { subject, ...(command ? { command } : {}), risk: decision.risk, rule: decision.matchedRule ?? 'built-in' } })
+      }
       return decision
     },
     noteManualApproval: (command: string | undefined) => approvalPolicy.noteManualApproval(command),
+    canBulkApproveCommand: (command: string | undefined) => approvalPolicy.canBulkApproveCommand(command),
+    canFullAutoApprove: (input: Parameters<typeof approvalPolicy.canFullAutoApprove>[0]) => approvalPolicy.canFullAutoApprove(input),
     async addRule(command: string) {
       await approvalPolicy.addRule(command)
       recordAudit({ level: 'info', category: 'rule', action: 'learned_rule_accepted', message: '已接受学习建议并添加自动批准规则' })
@@ -1159,22 +1382,48 @@ void app.whenReady().then(async () => {
   }
   const fullAutoActivity = {
     pending(request: ApprovalRequest) {
-      void dingTalkStreamService?.notifyApproval(request, dingTalkSettingsStore.getRuntimeSettings()).then((sent) => {
-        if (!sent) return
-        recordAudit({
-          level: 'info', category: 'remote', action: 'remote_approval_notified',
-          message: '已向钉钉发送待审批提醒',
-          sessionId: request.sessionId,
-          details: { requestId: request.requestId, workspace: request.workspace, toolName: request.toolName ?? approvalSubject(request.command) },
-        })
-      }).catch((error) => {
-        recordAudit({
-          level: 'error', category: 'remote', action: 'remote_approval_notification_failed',
-          message: '钉钉待审批提醒发送失败',
-          sessionId: request.sessionId,
-          details: { requestId: request.requestId, workspace: request.workspace, error: error instanceof Error ? error.message : String(error) },
-        })
+      recordAudit({
+        level: 'warning', category: 'approval', action: 'approval_waiting',
+        message: (request.toolName ?? approvalSubject(request.command)) + ' 正在等待人工处理',
+        sessionId: request.sessionId,
+        details: {
+          requestId: request.requestId,
+          toolName: request.toolName ?? approvalSubject(request.command),
+          workspace: request.workspace,
+           ...(request.command ? { command: request.command } : {}),
+           risk: request.risk,
+           reason: request.agentReason ?? request.reason,
+           ...(request.dangerRuleId ? { dangerRuleId: request.dangerRuleId } : {}),
+           ...(request.dangerRuleName ? { dangerRuleName: request.dangerRuleName } : {}),
+         },
       })
+      const notifyWhenReady = (): void => {
+        const current = controller.listPendingApprovals().find((item) => item.requestId === request.requestId)
+        if (!current) return
+        if (current.llmReviewStatus === 'pending') {
+          const retry = setTimeout(notifyWhenReady, 500)
+          retry.unref?.()
+          return
+        }
+        void dingTalkStreamService?.notifyApproval(current, dingTalkSettingsStore.getRuntimeSettings()).then((sent) => {
+          if (!sent) return
+          recordAudit({
+            level: 'info', category: 'remote', action: 'remote_approval_notified',
+            message: '已向钉钉发送待审批提醒',
+            sessionId: current.sessionId,
+            details: { requestId: current.requestId, workspace: current.workspace, toolName: current.toolName ?? approvalSubject(current.command) },
+          })
+        }).catch((error) => {
+          recordAudit({
+            level: 'error', category: 'remote', action: 'remote_approval_notification_failed',
+            message: '钉钉待审批提醒发送失败',
+            sessionId: current.sessionId,
+            details: { requestId: current.requestId, workspace: current.workspace, error: error instanceof Error ? error.message : String(error) },
+          })
+        })
+      }
+      const timer = setTimeout(notifyWhenReady, DINGTALK_APPROVAL_NOTIFICATION_DELAY_MS)
+      timer.unref?.()
     },
     approved(request: ApprovalRequest) {
       recordAudit({
@@ -1206,6 +1455,41 @@ void app.whenReady().then(async () => {
         },
       })
     },
+    reviewStarted(request: ApprovalRequest) {
+      recordAudit({
+        level: 'info', category: 'review', action: 'llm_approval_review_started',
+        message: '已启动 LLM 安全审查：' + (request.toolName ?? approvalSubject(request.command)),
+        sessionId: request.sessionId,
+        details: {
+          requestId: request.requestId, risk: request.risk,
+          ...(request.command ? { command: request.command } : {}),
+          ...(request.dangerRuleName ? { dangerRuleName: request.dangerRuleName } : {}),
+          level: llmReviewSettingsStore.getRuntimeSettings().level,
+        },
+      })
+    },
+    reviewed(request: ApprovalRequest, conclusion: NonNullable<ApprovalRequest['llmReview']>) {
+      recordAudit({
+        level: conclusion.requiresHumanApproval ? 'warning' : 'info',
+        category: 'review', action: 'llm_approval_review_completed',
+        message: 'LLM 审查结论：' + conclusion.summary,
+        sessionId: request.sessionId,
+        details: {
+          requestId: request.requestId, verdict: conclusion.verdict,
+          riskScore: conclusion.riskScore, requiresHumanApproval: conclusion.requiresHumanApproval,
+          model: conclusion.model, reasons: JSON.stringify(conclusion.reasons),
+          hazards: JSON.stringify(conclusion.hazards), assumptions: JSON.stringify(conclusion.assumptions),
+          ...(request.command ? { command: request.command } : {}),
+        },
+      })
+    },
+    reviewFailed(request: ApprovalRequest, error: string) {
+      recordAudit({
+        level: 'error', category: 'review', action: 'llm_approval_review_failed',
+        message: 'LLM 安全审查失败，已转人工处理', sessionId: request.sessionId,
+        details: { requestId: request.requestId, error, ...(request.command ? { command: request.command } : {}) },
+      })
+    },
   }
   const recoveryActivity = {
     keywordMatched(sessionId: string, keyword: string) {
@@ -1215,7 +1499,15 @@ void app.whenReady().then(async () => {
       recordAudit({ level: 'warning', category: 'recovery', action: 'continue_keyword_sent', message: '输出持续静默，已按关键词规则尝试 Continue 一次', sessionId, details: { keyword, attempt: 1 } })
     },
   }
-  controller = new SessionController(manager, broadcast, { discover: discoverNativeSessions }, auditedApprovalPolicy, recoveryPolicy, fullAutoActivity, continueKeywordStore, recoveryActivity, sessionCatalog)
+  const llmApprovalReview = {
+    getSettings: () => {
+      const settings = llmReviewSettingsStore.getRuntimeSettings()
+      return { enabled: settings.enabled, level: settings.level }
+    },
+    reviewApproval: (request: ApprovalRequest, hardBlockedReason?: string) =>
+      llmSecurityReviewer.reviewApproval(request, llmReviewSettingsStore.getRuntimeSettings(), hardBlockedReason),
+  }
+  controller = new SessionController(manager, broadcast, { discover: discoverNativeSessions }, auditedApprovalPolicy, recoveryPolicy, fullAutoActivity, continueKeywordStore, recoveryActivity, sessionCatalog, llmApprovalReview)
   const remoteAudit = {
     list: () => auditStore.list(),
     record: (entry: { level: 'info' | 'warning' | 'error'; action: string; message: string; sessionId?: string; details?: Record<string, string | number | boolean> }) => {
@@ -1257,11 +1549,12 @@ void app.whenReady().then(async () => {
   )
   dingTalkStreamService = new DingTalkStreamService(dingTalkRouter, {
     connected: () => recordAudit({ level: 'info', category: 'remote', action: 'remote_connected', message: '钉钉 Stream 已连接' }),
-    disconnected: () => recordAudit({ level: 'warning', category: 'remote', action: 'remote_disconnected', message: '钉钉 Stream 连接已断开，正在等待 SDK 重连' }),
+    disconnected: () => recordAudit({ level: 'warning', category: 'remote', action: 'remote_disconnected', message: '钉钉 Stream 连接已断开，Manager 将在网络恢复后重连' }),
     error: (error) => recordAudit({ level: 'error', category: 'remote', action: 'remote_error', message: '钉钉远程通道发生错误', details: { error } }),
     message: (staffId, command) => recordAudit({ level: 'info', category: 'remote', action: 'remote_message_received', message: `收到钉钉命令 ${command}`, details: { staffId, command } }),
-  })
+  }, () => net.isOnline())
   registerIpc(approvalPolicy)
+  scheduleLlmRuleAudit(approvalPolicy)
   await controller.restoreSessions(sessionSafetyStore.getSettings().preserveWorkspaceOnCrash)
   for (const session of controller.listSessions()) {
     if (session.status === 'stopped' || session.status === 'failed') {

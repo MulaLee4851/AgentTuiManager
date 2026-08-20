@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { commandFromAgentResponse, withAgentRetries } from '../../electron/dingtalk-agent-interpreter'
+import { commandFromAgentResponse, commandsFromAgentResponse, withAgentRetries } from '../../electron/dingtalk-agent-interpreter'
 
 describe('DingTalkAgentInterpreter output policy', () => {
   it('maps structured actions to the existing fixed command router', () => {
@@ -9,6 +9,27 @@ describe('DingTalkAgentInterpreter output policy', () => {
     expect(commandFromAgentResponse({ action: 'auto_on', target: 'Code Agent' })).toBe('/auto Code Agent on')
     expect(commandFromAgentResponse({ action: 'auto_off', target: 'session-1' })).toBe('/auto session-1 off')
     expect(commandFromAgentResponse({ action: 'send', target: 'Agent A', content: '继续检查登录问题' })).toBe('/send Agent A 继续检查登录问题')
+  })
+
+  it('maps multiple model actions from one natural-language request in order', () => {
+    expect(commandsFromAgentResponse({
+      actions: [
+        { action: 'auto_on', target: '40f5c044' },
+        { action: 'auto_off', target: 'Review Agent' },
+      ],
+    })).toEqual({
+      commands: ['/auto 40f5c044 on', '/auto Review Agent off'],
+    })
+  })
+
+  it('keeps an explicit reason when the model cannot choose an operation', () => {
+    expect(commandsFromAgentResponse({
+      actions: [{ action: 'help' }],
+      reason: '没有找到用户提到的 Agent',
+    })).toEqual({
+      commands: ['/help'],
+      reason: '没有找到用户提到的 Agent',
+    })
   })
 
   it('rejects arbitrary actions and multiline terminal content', () => {

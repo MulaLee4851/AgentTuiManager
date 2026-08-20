@@ -120,6 +120,84 @@ export interface DingTalkSettingsSummary {
   connectionError?: string
 }
 
+export type LlmReviewLevel = 'low' | 'medium' | 'high'
+export type LlmReviewVerdict = 'allow' | 'manual' | 'deny' | 'uncertain'
+export type LlmReviewStatus = 'pending' | 'completed' | 'failed'
+export type LlmRuleAuditStatus = 'idle' | 'running' | 'completed' | 'failed'
+
+export interface LlmRuleAuditState {
+  status: LlmRuleAuditStatus
+  source?: 'manual' | 'scheduled'
+  startedAt?: number
+  completedAt?: number
+  error?: string
+}
+
+export interface LlmReviewSettingsInput {
+  enabled: boolean
+  level: LlmReviewLevel
+  baseUrl?: string
+  apiKey?: string
+  clearApiKey?: boolean
+  model?: string
+  retryCount: number
+  timeoutSeconds: number
+  scheduledRuleAuditEnabled: boolean
+  scheduledRuleAuditHours: number
+  proxyEnabled: boolean
+  proxyHost?: string
+  proxyPort?: number
+  proxyUsername?: string
+  proxyPassword?: string
+  clearProxyPassword?: boolean
+}
+
+export interface LlmReviewConclusion {
+  verdict: LlmReviewVerdict
+  riskScore: number
+  summary: string
+  reasons: string[]
+  hazards: string[]
+  assumptions: string[]
+  requiresHumanApproval: boolean
+  model: string
+  reviewedAt: number
+}
+
+export interface LlmRuleAuditFinding {
+  rule: string
+  severity: 'low' | 'medium' | 'high' | 'critical'
+  issue: string
+  recommendation: string
+}
+
+export interface LlmRuleAuditResult {
+  reviewedAt: number
+  model: string
+  ruleCount: number
+  summary: string
+  findings: LlmRuleAuditFinding[]
+}
+
+export interface LlmReviewSettingsSummary {
+  enabled: boolean
+  level: LlmReviewLevel
+  baseUrl?: string
+  hasApiKey: boolean
+  model?: string
+  retryCount: number
+  timeoutSeconds: number
+  scheduledRuleAuditEnabled: boolean
+  scheduledRuleAuditHours: number
+  proxyEnabled: boolean
+  proxyHost: string
+  proxyPort: number
+  proxyUsername?: string
+  hasProxyPassword: boolean
+  lastRuleAudit?: LlmRuleAuditResult
+  ruleAuditState: LlmRuleAuditState
+}
+
 export interface CCSwitchProviderSummary {
   id: string
   name: string
@@ -132,6 +210,28 @@ export interface CCSwitchProviderSummary {
 }
 export type ApprovalRisk = 'read' | 'write' | 'delete' | 'unknown'
 export type ApprovalSource = 'terminal' | 'claude-hook'
+export type DangerRuleScope = 'safe-rule' | 'bulk-approval' | 'full-auto'
+
+export interface DangerRuleSummary {
+  id: string
+  name: string
+  description: string
+  pattern: string
+  patternKind: 'regex' | 'contains'
+  origin: 'built-in' | 'custom'
+  enabled: boolean
+  scopes: DangerRuleScope[]
+}
+
+export interface DangerRuleInput {
+  name: string
+  keyword: string
+}
+
+export interface DangerRuleTestResult {
+  command: string
+  matches: DangerRuleSummary[]
+}
 
 export interface ApprovalRequest {
   requestId: string
@@ -151,6 +251,11 @@ export interface ApprovalRequest {
   targetPaths?: string[]
   createdAt: number
   canBulkApprove: boolean
+  dangerRuleId?: string
+  dangerRuleName?: string
+  llmReviewStatus?: LlmReviewStatus
+  llmReview?: LlmReviewConclusion
+  llmReviewError?: string
 }
 
 export interface BulkApprovalResult {
@@ -230,7 +335,7 @@ export interface SessionSummary extends SessionState {
 }
 
 export type AuditLevel = 'info' | 'warning' | 'error'
-export type AuditCategory = 'session' | 'approval' | 'recovery' | 'rule' | 'remote'
+export type AuditCategory = 'session' | 'approval' | 'recovery' | 'rule' | 'review' | 'remote'
 
 export interface AuditEntry {
   id: string
@@ -259,7 +364,13 @@ export interface AgentInstallProgress {
 
 export type ManagerEvent =
   | ({ sessionId: string; sequence?: number } & HostEvent)
-  | { type: 'sessions-changed'; sessionId: string }
+  | {
+      type: 'sessions-changed'
+      sessionId: string
+      session?: SessionSummary | null
+      approvals?: ApprovalRequest[]
+    }
+  | { type: 'terminal-refresh-requested'; sessionId: string }
   | { type: 'audit-changed' }
   | { type: 'external-terminal-drag'; projection: ExternalTerminalDragProjection | null }
   | { type: 'agent-install-progress'; progress: AgentInstallProgress }
@@ -303,6 +414,14 @@ export const IPC_CHANNELS = {
   listApprovalRules: 'agent-manager:list-approval-rules',
   addApprovalRule: 'agent-manager:add-approval-rule',
   removeApprovalRule: 'agent-manager:remove-approval-rule',
+  listDangerRules: 'agent-manager:list-danger-rules',
+  addDangerRule: 'agent-manager:add-danger-rule',
+  setDangerRuleEnabled: 'agent-manager:set-danger-rule-enabled',
+  removeDangerRule: 'agent-manager:remove-danger-rule',
+  testDangerCommand: 'agent-manager:test-danger-command',
+  getLlmReviewSettings: 'agent-manager:get-llm-review-settings',
+  updateLlmReviewSettings: 'agent-manager:update-llm-review-settings',
+  reviewApprovalRules: 'agent-manager:review-approval-rules',
   chooseWorkspace: 'agent-manager:choose-workspace',
   chooseExecutable: 'agent-manager:choose-executable',
   discoverSessions: 'agent-manager:discover-sessions',
@@ -316,6 +435,7 @@ export const IPC_CHANNELS = {
 } as const
 
 export interface AgentManagerApi {
+  readonly platform: NodeJS.Platform
   listSessions(): Promise<SessionSummary[]>
   terminalReplay(sessionId: string): Promise<TerminalReplaySnapshot>
   listAuditEntries(): Promise<AuditEntry[]>
@@ -354,6 +474,14 @@ export interface AgentManagerApi {
   listApprovalRules(): Promise<string[]>
   addApprovalRule(command: string): Promise<void>
   removeApprovalRule(command: string): Promise<void>
+  listDangerRules(): Promise<DangerRuleSummary[]>
+  addDangerRule(input: DangerRuleInput): Promise<DangerRuleSummary>
+  setDangerRuleEnabled(ruleId: string, enabled: boolean): Promise<void>
+  removeDangerRule(ruleId: string): Promise<void>
+  testDangerCommand(command: string): Promise<DangerRuleTestResult>
+  getLlmReviewSettings(): Promise<LlmReviewSettingsSummary>
+  updateLlmReviewSettings(settings: LlmReviewSettingsInput): Promise<LlmReviewSettingsSummary>
+  reviewApprovalRules(): Promise<LlmRuleAuditState>
   chooseWorkspace(): Promise<string | undefined>
   chooseExecutable?(agentKind: AgentKind): Promise<string | undefined>
   discoverSessions(agentKind: AgentKind, workspace: string): Promise<NativeSessionSummary[]>

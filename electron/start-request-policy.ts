@@ -1,4 +1,4 @@
-import { delimiter, win32 } from 'node:path'
+import { posix, win32 } from 'node:path'
 
 import type { AgentKind, RecoveryRecipe } from '../src/shared/manager-api'
 
@@ -7,24 +7,30 @@ const BUILT_INS: Record<AgentKind, ReadonlySet<string>> = {
   claude: new Set(['claude', 'claude.exe', 'claude.cmd']),
   pi: new Set(['pi', 'pi.exe', 'pi.cmd']),
   deepseek: new Set(['dsh', 'dsh.exe', 'dsh.cmd']),
-  generic: new Set(['cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe']),
+  generic: new Set(['cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe', 'sh', 'bash', 'zsh']),
 }
 
-function normalizedAbsolute(value: string): string | undefined {
+function normalizedAbsolute(value: string, platform: NodeJS.Platform): string | undefined {
+  if (platform !== 'win32') return posix.isAbsolute(value) ? posix.normalize(value) : undefined
   if (!win32.isAbsolute(value)) return undefined
   return win32.normalize(value).toLocaleLowerCase('en-US')
 }
 
-export function validateExecutable(agentKind: AgentKind, candidate: string, configuredRaw: string): string {
+export function validateExecutable(
+  agentKind: AgentKind,
+  candidate: string,
+  configuredRaw: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
   const lower = candidate.toLocaleLowerCase('en-US')
   const isBare = win32.basename(candidate) === candidate && !candidate.includes('/') && !candidate.includes('\\')
   if (isBare && BUILT_INS[agentKind].has(lower)) return candidate
 
-  const normalizedCandidate = normalizedAbsolute(candidate)
+  const normalizedCandidate = normalizedAbsolute(candidate, platform)
   const configured = configuredRaw
-    .split(delimiter)
+    .split(platform === 'win32' ? ';' : ':')
     .map((item) => item.trim())
-    .map(normalizedAbsolute)
+    .map((item) => normalizedAbsolute(item, platform))
     .filter((item): item is string => item !== undefined)
   if (normalizedCandidate && configured.includes(normalizedCandidate)) return candidate
   throw new Error('Executable is not allowed for this Agent type')
@@ -35,7 +41,7 @@ function sameStrings(left: string[], right: string[]): boolean {
 }
 
 function sameExecutable(left: string, right: string): boolean {
-  return (normalizedAbsolute(left) ?? left.toLocaleLowerCase('en-US')) === (normalizedAbsolute(right) ?? right.toLocaleLowerCase('en-US'))
+  return (normalizedAbsolute(left, process.platform) ?? left.toLocaleLowerCase('en-US')) === (normalizedAbsolute(right, process.platform) ?? right.toLocaleLowerCase('en-US'))
 }
 
 export function terminalScrollbackArgs(agentKind: AgentKind, args: string[]): string[] {

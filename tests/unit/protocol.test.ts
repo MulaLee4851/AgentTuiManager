@@ -45,6 +45,10 @@ describe('host protocol', () => {
       operation: 'write',
       filePath: 'B:/workspace/README.md',
       toolInputSummary: 'B:/workspace/README.md',
+      toolUseId: 'tool-use-1',
+      agentId: 'subagent-1',
+      agentType: 'Explore',
+      toolInputFingerprint: 'a'.repeat(64),
     } satisfies HostEvent
 
     expectTypeOf(event).toMatchTypeOf<HostEvent>()

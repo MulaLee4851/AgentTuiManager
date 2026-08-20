@@ -12,6 +12,11 @@ export interface DingTalkStreamActivityPort {
   message(staffId: string, command: string): void
 }
 
+type RuntimeDingTalkClient = DWClient & {
+  connected: boolean
+  config: { autoReconnect?: boolean }
+}
+
 export class DingTalkStreamService {
   private client: DWClient | undefined
   private status: NonNullable<DingTalkSettingsSummary['connectionStatus']> = 'disabled'
@@ -22,9 +27,14 @@ export class DingTalkStreamService {
   private accessTokenExpiresAt = 0
   private accessTokenClientId: string | undefined
 
+  private reconnectTimer: NodeJS.Timeout | undefined
+  private monitorTimer: NodeJS.Timeout | undefined
+  private reconnectAttempt = 0
+  private outageNotified = false
   constructor(
     private readonly router: DingTalkCommandRouter,
     private readonly activity?: DingTalkStreamActivityPort,
+    private readonly networkAvailable?: () => boolean,
   ) {}
 
   getStatus(): Pick<DingTalkSettingsSummary, 'connectionStatus' | 'connectionError'> {
@@ -37,37 +47,34 @@ export class DingTalkStreamService {
     if (!settings.clientId || !settings.clientSecret) throw new Error('缺少钉钉 Client ID 或 Client Secret')
     this.status = 'connecting'
     this.connectionError = undefined
-    const client = new DWClient({ clientId: settings.clientId, clientSecret: settings.clientSecret, keepAlive: true, debug: false })
+    const client = new DWClient({ clientId: settings.clientId, clientSecret: settings.clientSecret, keepAlive: false, debug: false })
+    const runtimeClient = client as RuntimeDingTalkClient
+    runtimeClient.config.autoReconnect = false
     client.registerCallbackListener(TOPIC_ROBOT, (message) => {
       void this.onRobotMessage(client, message)
     })
-    client.on('error', (error: unknown) => this.onError(error))
+    client.on('error', (error: unknown) => this.markDisconnected(client, error))
     client.on('close', () => {
-      if (this.client !== client) return
-      this.status = 'error'
-      this.connectionError = '钉钉 Stream 连接已断开，SDK 正在尝试重连'
-      this.activity?.disconnected()
+      this.markDisconnected(client)
+      this.scheduleReconnect(client)
     })
     this.client = client
-    try {
-      await client.connect()
-      if (this.client !== client) { client.disconnect(); return }
-      this.status = 'connected'
-      this.activity?.connected()
-    } catch (error) {
-      if (this.client === client) this.onError(error)
-      client.disconnect()
-      if (this.client === client) this.client = undefined
-      throw error
-    }
+    this.startMonitor(client)
+    await this.connectClient(client)
   }
 
   stop(): void {
     const client = this.client
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+    if (this.monitorTimer) clearInterval(this.monitorTimer)
+    this.reconnectTimer = undefined
+    this.monitorTimer = undefined
     this.client = undefined
     if (client) client.disconnect()
     this.status = 'disabled'
     this.connectionError = undefined
+    this.reconnectAttempt = 0
+    this.outageNotified = false
   }
 
   async notifyApproval(request: ApprovalRequest, settings: StoredDingTalkSettings): Promise<boolean> {
@@ -122,7 +129,10 @@ export class DingTalkStreamService {
     if (typeof robot.senderStaffId !== 'string' || !robot.senderStaffId || typeof robot.sessionWebhook !== 'string') return
     this.activity?.message(robot.senderStaffId, content.split(/\s/, 1)[0] ?? '')
     const reply = await this.router.execute(content, { staffId: robot.senderStaffId, senderName: robot.senderNick })
-    await this.reply(robot.sessionWebhook, reply).catch((error) => this.onError(error))
+    await this.reply(robot.sessionWebhook, reply).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error)
+      this.activity?.error(message.slice(0, 500))
+    })
     client.socketCallBackResponse(message.headers.messageId, { status: 'SUCCESS' })
   }
 
@@ -192,11 +202,85 @@ export class DingTalkStreamService {
     this.accessTokenExpiresAt = 0
   }
 
-  private onError(error: unknown): void {
-    const message = error instanceof Error ? error.message : String(error)
+  private startMonitor(client: DWClient): void {
+    this.monitorTimer = setInterval(() => {
+      if (this.client !== client) return
+      const connected = (client as RuntimeDingTalkClient).connected
+      if (connected) {
+        if (this.status !== 'connected') this.markConnected(client)
+        return
+      }
+      if (this.status === 'connected') this.markDisconnected(client)
+      this.scheduleReconnect(client)
+    }, 2_000)
+    this.monitorTimer.unref()
+  }
+
+  private async connectClient(client: DWClient): Promise<void> {
+    if (this.client !== client) return
+    if (this.networkAvailable && !this.networkAvailable()) {
+      this.markDisconnected(client)
+      this.scheduleReconnect(client, true)
+      return
+    }
+
+    this.status = 'connecting'
+    try {
+      await client.connect()
+    } catch (error) {
+      if (this.client !== client) return
+      this.markDisconnected(client, error)
+      this.scheduleReconnect(client)
+      return
+    }
+    if (this.client !== client) {
+      client.disconnect()
+      return
+    }
+    if ((client as RuntimeDingTalkClient).connected) {
+      this.markConnected(client)
+    } else {
+      this.markDisconnected(client)
+      this.scheduleReconnect(client)
+    }
+  }
+
+  private markConnected(client: DWClient): void {
+    if (this.client !== client) return
+    const changed = this.status !== 'connected' || this.outageNotified
+    this.status = 'connected'
+    this.connectionError = undefined
+    this.reconnectAttempt = 0
+    this.outageNotified = false
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = undefined
+    if (changed) this.activity?.connected()
+  }
+
+  private markDisconnected(client: DWClient, error?: unknown): void {
+    if (this.client !== client) return
+    const firstNotice = !this.outageNotified
     this.status = 'error'
-    this.connectionError = message.slice(0, 500)
-    this.activity?.error(this.connectionError)
+    this.connectionError = '钉钉 Stream 暂时离线，网络恢复后会自动重连'
+    this.outageNotified = true
+    if (!firstNotice) return
+    this.activity?.disconnected()
+    if (error !== undefined) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.activity?.error(message.slice(0, 500))
+    }
+  }
+
+  private scheduleReconnect(client: DWClient, waitingForNetwork = false): void {
+    if (this.client !== client || this.reconnectTimer) return
+    const delays = [3_000, 5_000, 10_000, 30_000]
+    const delay = waitingForNetwork ? 3_000 : delays[Math.min(this.reconnectAttempt, delays.length - 1)]!
+    if (!waitingForNetwork) this.reconnectAttempt += 1
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined
+      if (this.client === client) void this.connectClient(client)
+    }, delay)
+    this.reconnectTimer.unref()
   }
 }
 

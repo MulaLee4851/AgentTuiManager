@@ -18,8 +18,8 @@ describe('ApprovalPolicyStore', () => {
     await store.addRule('Get-Content special.txt')
 
     const persisted = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>
-    expect(persisted).toEqual({ version: 1, rules: ['get-content special.txt'] })
-    expect(Object.keys(persisted)).toEqual(['version', 'rules'])
+    expect(persisted).toEqual({ version: 2, rules: ['get-content special.txt'], dangerRules: [] })
+    expect(Object.keys(persisted)).toEqual(['version', 'rules', 'dangerRules'])
     expect((await ApprovalPolicyStore.load(path)).decide('Get-Content special.txt').action).toBe('auto-approve')
   })
 
@@ -35,5 +35,29 @@ describe('ApprovalPolicyStore', () => {
     await writeFile(path, JSON.stringify({ version: 1, rules: ['Remove-Item -Recurse build'] }), 'utf8')
     const handEdited = await ApprovalPolicyStore.load(path)
     expect(handEdited.listRules()).toEqual([])
+  })
+
+  it('migrates v1 settings and persists maintainable custom danger rules', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'agent-tui-approval-'))
+    roots.push(root)
+    const path = join(root, 'approval-policy.json')
+    await writeFile(path, JSON.stringify({ version: 1, rules: ['git log --oneline'] }), 'utf8')
+    const store = await ApprovalPolicyStore.load(path)
+
+    const rule = await store.addDangerRule({ name: '生产环境', keyword: 'prod-db' })
+    expect(rule).toMatchObject({ name: '生产环境', pattern: 'prod-db', enabled: true, origin: 'custom' })
+    expect(store.canBulkApproveCommand('deploy prod-db')).toBe(false)
+    expect(store.testDangerCommand('deploy prod-db').matches).toEqual([
+      expect.objectContaining({ id: rule.id, name: '生产环境' }),
+    ])
+
+    await store.setDangerRuleEnabled(rule.id, false)
+    expect(store.canFullAutoApprove({ command: 'deploy prod-db', risk: 'unknown', workspace: 'B:\\work' }).allowed).toBe(true)
+    const reloaded = await ApprovalPolicyStore.load(path)
+    expect(reloaded.listRules()).toContain('git log --oneline')
+    expect(reloaded.listDangerRules().find((item) => item.id === rule.id)).toMatchObject({ enabled: false })
+
+    await reloaded.removeDangerRule(rule.id)
+    expect(reloaded.listDangerRules().some((item) => item.id === rule.id)).toBe(false)
   })
 })

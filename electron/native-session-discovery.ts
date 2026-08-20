@@ -1,6 +1,6 @@
 import { promises as fs } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, join, win32 } from 'node:path'
+import { basename, join, posix, win32 } from 'node:path'
 
 import type { AgentKind, NativeSessionSummary } from '../src/shared/manager-api'
 
@@ -130,8 +130,13 @@ const defaultReader: NativeSessionDiscoveryReader = {
   mtime: async (file) => (await fs.stat(file)).mtimeMs,
 }
 
-function normalizeWorkspace(workspace: string): string {
+export function normalizeWorkspace(workspace: string, platform: NodeJS.Platform = process.platform): string {
+  const isWindowsPath = /^[a-zA-Z]:[\\/]/.test(workspace) || /^\\\\[^\\/]+[\\/][^\\/]+/.test(workspace)
   const normalized = win32.normalize(workspace.replaceAll('/', '\\'))
+  if (platform !== 'win32' && !isWindowsPath) {
+    const normalized = posix.normalize(workspace.replaceAll('\\', '/'))
+    return normalized.length > 1 ? normalized.replace(/\/+$/, '') : normalized
+  }
   const root = win32.parse(normalized).root
   const withoutTrailingSeparators = normalized.length > root.length
     ? normalized.replace(/[\\/]+$/, '')
