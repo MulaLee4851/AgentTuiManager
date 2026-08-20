@@ -11,8 +11,8 @@
 </p>
 
 <p align="center">
-  <a href="#快速开始">快速开始</a> ·
   <a href="#核心能力">能力</a> ·
+  <a href="#安装与启动">安装</a> ·
   <a href="#审批与安全">安全</a> ·
   <a href="#钉钉远程控制">钉钉</a> ·
   <a href="LICENSE">MIT License</a>
@@ -71,8 +71,6 @@
 | UI 关了长任务也没了 | Session Host 可与窗口解耦，支持保留工作区 |
 | 人不在电脑前 | 可选钉钉 Stream：审批、发送、停启、审计 |
 
-更完整的产品叙述见 [`docs/open-source-intro.md`](docs/open-source-intro.md)（若你本地忽略了 `docs/`，以本 README 为准即可）。
-
 ---
 
 ## 核心能力
@@ -88,6 +86,12 @@
 - **钉钉远程**：Stream 机器人查看 Agent、处理审批、发送任务；可选受限自然语言模式  
 - **拖出终端**：受管 Agent 可拖出为普通终端；外部拖入仍为 Beta 且默认关闭  
 
+### 跨平台
+
+- **Windows**：提供 NSIS 安装包，使用 Windows ConPTY 和原生命令环境
+- **macOS**：提供 DMG / ZIP，支持 Intel 与 Apple Silicon，使用 macOS PTY 和登录 Shell 环境
+- 两个平台各自读取本机 Agent 配置；Manager 的独立配置只作用于对应实例，不会改写系统全局配置
+
 ---
 
 ## 运行要求
@@ -101,17 +105,20 @@ CLI 未进 `PATH` 时，可在新建 Agent 的高级设置里选择完整可执�
 
 ---
 
-## 快速开始
+## 安装与启动
 
-### 安装包（推荐分发）
+### 安装包（推荐）
 
-使用 Release 中的 NSIS 安装包，例如：
+从 [Releases](https://github.com/MulaLee4851/AgentTuiManager/releases) 下载与你的平台对应的产物：
 
 ```text
-Agent-TUI-Manager-Setup-0.1.0-x64.exe
+Windows: Agent-TUI-Manager-Setup-<version>-x64.exe
+macOS:   Agent-TUI-Manager-<version>-<arch>.dmg 或 .zip
 ```
 
-安装后启动应用，再准备好本机 Agent CLI 即可。
+Windows 运行安装程序后启动应用。macOS 优先打开 DMG 并把应用拖入“应用程序”；ZIP 可解压后直接运行。若 macOS 因未签名应用拦截启动，请在“系统设置 → 隐私与安全性”中确认允许打开。
+
+安装完成后准备好至少一个本机 Agent CLI，即可新建或恢复会话。
 
 ### 开发模式
 
@@ -207,7 +214,7 @@ npm run dist:win
 npm run dist:mac
 ```
 
-默认生成 DMG 和 ZIP。由于 `node-pty` 包含原生模块，macOS 包必须在对应架构的 Mac 上安装依赖并构建；不支持直接复用 Windows 的 `node_modules` 交叉打包。当前配置未包含 Apple Developer 签名和公证，正式对外分发前仍需配置证书与 notarization。
+默认生成 DMG 和 ZIP。由于 `node-pty` 包含原生模块，macOS 包必须在对应架构的 Mac 上安装依赖并构建；不支持直接复用 Windows 的 `node_modules` 交叉打包。macOS 打包与发布流程已可用；当前配置未包含 Apple Developer 签名和公证，正式对外分发前仍需配置证书与 notarization。
 
 ---
 
@@ -243,7 +250,7 @@ claude --resume <session-id>
 
 ## 当前限制
 
-- Windows 已完成真实运行验证；macOS 第一阶段兼容代码已接入，仍需在真实 Intel / Apple Silicon 设备上验收 PTY、审批 Hook、会话保留和打包产物
+- macOS 已可安装和打包；由于当前发布包未签名、公证，首次启动可能需要在系统安全设置中手动允许
 - 外部终端**拖入**仍为 Beta，默认关闭；**拖出**可用  
 - 代理目前支持 **HTTP**；HTTPS / SOCKS5 配置尚未开放  
 
@@ -264,4 +271,4 @@ Electron · React · TypeScript · xterm.js · node-pty（Windows ConPTY / macOS
 
 ## License
 
-[MIT](LICENSE) © Agent TUI Manager contributors
+[MIT](LICENSE) © 2026 MulaLee
