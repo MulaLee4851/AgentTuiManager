@@ -164,14 +164,14 @@ describe('SessionController recovery evidence', () => {
       await vi.advanceTimersByTimeAsync(0)
 
       expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)).toMatchObject({
-        status: 'needs_attention',
+        status: 'running',
         recoveryAttempts: 0,
       })
       expect(handles[0]!.writes).toEqual([])
 
       await vi.advanceTimersByTimeAsync(10_000)
       expect(handles[0]!.writes).toEqual([])
-      expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('needs_attention')
+      expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
     } finally {
       vi.useRealTimers()
     }
@@ -234,7 +234,7 @@ describe('SessionController recovery evidence', () => {
 
       expect(handles[0]!.writes).toEqual([])
       expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)).toMatchObject({
-        status: 'needs_attention',
+        status: 'running',
         recoveryAttempts: 0,
       })
       expect(handles[0]!.stops).toBe(0)
@@ -899,6 +899,27 @@ describe('SessionController recovery evidence', () => {
     }
   })
 
+
+  it('only allows capacity Continue when the user explicitly configures that keyword', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const keywordPolicy = {
+        getSettings: () => ({ enabled: true, quietSeconds: 3, keywords: ['Selected model is at capacity'] }),
+        match: (value: string) => value.toLowerCase().includes('selected model is at capacity') ? 'Selected model is at capacity' : undefined,
+        maxKeywordLength: () => 32,
+      }
+      const controller = new SessionController(base.manager, undefined, undefined, undefined, undefined, undefined, keywordPolicy)
+      await controller.startSession(request(true))
+      base.handles[0]!.emit({ type: 'output', data: 'Selected model is at capacity. Please try a different model.' })
+      await vi.advanceTimersByTimeAsync(2_999)
+      expect(base.handles[0]!.writes).toEqual([])
+      await vi.advanceTimersByTimeAsync(1)
+      expect(base.handles[0]!.writes).toEqual(['continue'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
   it('does not start keyword Continue from output repainted immediately after resize', async () => {
     vi.useFakeTimers()
     try {

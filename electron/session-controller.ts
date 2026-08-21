@@ -953,9 +953,6 @@ export class SessionController {
           this.cancelTransientRetry(managed, true)
           this.cancelPendingContinueSubmit(managed)
         }
-        if (observation.recoverableError && !managed.suppressTransientRetryUntilReady) {
-          this.scheduleTransientRetry(managed, observation.recoverableError)
-        }
         if (observation.approvalRequired) {
           if (managed.summary.agentKind === 'claude') {
             this.scheduleClaudeTerminalApproval(managed, observation, event.data)
@@ -1376,7 +1373,7 @@ export class SessionController {
       || continueSuppressed
       || managed.pendingUserInterrupt || managed.summary.userStopRequested
       || managed.summary.status !== 'running' || observation.approvalRequired
-      || observation.recoverableError || managed.awaitingRecoveryReady) {
+      || managed.awaitingRecoveryReady) {
       this.cancelKeywordContinue(managed)
       managed.continueKeywordTail = ''
       return
@@ -1929,7 +1926,10 @@ export class SessionController {
     if (requestIndex >= 0) managed.approvalRequests[requestIndex] = request
     else managed.approvalRequests.push(request)
     this.syncApprovalSummary(managed)
-    if (requestIndex < 0) this.fullAutoActivity?.pending?.(request)
+    // Claude Hook requests may be refined or re-emitted with the same request id.
+    // Re-arm the notifier for those updates; DingTalkStreamService deduplicates
+    // successful sends by requestId, while this avoids losing the first alert.
+    if (requestIndex < 0 || request.source === 'claude-hook') this.fullAutoActivity?.pending?.(request)
     return request
   }
 
