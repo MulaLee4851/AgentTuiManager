@@ -36,6 +36,17 @@ describe('applyAgentLaunchProfile', () => {
     expect(result.args.join(' ')).not.toContain('agent_tui_manager')
   })
 
+  it('keeps user resume flags after the id while profile overrides stay before resume', () => {
+    const result = applyAgentLaunchProfile(
+      'codex',
+      ['--no-alt-screen', 'resume', 'native-1', '--dangerously-bypass-approvals-and-sandbox'],
+      profile({ baseUrl: undefined, apiKey: undefined, model: undefined, extraArgs: ['--search'] }),
+    )
+    expect(result.args).toEqual([
+      '--no-alt-screen', '--search', 'resume', 'native-1', '--dangerously-bypass-approvals-and-sandbox',
+    ])
+  })
+
   it('uses the built-in OpenAI override without defining an unmergeable provider', () => {
     const result = applyAgentLaunchProfile('codex', [], profile(), { id: 'openai', configurable: false })
     expect(result.environment).toEqual({ OPENAI_API_KEY: 'secret-key' })

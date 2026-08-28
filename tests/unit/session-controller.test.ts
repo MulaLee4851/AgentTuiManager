@@ -9,6 +9,7 @@ import { ApprovalPolicyEngine } from '../../electron/approval-policy'
 class FakeHandle implements HostHandle {
   readonly writes: string[] = []
   readonly permissionResponses: Array<{ requestId: string; action: 'allow' | 'ask' | 'deny' }> = []
+  permissionHook?: 'claude' | 'codex'
   stops = 0
   disconnects = 0
   preserveOnDisconnect = vi.fn(async (): Promise<void> => undefined)
@@ -507,6 +508,252 @@ describe('SessionController recovery evidence', () => {
     expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
   })
 
+  it('uses Codex PermissionRequest payloads without terminal input', async () => {
+    const base = fixture()
+    const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
+    const session = await controller.startSession(request())
+    base.handles[0]!.permissionHook = 'codex'
+    base.handles[0]!.emit({
+      type: 'permission-request',
+      hookSource: 'codex',
+      requestId: 'codex-shell-1',
+      toolName: 'Shell',
+      command: 'Set-Content package.json updated',
+      operation: 'write',
+      nativeSessionId: 'thread-1',
+      turnId: 'turn-1',
+      cwd: 'B:\\work',
+      model: 'gpt-5.6',
+      permissionMode: 'on-request',
+      transcriptPath: 'C:\\codex\\rollout.jsonl',
+      toolInput: { command: 'Set-Content package.json updated' },
+      rawPayload: { hook_event_name: 'PermissionRequest', turn_id: 'turn-1' },
+    })
+    await settle()
+
+    expect(controller.listPendingApprovals()).toEqual([
+      expect.objectContaining({
+        sessionId: session.sessionId,
+        source: 'codex-hook',
+        requestId: 'codex-shell-1',
+        nativeTurnId: 'turn-1',
+        hookCwd: 'B:\\work',
+        hookModel: 'gpt-5.6',
+        permissionMode: 'on-request',
+        toolInput: { command: 'Set-Content package.json updated' },
+      }),
+    ])
+    controller.approveRequest('codex-shell-1')
+    expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'codex-shell-1', action: 'allow' }])
+    expect(base.handles[0]!.writes).toEqual([])
+  })
+
+  it('falls back to a complete Codex command prompt when its Hook does not arrive', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
+      await controller.startSession(request())
+      base.handles[0]!.permissionHook = 'codex'
+      base.handles[0]!.emit({
+        type: 'output',
+        data: [
+          '• Running git apply --recount --ignore-space-change --ignore-whitespace .rc2-governance-v2.patch',
+          'Would you like to run the following command?',
+          'Environment: local',
+          'Reason: 是否允许我在沙箱外应用同一份 RC2 治理补丁，并兼容现有文档的 CRLF 行尾？',
+          '$ git apply --recount --ignore-space-change --ignore-whitespace .rc2-governance-v2.patch',
+          '› 1. Yes, proceed (y)',
+          '2. Yes, and don\'t ask again',
+          '3. No, and tell Codex what to do differently (esc)',
+        ].join('\r\n'),
+      })
+
+      await vi.advanceTimersByTimeAsync(999)
+      expect(controller.listPendingApprovals()).toEqual([])
+      await vi.advanceTimersByTimeAsync(1)
+      expect(controller.listPendingApprovals()).toEqual([
+        expect.objectContaining({
+          source: 'terminal',
+          command: 'git apply --recount --ignore-space-change --ignore-whitespace .rc2-governance-v2.patch',
+          agentReason: '是否允许我在沙箱外应用同一份 RC2 治理补丁，并兼容现有文档的 CRLF 行尾？',
+        }),
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels the Codex terminal fallback when the structured Hook arrives', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
+      await controller.startSession(request())
+      base.handles[0]!.permissionHook = 'codex'
+      base.handles[0]!.emit({
+        type: 'output',
+        data: '$ git apply fix.patch\r\nWould you like to run the following command?\r\n1. Yes, proceed\r\n2. No',
+      })
+      await vi.advanceTimersByTimeAsync(500)
+      base.handles[0]!.emit({
+        type: 'permission-request', requestId: 'codex-hook-wins', hookSource: 'codex',
+        toolName: 'Shell', command: 'git apply fix.patch', operation: 'write',
+      })
+      await vi.advanceTimersByTimeAsync(1_000)
+
+      expect(controller.listPendingApprovals()).toEqual([
+        expect.objectContaining({ requestId: 'codex-hook-wins', source: 'codex-hook', command: 'git apply fix.patch' }),
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not treat Claude subagent repaint text as approval when its Hook is active', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
+      await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+      base.handles[0]!.permissionHook = 'claude'
+      base.handles[0]!.emit({
+        type: 'output',
+        data: 'Subagent tool call: Bash git status\r\nAllow this tool use?\r\n1. Yes\r\n2. No',
+      })
+      await vi.advanceTimersByTimeAsync(5_000)
+
+      expect(controller.listPendingApprovals()).toEqual([])
+      expect(base.handles[0]!.writes).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('falls back for a real Claude forwarded subagent permission prompt when its Hook is active', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
+      await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+      base.handles[0]!.permissionHook = 'claude'
+      base.handles[0]!.emit({
+        type: 'output',
+        data: [
+          'Write file · from the Explore agent',
+          'Write(F:\\puwo\\native-api\\MigrationReview.md)',
+          'Do you want to proceed?',
+          '❯ 1. Yes',
+          '2. Yes, allow reading during this session',
+          '3. No',
+        ].join('\r\n'),
+      })
+
+      await vi.advanceTimersByTimeAsync(999)
+      expect(controller.listPendingApprovals()).toEqual([])
+      await vi.advanceTimersByTimeAsync(1)
+      expect(controller.listPendingApprovals()).toEqual([
+        expect.objectContaining({ source: 'terminal', command: 'tool:Write' }),
+      ])
+      expect(base.handles[0]!.writes).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('auto-approves a real Claude forwarded subagent prompt once without repaint duplicates', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const activity = { approved: vi.fn(), blocked: vi.fn() }
+      const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine(), undefined, activity)
+      const session = await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+      base.handles[0]!.permissionHook = 'claude'
+      await controller.setFullAutoMode(session.sessionId, true)
+      const prompt = [
+        'Read file · from the Explore agent',
+        'Read(F:\\puwo\\native-api\\FoshanBillService.cs · lines 340-549)',
+        'Do you want to proceed?',
+        '❯ 1. Yes',
+        '2. Yes, allow reading during this session',
+        '3. No',
+      ].join('\r\n')
+
+      base.handles[0]!.emit({ type: 'output', data: prompt })
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(base.handles[0]!.writes).toEqual(['\r'])
+      expect(activity.approved).not.toHaveBeenCalled()
+
+      base.handles[0]!.emit({ type: 'output', data: prompt })
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(base.handles[0]!.writes).toEqual(['\r'])
+      expect(activity.approved).not.toHaveBeenCalled()
+      expect(controller.listPendingApprovals()).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels a forwarded Claude terminal fallback when a structured Hook arrives', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
+      await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+      base.handles[0]!.permissionHook = 'claude'
+      base.handles[0]!.emit({
+        type: 'output',
+        data: [
+          'Write file · from the Explore agent',
+          'Write(F:\\puwo\\native-api\\MigrationReview.md)',
+          'Do you want to proceed?',
+          '❯ 1. Yes',
+          '2. Yes, allow writing during this session',
+          '3. No',
+        ].join('\r\n'),
+      })
+      await vi.advanceTimersByTimeAsync(500)
+      base.handles[0]!.emit({
+        type: 'permission-request', requestId: 'forwarded-hook-wins', hookSource: 'claude',
+        toolName: 'Write', operation: 'write', agentId: 'subagent-1', agentType: 'Explore',
+      })
+      await vi.advanceTimersByTimeAsync(1_000)
+
+      expect(controller.listPendingApprovals()).toEqual([
+        expect.objectContaining({ requestId: 'forwarded-hook-wins', source: 'claude-hook', command: 'tool:Write' }),
+      ])
+      expect(base.handles[0]!.writes).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('merges an exact main/subagent Claude Hook clone even when tool-use IDs differ', async () => {
+    const base = fixture()
+    const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
+    await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+    const fingerprint = 'a'.repeat(64)
+    base.handles[0]!.emit({
+      type: 'permission-request', requestId: 'claude-main-1', hookSource: 'claude',
+      toolName: 'PowerShell', command: 'Set-Content package.json updated', operation: 'write',
+      toolUseId: 'tool-main-1', toolInputFingerprint: fingerprint,
+    })
+    base.handles[0]!.emit({
+      type: 'permission-request', requestId: 'claude-child-1', hookSource: 'claude',
+      toolName: 'PowerShell', command: 'Set-Content package.json updated', operation: 'write',
+      toolUseId: 'tool-child-1', toolInputFingerprint: fingerprint,
+      agentId: 'subagent-1', agentType: 'Explore',
+    })
+    await settle()
+
+    expect(controller.listPendingApprovals().map((item) => item.requestId)).toEqual(['claude-main-1'])
+    controller.approveRequest('claude-main-1')
+    expect(base.handles[0]!.permissionResponses).toEqual([
+      { requestId: 'claude-main-1', action: 'allow' },
+      { requestId: 'claude-child-1', action: 'allow' },
+    ])
+  })
+
   it('lets a structured Claude Hook replace an earlier terminal-text candidate', async () => {
     vi.useFakeTimers()
     try {
@@ -887,13 +1134,11 @@ describe('SessionController recovery evidence', () => {
       await vi.advanceTimersByTimeAsync(2_999)
       expect(base.handles[0]!.writes).toEqual([])
       await vi.advanceTimersByTimeAsync(1)
-      expect(base.handles[0]!.writes).toEqual(['continue'])
-      await vi.advanceTimersByTimeAsync(75)
-      expect(base.handles[0]!.writes).toEqual(['continue', '\r'])
+      expect(base.handles[0]!.writes).toEqual(['continue\r'])
       expect(activity.keywordMatched).toHaveBeenCalledWith(session.sessionId, 'please retry')
       expect(activity.keywordContinued).toHaveBeenCalledWith(session.sessionId, 'please retry')
       await vi.advanceTimersByTimeAsync(10_000)
-      expect(base.handles[0]!.writes).toEqual(['continue', '\r'])
+      expect(base.handles[0]!.writes).toEqual(['continue\r'])
     } finally {
       vi.useRealTimers()
     }
@@ -915,7 +1160,7 @@ describe('SessionController recovery evidence', () => {
       await vi.advanceTimersByTimeAsync(2_999)
       expect(base.handles[0]!.writes).toEqual([])
       await vi.advanceTimersByTimeAsync(1)
-      expect(base.handles[0]!.writes).toEqual(['continue'])
+      expect(base.handles[0]!.writes).toEqual(['continue\r'])
     } finally {
       vi.useRealTimers()
     }
@@ -966,7 +1211,7 @@ describe('SessionController recovery evidence', () => {
       vi.useRealTimers()
     }
   })
-  it('defers keyword Continue while the Agent keeps producing output', async () => {
+  it('cancels keyword Continue when the Agent keeps producing output', async () => {
     vi.useFakeTimers()
     try {
       const base = fixture()
@@ -980,10 +1225,8 @@ describe('SessionController recovery evidence', () => {
       base.handles[0]!.emit({ type: 'output', data: 'please retry' })
       await vi.advanceTimersByTimeAsync(2_000)
       base.handles[0]!.emit({ type: 'output', data: 'Agent is retrying itself' })
-      await vi.advanceTimersByTimeAsync(2_999)
+      await vi.advanceTimersByTimeAsync(10_000)
       expect(base.handles[0]!.writes).toEqual([])
-      await vi.advanceTimersByTimeAsync(1)
-      expect(base.handles[0]!.writes).toEqual(['continue'])
       expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
     } finally {
       vi.useRealTimers()

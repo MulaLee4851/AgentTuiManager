@@ -23,6 +23,7 @@ const hostId = argument('--host-id')
 const endpoint = argument('--endpoint')
 const exitPath = argument('--exit-path')
 const claudeSettingsPath = `${exitPath}.claude-settings.json`
+const codexHookLauncherPath = `${exitPath}.codex-hook.${process.platform === 'win32' ? 'cmd' : 'sh'}`
 const clients = new Set<Socket>()
 const permissionHookToken = randomBytes(24).toString('hex')
 const permissionHookSockets = new Map<string, Socket>()
@@ -86,6 +87,7 @@ async function finalizeExit(exitCode: number, signal?: number, reason: HostExitF
     broadcast({ type: 'error', message: `Failed to persist final exit: ${error instanceof Error ? error.message : String(error)}` })
   } finally {
     await unlink(claudeSettingsPath).catch(() => undefined)
+    await unlink(codexHookLauncherPath).catch(() => undefined)
     terminal = undefined
     terminalStateReplay?.dispose()
     terminalStateReplay = undefined
@@ -116,15 +118,35 @@ function ensureManagerLeaseTimer(): void {
   managerLeaseTimer.unref()
 }
 
-function hookCommand(): string {
+function hookCommand(scriptName = 'claude-permission-hook.js'): string {
   const executable = process.execPath.replace(/"/g, '""')
-  const script = join(__dirname, 'claude-permission-hook.js').replace(/"/g, '""')
+  const script = join(__dirname, scriptName).replace(/"/g, '""')
   return process.platform === 'win32'
     ? `set "ELECTRON_RUN_AS_NODE=1" && "${executable}" "${script}"`
     : `ELECTRON_RUN_AS_NODE=1 "${executable}" "${script}"`
 }
 
-function claudeArgs(args: string[], cwd: string): string[] {
+function codexHookCommand(): string {
+  const executable = process.execPath.replace(/"/g, '""')
+  const script = join(__dirname, 'codex-permission-hook.js').replace(/"/g, '""')
+  if (process.platform === 'win32') {
+    writeFileSync(codexHookLauncherPath, [
+      '@echo off',
+      'set "ELECTRON_RUN_AS_NODE=1"',
+      `"${executable}" "${script}"`,
+      '',
+    ].join('\r\n'), { encoding: 'utf8', mode: 0o700 })
+    return `cmd.exe /d /c call "${codexHookLauncherPath.replace(/"/g, '""')}"`
+  }
+  writeFileSync(codexHookLauncherPath, [
+    '#!/bin/sh',
+    `ELECTRON_RUN_AS_NODE=1 exec "${executable}" "${script}"`,
+    '',
+  ].join('\n'), { encoding: 'utf8', mode: 0o700 })
+  return `"${codexHookLauncherPath.replace(/"/g, '\\"')}"`
+}
+
+function claudeArgs(args: string[], cwd: string): { args: string[]; permissionHook: boolean } {
   const remaining = [...args]
   let existing: Record<string, unknown> = {}
   const settingsIndex = remaining.findIndex((value) => value === '--settings' || value.startsWith('--settings='))
@@ -139,7 +161,7 @@ function claudeArgs(args: string[], cwd: string): string[] {
         remaining.splice(settingsIndex, flag === '--settings' ? 2 : 1)
       } catch {
         // Keep the user's original flag intact; text detection remains available.
-        return args
+        return { args, permissionHook: false }
       }
     }
   }
@@ -161,13 +183,19 @@ function claudeArgs(args: string[], cwd: string): string[] {
     },
   }
   writeFileSync(claudeSettingsPath, JSON.stringify(settings), { encoding: 'utf8', mode: 0o600 })
-  return ['--settings', claudeSettingsPath, ...remaining]
+  return { args: ['--settings', claudeSettingsPath, ...remaining], permissionHook: true }
 }
 
 function codexArgs(args: string[]): string[] {
   const quote = String.fromCharCode(34)
+  const hookConfig = '[{ matcher = "*", hooks = [{ type = "command", command = '
+    + JSON.stringify(codexHookCommand())
+    + ', timeoutSec = 1800, statusMessage = "请稍后" }] }]'
   return [
     ...(args.includes('--no-alt-screen') ? [] : ['--no-alt-screen']),
+    ...(args.includes('--enable') && args.includes('hooks') ? [] : ['--enable', 'hooks']),
+    ...(args.includes('--dangerously-bypass-hook-trust') ? [] : ['--dangerously-bypass-hook-trust']),
+    '-c', `hooks.PermissionRequest=${hookConfig}`,
     '-c', 'tui.notifications=[' + quote + 'approval-requested' + quote + ']',
     '-c', 'tui.notification_method=' + quote + 'osc9' + quote,
     '-c', 'tui.notification_condition=' + quote + 'always' + quote,
@@ -205,11 +233,13 @@ function startTerminal(socket: Socket, command: Extract<HostCommand, { type: 'st
   try {
     const pendingOutput: string[] = []
     let ready = false
-    const args = command.agentKind === 'claude'
-      ? claudeArgs(command.args, command.cwd)
-      : command.agentKind === 'codex'
-        ? codexArgs(command.args)
-        : command.args
+    const claudeLaunch = command.agentKind === 'claude' ? claudeArgs(command.args, command.cwd) : undefined
+    const args = claudeLaunch?.args ?? (command.agentKind === 'codex' ? codexArgs(command.args) : command.args)
+    const permissionHook = command.agentKind === 'codex'
+      ? 'codex' as const
+      : claudeLaunch?.permissionHook
+        ? 'claude' as const
+        : undefined
     const spawnOptions: pty.IPtyForkOptions = {
       cwd: command.cwd,
       cols: command.cols,
@@ -239,7 +269,7 @@ function startTerminal(socket: Socket, command: Extract<HostCommand, { type: 'st
       void finalizeExit(exitCode, signal, terminalExitReason)
     })
 
-    send(socket, { type: 'ready', hostId })
+    send(socket, { type: 'ready', hostId, ...(permissionHook ? { permissionHook } : {}) })
     ready = true
     for (const data of pendingOutput) broadcast({ type: 'output', data })
   } catch (error) {
@@ -266,6 +296,7 @@ function handleCommand(socket: Socket, command: HostCommand): void {
       broadcast({
         type: 'permission-request',
         requestId: command.requestId,
+        hookSource: command.hookSource,
         toolName: command.toolName,
         ...(command.command ? { command: command.command } : {}),
         ...(command.operation ? { operation: command.operation } : {}),
@@ -277,6 +308,14 @@ function handleCommand(socket: Socket, command: HostCommand): void {
         ...(command.agentId ? { agentId: command.agentId } : {}),
         ...(command.agentType ? { agentType: command.agentType } : {}),
         ...(command.toolInputFingerprint ? { toolInputFingerprint: command.toolInputFingerprint } : {}),
+        ...(command.nativeSessionId ? { nativeSessionId: command.nativeSessionId } : {}),
+        ...(command.turnId ? { turnId: command.turnId } : {}),
+        ...(command.cwd ? { cwd: command.cwd } : {}),
+        ...(command.model ? { model: command.model } : {}),
+        ...(command.permissionMode ? { permissionMode: command.permissionMode } : {}),
+        ...(command.transcriptPath ? { transcriptPath: command.transcriptPath } : {}),
+        ...(command.toolInput !== undefined ? { toolInput: command.toolInput } : {}),
+        ...(command.rawPayload !== undefined ? { rawPayload: command.rawPayload } : {}),
       })
       break
     case 'permission-response': {

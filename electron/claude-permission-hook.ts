@@ -115,7 +115,9 @@ async function main(): Promise<void> {
     const timer = setTimeout(() => finish('ask'), 30 * 60_000)
     socket.setEncoding('utf8')
     socket.once('connect', () => socket.write(`${JSON.stringify({
-      type: 'permission-hook', token, requestId, toolName: input.tool_name,
+      type: 'permission-hook', token, requestId, hookSource: 'claude', toolName: input.tool_name,
+      toolInput: input.tool_input,
+      rawPayload: input,
       ...(boundedText(input.tool_use_id, 256) ? { toolUseId: boundedText(input.tool_use_id, 256) } : {}),
       ...(boundedText(input.agent_id, 256) ? { agentId: boundedText(input.agent_id, 256) } : {}),
       ...(boundedText(input.agent_type, 128) ? { agentType: boundedText(input.agent_type, 128) } : {}),

@@ -56,16 +56,20 @@ export function canonicalNativeRecovery(
   initialArgs: string[],
   suppliedRecovery: RecoveryRecipe | undefined,
 ): RecoveryRecipe {
-  const resumeArgs = agentKind === 'codex'
+  const resumePrefix = agentKind === 'codex'
     ? ['--no-alt-screen', 'resume', nativeSessionId]
     : agentKind === 'claude'
       ? ['--resume', nativeSessionId]
       : undefined
-  if (!resumeArgs || !sameStrings(initialArgs, resumeArgs) || !suppliedRecovery
+  const hasCanonicalArgs = Boolean(resumePrefix
+    && initialArgs.length >= resumePrefix.length
+    && resumePrefix.every((value, index) => initialArgs[index] === value)
+    && (agentKind === 'codex' || sameStrings(initialArgs, resumePrefix)))
+  if (!resumePrefix || !hasCanonicalArgs || !suppliedRecovery
     || !sameExecutable(suppliedRecovery.executable, executable)
-    || !sameStrings(suppliedRecovery.args, resumeArgs)
+    || !sameStrings(suppliedRecovery.args, initialArgs)
     || suppliedRecovery.continueInput !== undefined) {
     throw new Error('Invalid native resume request')
   }
-  return { executable, args: resumeArgs }
+  return { executable, args: [...initialArgs] }
 }

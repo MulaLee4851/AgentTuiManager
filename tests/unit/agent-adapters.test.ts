@@ -251,4 +251,23 @@ describe('native agent adapters', () => {
     )
     expect(next).toMatchObject({ approvalRequired: true, approvalCommand: 'git status' })
   })
+
+  it('recognizes a wrapped Claude mailbox approval from a general-purpose subagent', () => {
+    const adapter = createAgentAdapter('claude')
+    const result = adapter.observeOutput([
+      'Read file · from the general-purpose',
+      'agent',
+      'Read(B:\\AiDemo\\CLAUDE.md)',
+      'Do you want to proceed?',
+      '❯ 1. Yes',
+      '2. Yes, allow reading from /b/AiDemo during this session',
+      '3. No',
+    ].join('\r\n'))
+
+    expect(result).toMatchObject({
+      approvalRequired: true,
+      approvalCommand: 'tool:Read',
+      forwardedSubagentApproval: true,
+    })
+  })
 })

@@ -5,6 +5,7 @@ export interface AgentObservation {
   approvalRequired: boolean
   approvalCommand?: string
   approvalReason?: string
+  forwardedSubagentApproval?: boolean
   ready: boolean
   recoverableError?: {
     code: 'model-capacity'
@@ -27,7 +28,7 @@ export interface AgentAdapter {
 // Approval modals keep the command next to the prompt. Eight KiB covers the
 // maximum supported command plus redraw noise without rescanning a full TUI
 // screen on every small PTY output chunk.
-const MAX_EVIDENCE_CHARACTERS = 8_192
+const MAX_EVIDENCE_CHARACTERS = 32_768
 export const MODEL_CAPACITY_ERROR = 'Selected model is at capacity. Please try a different model.'
 
 function terminalText(value: string): string {
@@ -186,6 +187,12 @@ function hasApprovalInteraction(evidence: string): boolean {
 }
 
 
+function hasClaudeForwardedSubagentMarker(evidence: string): boolean {
+  const compact = evidence.replace(/\s+/g, ' ')
+  return /\bfrom the [^\r\n]{1,160}?\bagent\b/i.test(compact)
+}
+
+
 export function extractApprovalCommand(evidence: string): string | undefined {
   const normalizedEvidence = evidence.toLocaleLowerCase('en-US')
   const editApproval = Math.max(
@@ -298,6 +305,13 @@ class ClaudeAdapter extends EvidenceAdapter {
     const approvalCommand = approvalPhrase ? extractApprovalCommand(evidence) : undefined
     const approvalReason = approvalPhrase ? extractApprovalReason(evidence) : undefined
     const approvalRequired = approvalPhrase && (approvalCommand !== undefined || hasApprovalInteraction(evidence))
+    // Claude's local-agent mailbox renders a real permission dialog in the leader
+    // TUI without invoking command PermissionRequest hooks. Keep this deliberately
+    // narrow: ordinary subagent progress/repaint text must not become an approval.
+    const forwardedSubagentApproval = approvalRequired
+      && hasClaudeForwardedSubagentMarker(evidence)
+      && /(?:do you want to proceed|would you like to proceed)\?/i.test(evidence)
+      && hasApprovalInteraction(evidence)
     const hasIdentity = /claude\s+code/i.test(evidence)
     const hasPrompt = /(?:^|[\r\n])\s*[❯›]\s*(?:$|[\r\n])/m.test(evidence)
       || /\? for shortcuts/i.test(evidence)
@@ -305,6 +319,7 @@ class ClaudeAdapter extends EvidenceAdapter {
       approvalRequired,
       ...(approvalCommand ? { approvalCommand } : {}),
       ...(approvalReason ? { approvalReason } : {}),
+      ...(forwardedSubagentApproval ? { forwardedSubagentApproval: true } : {}),
       ready: !approvalRequired && hasIdentity && hasPrompt,
     }
   }

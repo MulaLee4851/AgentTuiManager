@@ -29,11 +29,20 @@ describe('start request policy', () => {
     expect(canonicalNativeRecovery('codex', 'native-1', 'codex', ['--no-alt-screen', 'resume', 'native-1'], {
       executable: 'codex', args: ['--no-alt-screen', 'resume', 'native-1'],
     })).toEqual({ executable: 'codex', args: ['--no-alt-screen', 'resume', 'native-1'] })
+    expect(canonicalNativeRecovery('codex', 'native-1', 'codex', ['--no-alt-screen', 'resume', 'native-1', '--dangerously-bypass-approvals-and-sandbox'], {
+      executable: 'codex', args: ['--no-alt-screen', 'resume', 'native-1', '--dangerously-bypass-approvals-and-sandbox'],
+    })).toEqual({ executable: 'codex', args: ['--no-alt-screen', 'resume', 'native-1', '--dangerously-bypass-approvals-and-sandbox'] })
     expect(() => canonicalNativeRecovery('codex', 'native-1', 'codex', ['--no-alt-screen', 'resume', 'native-1', '--extra'], {
       executable: 'codex', args: ['--no-alt-screen', 'resume', 'native-1'],
     })).toThrow(/resume/i)
+    expect(() => canonicalNativeRecovery('codex', 'native-1', 'codex', ['--no-alt-screen', 'resume', 'other-native', '--extra'], {
+      executable: 'codex', args: ['--no-alt-screen', 'resume', 'other-native', '--extra'],
+    })).toThrow(/resume/i)
     expect(() => canonicalNativeRecovery('claude', 'native-1', 'claude', ['--resume', 'native-1'], {
       executable: 'pwsh.exe', args: ['--resume', 'native-1'],
+    })).toThrow(/resume/i)
+    expect(() => canonicalNativeRecovery('claude', 'native-1', 'claude', ['--resume', 'native-1', '--extra'], {
+      executable: 'claude', args: ['--resume', 'native-1', '--extra'],
     })).toThrow(/resume/i)
   })
 

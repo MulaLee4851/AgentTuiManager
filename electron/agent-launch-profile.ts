@@ -60,6 +60,10 @@ function configuredArgs(agentKind: AgentKind, baseArgs: string[], profile: Store
   if (overrides.length === 0) return args
   if (agentKind === 'codex') {
     const resumeIndex = args.indexOf('resume')
+    // Provider/model overrides must stay in the root invocation. Putting them
+    // after `resume <id>` changes the config scope in Codex and can prevent the
+    // session-level PermissionRequest hook from handling approvals. User-entered
+    // resume flags are already part of baseArgs and remain after the session id.
     const insertion = resumeIndex >= 0 ? resumeIndex : args.length
     return [...args.slice(0, insertion), ...overrides, ...args.slice(insertion)]
   }

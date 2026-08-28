@@ -23,6 +23,7 @@ export interface HostRecord {
   agentConfig?: AgentConfigSummary
   agentProxy?: AgentProxySummary
   fullAutoEnabled?: boolean
+  permissionHook?: 'claude' | 'codex'
   pid: number
   endpoint: string
   lifecycle: 'starting' | 'running'
@@ -59,6 +60,7 @@ export interface HostMetadataUpdate {
 
 export interface HostHandle {
   readonly hostId: string
+  readonly permissionHook?: 'claude' | 'codex'
   nextEvent(timeoutMs?: number): Promise<HostEvent>
   ping(timeoutMs: number): Promise<'managed' | 'preserved' | 'unclaimed'>
   write(data: string): void
@@ -108,6 +110,7 @@ async function atomicWriteJson(path: string, value: unknown): Promise<void> {
 
 class PipeHostHandle implements HostHandle {
   readonly hostId: string
+  permissionHook?: 'claude' | 'codex'
   private readonly socket: Socket
   private readonly events: HostEvent[] = []
   private readonly waiters: EventWaiter[] = []
@@ -407,7 +410,14 @@ export class SessionHostManager {
       if (event.type !== 'ready') {
         throw new Error(event.type === 'error' ? event.message : `Expected ready, received ${event.type}`)
       }
-      await this.writeRecord({ ...pendingRecord, pid: child.pid, lifecycle: 'running', updatedAt: new Date().toISOString() })
+      handle.permissionHook = event.permissionHook
+      await this.writeRecord({
+        ...pendingRecord,
+        pid: child.pid,
+        lifecycle: 'running',
+        ...(event.permissionHook ? { permissionHook: event.permissionHook } : {}),
+        updatedAt: new Date().toISOString(),
+      })
       return handle
     } catch (error) {
       handle?.disconnect()
@@ -420,6 +430,7 @@ export class SessionHostManager {
   async reconnect(hostId: string): Promise<HostHandle> {
     const record = await this.readRecord(hostId)
     const handle = await this.connect(record.hostId, record.endpoint)
+    handle.permissionHook = record.permissionHook
     try {
       await handle.ping(this.timeoutMs)
       handle.claim()
@@ -528,6 +539,8 @@ export class SessionHostManager {
       unlink(this.registryPath(hostId)).catch(() => undefined),
       unlink(this.exitPath(hostId)).catch(() => undefined),
       unlink(`${this.exitPath(hostId)}.claude-settings.json`).catch(() => undefined),
+      unlink(`${this.exitPath(hostId)}.codex-hook.cmd`).catch(() => undefined),
+      unlink(`${this.exitPath(hostId)}.codex-hook.sh`).catch(() => undefined),
       ...(process.platform === 'win32' ? [] : [unlink(join(this.socketDir, `${hostId}.sock`)).catch(() => undefined)]),
     ])
   }

@@ -123,6 +123,12 @@ interface ManagedSession {
     observation: AgentObservation
     eventData: string
   }
+  pendingCodexTerminalApproval?: {
+    timer: ReturnType<typeof setTimeout>
+    generation: number
+    observation: AgentObservation
+    eventData: string
+  }
   pendingTerminalAutoApproval?: {
     command: string
     generation: number
@@ -167,9 +173,9 @@ const HOST_HEALTH_PROBE_TIMEOUT_MS = 1_000
 const HOST_HEALTH_FAILURE_LIMIT = 3
 
 const TRANSIENT_RETRY_DELAY_MS = 3_000
-const CONTINUE_SUBMIT_DELAY_MS = 75
 const MAX_PENDING_HOST_INPUT = 64 * 1024
 const CLAUDE_TERMINAL_APPROVAL_FALLBACK_MS = 1_000
+const CODEX_TERMINAL_APPROVAL_FALLBACK_MS = 1_000
 const CLAUDE_TERMINAL_REDRAW_GUARD_MS = 3_000
 const CLAUDE_HOOK_DUPLICATE_WINDOW_MS = 3_000
 const TERMINAL_AUTO_APPROVAL_REDRAW_GUARD_MS = 3_000
@@ -462,6 +468,8 @@ export class SessionController {
       if (managed.summary.agentKind === 'claude') {
         this.cancelClaudeTerminalApproval(managed)
         managed.claudeTerminalFallbackBlockedUntil = 0
+      } else if (managed.summary.agentKind === 'codex') {
+        this.cancelCodexTerminalApproval(managed)
       }
       if (!isTerminalProtocolResponse(data)) managed.continueKeywordAttempted.clear()
       this.cancelTransientRetry(managed, true)
@@ -486,15 +494,19 @@ export class SessionController {
     }
     else if (data.length > 0) {
       managed.pendingUserInterrupt = false
-      const claudeHookApproval = managed.summary.agentKind === 'claude' && /^[\r\n]+$/.test(data)
-        ? managed.approvalRequests.find((request) => request.source === 'claude-hook')
+      const hookApproval = /^[\r\n]+$/.test(data)
+        ? managed.approvalRequests.find((request) => request.source !== 'terminal')
         : undefined
       const terminalApproval = managed.approvalRequests.find((request) => request.source === 'terminal')
-      if (claudeHookApproval) {
+      if (hookApproval) {
         managed.adapter.acknowledgeUserInput(true)
-        managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
-        this.respondToClaudeHook(managed, claudeHookApproval.requestId, 'allow')
-        this.completeManualApproval(managed, claudeHookApproval)
+        if (hookApproval.source === 'claude-hook') {
+          managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
+          this.respondToClaudeHook(managed, hookApproval.requestId, 'allow')
+        } else {
+          managed.handle.respondToPermission(hookApproval.requestId, 'allow')
+        }
+        this.completeManualApproval(managed, hookApproval)
         handledClaudeHookApproval = true
       } else if (terminalApproval && /[\r\n]/.test(data)) {
         managed.adapter.acknowledgeUserInput(true)
@@ -531,11 +543,15 @@ export class SessionController {
 
   approveRequest(requestId: string, recordManualApproval = true): void {
     const { managed, request } = this.requiredApproval(requestId)
-    if (request.source === 'claude-hook') {
+    if (request.source !== 'terminal') {
       this.cancelClaudeTerminalApproval(managed)
       managed.adapter.acknowledgeUserInput(true)
-      managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
-      this.respondToClaudeHook(managed, request.requestId, 'allow')
+      if (request.source === 'claude-hook') {
+        managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
+        this.respondToClaudeHook(managed, request.requestId, 'allow')
+      } else {
+        managed.handle.respondToPermission(request.requestId, 'allow')
+      }
     } else {
       managed.adapter.acknowledgeUserInput(true)
       managed.handle.write(managed.adapter.approvalInput())
@@ -556,11 +572,15 @@ export class SessionController {
 
   rejectRequest(requestId: string): void {
     const { managed, request } = this.requiredApproval(requestId)
-    if (request.source === 'claude-hook') {
+    if (request.source !== 'terminal') {
       this.cancelClaudeTerminalApproval(managed)
       managed.adapter.acknowledgeUserInput(true)
-      managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
-      this.respondToClaudeHook(managed, request.requestId, 'deny')
+      if (request.source === 'claude-hook') {
+        managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
+        this.respondToClaudeHook(managed, request.requestId, 'deny')
+      } else {
+        managed.handle.respondToPermission(request.requestId, 'deny')
+      }
     } else {
       managed.adapter.acknowledgeUserInput(true)
       managed.handle.write(managed.adapter.rejectionInput())
@@ -956,11 +976,15 @@ export class SessionController {
         if (observation.approvalRequired) {
           if (managed.summary.agentKind === 'claude') {
             this.scheduleClaudeTerminalApproval(managed, observation, event.data)
+          } else if (managed.summary.agentKind === 'codex' && managed.handle.permissionHook === 'codex') {
+            this.scheduleCodexTerminalApproval(managed, observation, event.data)
           } else {
             this.handleTerminalApproval(managed, observation, event.data)
           }
         } else if (managed.summary.agentKind === 'claude') {
           this.cancelClaudeTerminalApproval(managed)
+        } else if (managed.summary.agentKind === 'codex') {
+          this.cancelCodexTerminalApproval(managed)
         }
         const resumedNow = managed.awaitingRecoveryReady && observation.ready
         if (resumedNow) {
@@ -981,15 +1005,20 @@ export class SessionController {
       } else if (event.type === 'permission-request') {
         managed.agentReady = true
         this.cancelClaudeTerminalApproval(managed)
+        this.cancelCodexTerminalApproval(managed)
         this.removeTerminalApprovals(managed)
         managed.adapter.acknowledgeUserInput(true)
-        const hookIdentity = this.rememberClaudeHookIdentity(managed, event)
-        if (hookIdentity.agentId && this.resolveDuplicateClaudeHook(managed, hookIdentity)) {
-          this.syncApprovalSummary(managed)
-          this.changed(managed.summary.sessionId)
-          continue
+        const hookSource = event.hookSource ?? (managed.summary.agentKind === 'codex' ? 'codex' : 'claude')
+        if (hookSource === 'claude') {
+          const hookIdentity = this.rememberClaudeHookIdentity(managed, event)
+          if (hookIdentity.agentId && this.resolveDuplicateClaudeHook(managed, hookIdentity)) {
+            this.syncApprovalSummary(managed)
+            this.changed(managed.summary.sessionId)
+            continue
+          }
         }
-        const toolName = /^[A-Za-z][\w-]{0,63}$/.test(event.toolName) ? event.toolName : 'Unknown'
+        const approvalSource = hookSource === 'codex' ? 'codex-hook' as const : 'claude-hook' as const
+        const toolName = event.toolName.trim().slice(0, 256) || 'Unknown'
         const approvalCommand = event.command ?? `tool:${toolName}`
         const decision = this.approvalPolicy?.decide(approvalCommand)
         const approvalRisk = event.operation && event.operation !== 'unknown'
@@ -1011,23 +1040,34 @@ export class SessionController {
           ...(decision?.matchedDangerRule ? { dangerRuleId: decision.matchedDangerRule.id } : {}),
         })
         if (decision?.action === 'auto-approve' || fullAuto?.allowed && !llmReviewRequired) {
-          managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
-          this.respondToClaudeHook(managed, event.requestId, 'allow')
+          if (approvalSource === 'claude-hook') {
+            managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
+            this.respondToClaudeHook(managed, event.requestId, 'allow')
+          } else {
+            managed.handle.respondToPermission(event.requestId, 'allow')
+          }
           if (fullAuto?.allowed && decision?.action !== 'auto-approve') {
             this.fullAutoActivity?.approved(this.approvalForActivity(managed, {
-              requestId: event.requestId, source: 'claude-hook', risk: approvalRisk,
+              requestId: event.requestId, source: approvalSource, risk: approvalRisk,
               reason: event.reason ?? fullAuto.reason, toolName, command: approvalCommand,
               ...(event.filePath ? { filePath: event.filePath } : {}),
               ...(event.targetPaths?.length ? { targetPaths: [...event.targetPaths] } : {}),
               ...(event.toolInputSummary ? { inputSummary: event.toolInputSummary } : {}),
               ...(event.reason ? { agentReason: event.reason } : {}),
+              ...(event.turnId ? { nativeTurnId: event.turnId } : {}),
+              ...(event.cwd ? { hookCwd: event.cwd } : {}),
+              ...(event.model ? { hookModel: event.model } : {}),
+              ...(event.permissionMode ? { permissionMode: event.permissionMode } : {}),
+              ...(event.transcriptPath ? { transcriptPath: event.transcriptPath } : {}),
+              ...(event.toolInput !== undefined ? { toolInput: event.toolInput } : {}),
+              ...(event.rawPayload !== undefined ? { rawPayload: event.rawPayload } : {}),
             }))
           }
           this.syncApprovalSummary(managed)
         } else {
           const queued = this.queueApproval(managed, {
             requestId: event.requestId,
-            source: 'claude-hook',
+            source: approvalSource,
             risk: approvalRisk,
             reason: decision?.matchedDangerRule
               ? decision.reason
@@ -1038,6 +1078,13 @@ export class SessionController {
             ...(event.targetPaths?.length ? { targetPaths: [...event.targetPaths] } : {}),
             ...(event.toolInputSummary ? { inputSummary: event.toolInputSummary } : {}),
             ...(event.reason ? { agentReason: event.reason } : {}),
+            ...(event.turnId ? { nativeTurnId: event.turnId } : {}),
+            ...(event.cwd ? { hookCwd: event.cwd } : {}),
+            ...(event.model ? { hookModel: event.model } : {}),
+            ...(event.permissionMode ? { permissionMode: event.permissionMode } : {}),
+            ...(event.transcriptPath ? { transcriptPath: event.transcriptPath } : {}),
+            ...(event.toolInput !== undefined ? { toolInput: event.toolInput } : {}),
+            ...(event.rawPayload !== undefined ? { rawPayload: event.rawPayload } : {}),
             ...(decision?.matchedDangerRule ? {
               dangerRuleId: decision.matchedDangerRule.id,
               dangerRuleName: decision.matchedDangerRule.name,
@@ -1069,6 +1116,7 @@ export class SessionController {
     this.cancelKeywordContinue(managed)
     this.cancelPendingContinueSubmit(managed)
     this.cancelClaudeTerminalApproval(managed)
+    this.cancelCodexTerminalApproval(managed)
     managed.approvalRequests.length = 0
     this.clearClaudeHookState(managed)
     this.syncApprovalSummary(managed)
@@ -1352,17 +1400,10 @@ export class SessionController {
   private submitContinue(managed: ManagedSession): void {
     this.cancelPendingContinueSubmit(managed)
     const input = (managed.request?.recovery?.continueInput ?? 'continue').replace(/[\r\n]+$/g, '') || 'continue'
-    const generation = managed.generation
-    managed.handle.write(input)
-    const timer = setTimeout(() => {
-      if (managed.pendingContinueSubmit?.timer !== timer) return
-      delete managed.pendingContinueSubmit
-      if (managed.generation !== generation || managed.pendingUserInterrupt
-        || managed.summary.userStopRequested || isTerminalStatus(managed.summary.status)) return
-      managed.handle.write('\r')
-    }, CONTINUE_SUBMIT_DELAY_MS)
-    timer.unref?.()
-    managed.pendingContinueSubmit = { timer, generation }
+    if (managed.pendingUserInterrupt || managed.summary.userStopRequested || isTerminalStatus(managed.summary.status)) return
+    // Keep text and Enter in one PTY write. Splitting them could leave a visible
+    // but unsubmitted "continue" when state changed during the old 75 ms gap.
+    managed.handle.write(`${input}\r`)
   }
 
   private observeContinueKeyword(managed: ManagedSession, data: string, observation: AgentObservation): void {
@@ -1382,13 +1423,17 @@ export class SessionController {
     const maximum = Math.max(256, policy.maxKeywordLength() * 2)
     const previousTail = managed.continueKeywordTail
     managed.continueKeywordTail = (previousTail + data).slice(-maximum)
-    const current = managed.pendingKeywordContinue
     const matchedKeyword = policy.matchIncremental
       ? policy.matchIncremental(previousTail, data)
-      : policy.match(managed.continueKeywordTail)
-    const keyword = matchedKeyword ?? current?.keyword
-    if (!keyword || managed.continueKeywordAttempted.has(keyword)) return
-    const newlyMatched = !current || current.keyword !== keyword
+      : policy.match(data)
+    if (!matchedKeyword) {
+      // Any fresh output after a match means the Agent continued by itself.
+      // Never carry an old keyword forward until a later quiet period.
+      this.cancelKeywordContinue(managed)
+      return
+    }
+    const keyword = matchedKeyword
+    if (managed.continueKeywordAttempted.has(keyword)) return
     this.cancelKeywordContinue(managed)
     const generation = managed.generation
     const outputSequence = managed.outputSequence
@@ -1407,7 +1452,7 @@ export class SessionController {
     }, settings.quietSeconds * 1_000)
     timer.unref?.()
     managed.pendingKeywordContinue = { timer, generation, keyword, outputSequence }
-    if (newlyMatched) this.recoveryActivity?.keywordMatched(managed.summary.sessionId, keyword)
+    this.recoveryActivity?.keywordMatched(managed.summary.sessionId, keyword)
   }
 
   private cancelKeywordContinue(managed: ManagedSession): boolean {
@@ -1533,6 +1578,10 @@ export class SessionController {
   }
 
   private scheduleClaudeTerminalApproval(managed: ManagedSession, observation: AgentObservation, eventData: string): void {
+    // Claude local-agent mailbox approvals are rendered directly by the leader TUI
+    // and bypass command PermissionRequest hooks. Fall back only for that explicit
+    // prompt; all other Hook-enabled Claude output remains structure-only.
+    if (managed.handle.permissionHook === 'claude' && !observation.forwardedSubagentApproval) return
     if (Date.now() < (managed.claudeTerminalFallbackBlockedUntil ?? 0)) return
     if (managed.approvalRequests.some((request) => request.source === 'claude-hook')) return
     const pending = managed.pendingClaudeTerminalApproval
@@ -1562,6 +1611,38 @@ export class SessionController {
     if (!managed.pendingClaudeTerminalApproval) return
     clearTimeout(managed.pendingClaudeTerminalApproval.timer)
     delete managed.pendingClaudeTerminalApproval
+  }
+
+  private scheduleCodexTerminalApproval(managed: ManagedSession, observation: AgentObservation, eventData: string): void {
+    if (managed.approvalRequests.some((request) => request.source === 'codex-hook')) return
+    const pending = managed.pendingCodexTerminalApproval
+    if (pending) {
+      pending.observation = observation
+      pending.eventData = eventData
+      return
+    }
+    const generation = managed.generation
+    const scheduled = {
+      generation,
+      observation,
+      eventData,
+      timer: setTimeout(() => {
+        if (managed.pendingCodexTerminalApproval !== scheduled) return
+        delete managed.pendingCodexTerminalApproval
+        if (managed.generation !== generation || managed.summary.userStopRequested
+          || isTerminalStatus(managed.summary.status)
+          || managed.approvalRequests.some((request) => request.source === 'codex-hook')) return
+        this.handleTerminalApproval(managed, scheduled.observation, scheduled.eventData)
+      }, CODEX_TERMINAL_APPROVAL_FALLBACK_MS),
+    }
+    scheduled.timer.unref?.()
+    managed.pendingCodexTerminalApproval = scheduled
+  }
+
+  private cancelCodexTerminalApproval(managed: ManagedSession): void {
+    if (!managed.pendingCodexTerminalApproval) return
+    clearTimeout(managed.pendingCodexTerminalApproval.timer)
+    delete managed.pendingCodexTerminalApproval
   }
 
   private removeTerminalApprovals(managed: ManagedSession): void {
@@ -1703,7 +1784,10 @@ export class SessionController {
   }
 
   private schedulePendingTerminalAutoApproval(managed: ManagedSession, command: string | undefined): void {
-    if (!command) return
+    // The bounded confirmation retry exists only for Codex OSC notifications,
+    // which can arrive before its raw prompt starts reading. Claude dialogs are
+    // already interactive when painted; a second Enter can leak into the next UI.
+    if (managed.summary.agentKind !== 'codex' || !command) return
     this.cancelPendingTerminalAutoApproval(managed)
     const generation = managed.generation
     const pending: ManagedSession['pendingTerminalAutoApproval'] = {
@@ -1817,10 +1901,17 @@ export class SessionController {
     allowMainToSubagentClone: boolean,
   ): boolean {
     if (Math.abs(existing.createdAt - candidate.createdAt) > CLAUDE_HOOK_DUPLICATE_WINDOW_MS) return false
-    if (existing.toolUseId && candidate.toolUseId) return existing.toolUseId === candidate.toolUseId
+    if (existing.toolUseId && candidate.toolUseId && existing.toolUseId === candidate.toolUseId) return true
     if (existing.fingerprint !== candidate.fingerprint) return false
-    if (existing.agentId && candidate.agentId) return existing.agentId === candidate.agentId
-    return allowMainToSubagentClone && !existing.agentId && Boolean(candidate.agentId)
+    // Two requests from the same subagent with different tool-use IDs are real,
+    // independent calls even when their inputs happen to be identical. A main
+    // request and its subagent clone can carry different tool-use IDs, however;
+    // merge that exact-fingerprint pair into one user decision.
+    if (existing.agentId && candidate.agentId) {
+      return existing.agentId === candidate.agentId
+        && (!existing.toolUseId || !candidate.toolUseId)
+    }
+    return allowMainToSubagentClone && Boolean(existing.agentId) !== Boolean(candidate.agentId)
   }
 
   private respondToClaudeHook(
@@ -1889,7 +1980,7 @@ export class SessionController {
   private queueApproval(
     managed: ManagedSession,
     input: Pick<ApprovalRequest, 'requestId' | 'source' | 'risk' | 'reason'>
-      & Partial<Pick<ApprovalRequest, 'toolName' | 'command' | 'inputSummary' | 'filePath' | 'targetPaths' | 'agentReason' | 'dangerRuleId' | 'dangerRuleName'>>,
+      & Partial<Pick<ApprovalRequest, 'toolName' | 'command' | 'inputSummary' | 'filePath' | 'targetPaths' | 'agentReason' | 'dangerRuleId' | 'dangerRuleName' | 'nativeTurnId' | 'hookCwd' | 'hookModel' | 'permissionMode' | 'transcriptPath' | 'toolInput' | 'rawPayload'>>,
   ): ApprovalRequest {
     const terminalIndex = input.source === 'terminal'
       ? this.findTerminalApprovalToUpdate(managed, input.command)
@@ -1915,6 +2006,13 @@ export class SessionController {
       ...(input.inputSummary ? { inputSummary: input.inputSummary } : {}),
       ...(input.filePath ? { filePath: input.filePath } : {}),
       ...(input.targetPaths?.length ? { targetPaths: [...input.targetPaths] } : {}),
+      ...(input.nativeTurnId ? { nativeTurnId: input.nativeTurnId } : {}),
+      ...(input.hookCwd ? { hookCwd: input.hookCwd } : {}),
+      ...(input.hookModel ? { hookModel: input.hookModel } : {}),
+      ...(input.permissionMode ? { permissionMode: input.permissionMode } : {}),
+      ...(input.transcriptPath ? { transcriptPath: input.transcriptPath } : {}),
+      ...(input.toolInput !== undefined ? { toolInput: input.toolInput } : {}),
+      ...(input.rawPayload !== undefined ? { rawPayload: input.rawPayload } : {}),
       ...(input.dangerRuleId ? { dangerRuleId: input.dangerRuleId } : {}),
       ...(input.dangerRuleName ? { dangerRuleName: input.dangerRuleName } : {}),
       ...(preserveLlmReview && previous?.llmReviewStatus ? { llmReviewStatus: previous.llmReviewStatus } : {}),
@@ -1926,10 +2024,10 @@ export class SessionController {
     if (requestIndex >= 0) managed.approvalRequests[requestIndex] = request
     else managed.approvalRequests.push(request)
     this.syncApprovalSummary(managed)
-    // Claude Hook requests may be refined or re-emitted with the same request id.
+    // Hook requests may be refined or re-emitted with the same request id.
     // Re-arm the notifier for those updates; DingTalkStreamService deduplicates
     // successful sends by requestId, while this avoids losing the first alert.
-    if (requestIndex < 0 || request.source === 'claude-hook') this.fullAutoActivity?.pending?.(request)
+    if (requestIndex < 0 || request.source !== 'terminal') this.fullAutoActivity?.pending?.(request)
     return request
   }
 
@@ -1965,7 +2063,7 @@ export class SessionController {
   private approvalForActivity(
     managed: ManagedSession,
     input: Pick<ApprovalRequest, 'requestId' | 'source' | 'risk' | 'reason'>
-      & Partial<Pick<ApprovalRequest, 'toolName' | 'command' | 'inputSummary' | 'filePath' | 'targetPaths' | 'agentReason' | 'dangerRuleId' | 'dangerRuleName'>>,
+      & Partial<Pick<ApprovalRequest, 'toolName' | 'command' | 'inputSummary' | 'filePath' | 'targetPaths' | 'agentReason' | 'dangerRuleId' | 'dangerRuleName' | 'nativeTurnId' | 'hookCwd' | 'hookModel' | 'permissionMode' | 'transcriptPath' | 'toolInput' | 'rawPayload'>>,
   ): ApprovalRequest {
     return {
       requestId: input.requestId,
@@ -1983,6 +2081,13 @@ export class SessionController {
       ...(input.inputSummary ? { inputSummary: input.inputSummary } : {}),
       ...(input.filePath ? { filePath: input.filePath } : {}),
       ...(input.targetPaths?.length ? { targetPaths: [...input.targetPaths] } : {}),
+      ...(input.nativeTurnId ? { nativeTurnId: input.nativeTurnId } : {}),
+      ...(input.hookCwd ? { hookCwd: input.hookCwd } : {}),
+      ...(input.hookModel ? { hookModel: input.hookModel } : {}),
+      ...(input.permissionMode ? { permissionMode: input.permissionMode } : {}),
+      ...(input.transcriptPath ? { transcriptPath: input.transcriptPath } : {}),
+      ...(input.toolInput !== undefined ? { toolInput: input.toolInput } : {}),
+      ...(input.rawPayload !== undefined ? { rawPayload: input.rawPayload } : {}),
       ...(input.dangerRuleId ? { dangerRuleId: input.dangerRuleId } : {}),
       ...(input.dangerRuleName ? { dangerRuleName: input.dangerRuleName } : {}),
       createdAt: Date.now(),
