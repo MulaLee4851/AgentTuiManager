@@ -276,7 +276,7 @@ describe('App terminal wall', () => {
     })
 
     expect(await screen.findByRole('heading', { name: '添加 Agent' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '迁移外部会话' })).toHaveClass('active')
+    expect(screen.queryByRole('button', { name: '迁移外部会话' })).not.toBeInTheDocument()
     expect(screen.getByText('来源窗口安全校验未通过，请在原终端正常退出后确认迁入')).toBeInTheDocument()
     expect(screen.getByDisplayValue('B:\\chosen\\workspace')).toBeInTheDocument()
     await waitFor(() => expect(screen.getByRole('button', { name: '迁入 Manager' })).toBeEnabled())
@@ -643,8 +643,8 @@ describe('App terminal wall', () => {
   it('opens and saves disabled-by-default Continue keyword rules', async () => {
     render(<App />)
     await screen.findByText('Codex API 重构')
-    fireEvent.click(screen.getAllByRole('button', { name: 'Continue 规则' })[0]!)
-    expect(await screen.findByRole('heading', { name: 'Continue 关键词' })).toBeInTheDocument()
+    fireEvent.click(screen.getAllByRole('button', { name: '关键词续跑' })[0]!)
+    expect(await screen.findByRole('heading', { name: '关键词续跑' })).toBeInTheDocument()
     expect(screen.getByRole('switch', { name: '启用关键词 Continue' })).not.toBeChecked()
     fireEvent.click(screen.getByRole('switch', { name: '启用关键词 Continue' }))
     fireEvent.change(screen.getByLabelText('Continue 关键词列表'), { target: { value: 'model busy\nconnection lost' } })
@@ -853,16 +853,17 @@ describe('App terminal wall', () => {
       type: 'sessions-changed',
       sessionId: session.sessionId,
       session: {
-        ...session,
-        status: 'needs_approval',
-        pendingApprovalCommand: approval.command,
-        pendingApprovalCount: 1,
+         ...session,
+         status: 'needs_approval',
+         pendingApprovalCommand: approval.command,
+         pendingApprovalCount: 2,
       },
       approvals: [approval],
     })))
 
     const tile = await screen.findByTestId('terminal-tile-session-1')
     await waitFor(() => expect(within(tile).getByText('待授权')).toBeInTheDocument())
+    expect(within(tile).getByText(/2 笔 · Set-Content result\.txt done/)).toBeInTheDocument()
     expect(api.listSessions).toHaveBeenCalledTimes(initialReads)
 
     act(() => listeners.forEach((listener) => listener({
@@ -873,6 +874,32 @@ describe('App terminal wall', () => {
     })))
     await waitFor(() => expect(within(tile).queryByText('待授权')).not.toBeInTheDocument())
     expect(api.listSessions).toHaveBeenCalledTimes(initialReads)
+  })
+
+  it('selects newly discovered DingTalk workspaces by default and preserves explicit opt-outs', async () => {
+    const second = { ...session, sessionId: 'session-2', displayName: '医保移植Agent', agentKind: 'claude' as const, workspace: 'F:\\puwo\\his' }
+    vi.mocked(api.listSessions).mockResolvedValue([session, second])
+    vi.mocked(api.getDingTalkSettings).mockResolvedValue({
+      enabled: true, clientId: 'client-id', hasClientSecret: true,
+      allowedWorkspaces: ['B:\\projects\\api'], knownWorkspaces: [], commandsPerMinute: 20,
+      boundStaffId: 'staff-1', agentModeEnabled: false, hasAgentApiKey: false, agentRetryCount: 3,
+      agentProxyEnabled: false, agentProxyHost: '127.0.0.1', agentProxyPort: 7897,
+      hasAgentProxyPassword: false, connectionStatus: 'connected',
+    })
+
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /钉钉远程/ }))
+    const apiWorkspace = await screen.findByRole('checkbox', { name: 'B:\\projects\\api' })
+    const medicalWorkspace = screen.getByRole('checkbox', { name: 'F:\\puwo\\his' })
+    expect(apiWorkspace).toBeChecked()
+    expect(medicalWorkspace).toBeChecked()
+
+    fireEvent.click(medicalWorkspace)
+    fireEvent.click(screen.getByRole('button', { name: '保存并连接' }))
+    await waitFor(() => expect(api.updateDingTalkSettings).toHaveBeenCalledWith(expect.objectContaining({
+      allowedWorkspaces: ['B:\\projects\\api'],
+      knownWorkspaces: expect.arrayContaining(['B:\\projects\\api', 'F:\\puwo\\his']),
+    })))
   })
 
   it('accepts or dismisses an approval rule suggestion on the Agent tile', async () => {
@@ -893,7 +920,7 @@ describe('App terminal wall', () => {
   it('manages exact approval rules from the overview', async () => {
     render(<App />)
     await screen.findByText('Codex API 重构')
-    fireEvent.click(screen.getByRole('button', { name: '批准规则' }))
+    fireEvent.click(screen.getByRole('button', { name: '安全规则' }))
     expect(await screen.findByText('git log --oneline')).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('新增批准命令'), { target: { value: 'git show --stat' } })
     fireEvent.click(screen.getByRole('button', { name: '添加' }))
@@ -907,7 +934,7 @@ describe('App terminal wall', () => {
   it('closes the approval rules drawer only on a real double-click of the backdrop', async () => {
     render(<App />)
     await screen.findByText('Codex API 重构')
-    fireEvent.click(screen.getByRole('button', { name: '批准规则' }))
+    fireEvent.click(screen.getByRole('button', { name: '安全规则' }))
     const backdrop = document.querySelector('.modal-backdrop')
     expect(backdrop).not.toBeNull()
     fireEvent.mouseDown(backdrop!)
@@ -920,7 +947,7 @@ describe('App terminal wall', () => {
   it('shows, maintains, and tests high-risk command rules', async () => {
     render(<App />)
     await screen.findByText('Codex API 重构')
-    fireEvent.click(screen.getByRole('button', { name: '批准规则' }))
+    fireEvent.click(screen.getByRole('button', { name: '安全规则' }))
     fireEvent.click(await screen.findByRole('button', { name: /高危命令/ }))
 
     expect(await screen.findByText('递归或强制删除')).toBeInTheDocument()
@@ -956,7 +983,7 @@ describe('App terminal wall', () => {
   })
 
   it.each([
-    ['codex', 'codex-1', ['resume', 'codex-1']],
+    ['codex', 'codex-1', ['resume', 'codex-1', '--dangerously-bypass-approvals-and-sandbox']],
     ['claude', 'claude-1', ['--resume', 'claude-1']],
   ] as const)('starts a selected %s native session with resume on both initial and recovery hosts', async (kind, id, resumeArgs) => {
     vi.mocked(api.discoverSessions).mockImplementation(async (agentKind, selectedWorkspace) => [{ id, title: `${agentKind} 历史任务`, updatedAt: 1_786_000_000_000, workspace: selectedWorkspace }])
@@ -966,7 +993,7 @@ describe('App terminal wall', () => {
     fireEvent.change(screen.getByLabelText('Agent 类型'), { target: { value: kind } })
     fireEvent.click(screen.getByRole('button', { name: '选择文件夹' }))
     await waitFor(() => expect(screen.getByLabelText('历史会话')).toHaveTextContent(`${kind} 历史任务`))
-    fireEvent.change(screen.getByLabelText('参数（每行一个）'), { target: { value: '--advanced-must-not-pollute-resume' } })
+    fireEvent.change(screen.getByLabelText('参数（每行一个）'), { target: { value: '--dangerously-bypass-approvals-and-sandbox' } })
     fireEvent.change(screen.getByLabelText('历史会话'), { target: { value: id } })
     fireEvent.click(screen.getByRole('button', { name: '恢复会话' }))
     await waitFor(() => expect(api.startSession).toHaveBeenCalledTimes(1))

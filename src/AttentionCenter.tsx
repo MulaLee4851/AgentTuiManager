@@ -201,7 +201,7 @@ function ApprovalDetail({
     <h2>{approvalTitle(request)}</h2>
     <p className='detail-subtitle'>请求来自“{request.displayName}”会话 · {request.workspace} · 会话 {request.nativeSessionId ?? request.sessionId}</p>
     <section className='command-card'>
-      <div className='command-label'><span>{request.source === 'claude-hook' ? 'Claude Hook 结构化请求' : '终端兼容识别'}</span><span>{request.toolName ?? request.agentKind.toUpperCase()}</span></div>
+      <div className='command-label'><span>{request.source === 'terminal' ? '终端兼容识别' : request.source === 'codex-hook' ? 'Codex Hook 结构化请求' : 'Claude Hook 结构化请求'}</span><span>{request.toolName ?? request.agentKind.toUpperCase()}</span></div>
       <pre>{approvalDisplay(request)}</pre>
       <div className='command-path'>{targets.length ? '目标：' + targets.join(' · ') : '工作目录：' + request.workspace}</div>
     </section>

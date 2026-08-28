@@ -7,7 +7,7 @@ function readableError(reason: unknown): string {
 }
 
 const DEFAULTS: DingTalkSettingsSummary = {
-  enabled: false, hasClientSecret: false, allowedWorkspaces: [], commandsPerMinute: 20,
+  enabled: false, hasClientSecret: false, allowedWorkspaces: [], knownWorkspaces: [], commandsPerMinute: 20,
   agentModeEnabled: false, hasAgentApiKey: false, agentRetryCount: 3, agentProxyEnabled: false,
   agentProxyHost: '127.0.0.1', agentProxyPort: 7897, hasAgentProxyPassword: false,
   connectionStatus: 'disabled',
@@ -28,7 +28,16 @@ export default function DingTalkSettingsDialog({ sessions, onClose }: { sessions
   const availableWorkspaces = [...new Set(sessions.map((session) => session.workspace))]
 
   useEffect(() => {
-    void window.agentManager.getDingTalkSettings().then(setSettings).catch((reason) => setError(readableError(reason))).finally(() => setBusy(false))
+    void window.agentManager.getDingTalkSettings().then((loaded) => {
+      const loadedKnownWorkspaces = loaded.knownWorkspaces ?? []
+      const known = new Set(loadedKnownWorkspaces)
+      const newlyDiscovered = availableWorkspaces.filter((workspace) => !known.has(workspace))
+      setSettings({
+        ...loaded,
+        allowedWorkspaces: [...new Set([...loaded.allowedWorkspaces, ...newlyDiscovered])],
+        knownWorkspaces: [...new Set([...loadedKnownWorkspaces, ...availableWorkspaces])],
+      })
+    }).catch((reason) => setError(readableError(reason))).finally(() => setBusy(false))
     const statusTimer = setInterval(() => {
       void window.agentManager.getDingTalkSettings().then((next) => {
         setSettings((current) => ({ ...current, connectionStatus: next.connectionStatus, connectionError: next.connectionError }))
@@ -49,7 +58,11 @@ export default function DingTalkSettingsDialog({ sessions, onClose }: { sessions
   }))
   const chooseWorkspace = async (): Promise<void> => {
     const workspace = await window.agentManager.chooseWorkspace()
-    if (workspace && !settings.allowedWorkspaces.includes(workspace)) setSettings((current) => ({ ...current, allowedWorkspaces: [...current.allowedWorkspaces, workspace] }))
+    if (workspace) setSettings((current) => ({
+      ...current,
+      allowedWorkspaces: current.allowedWorkspaces.includes(workspace) ? current.allowedWorkspaces : [...current.allowedWorkspaces, workspace],
+      knownWorkspaces: current.knownWorkspaces?.includes(workspace) ? current.knownWorkspaces : [...(current.knownWorkspaces ?? []), workspace],
+    }))
   }
   const resetBinding = async (): Promise<void> => {
     setBusy(true); setError('')
@@ -63,7 +76,7 @@ export default function DingTalkSettingsDialog({ sessions, onClose }: { sessions
       const saved = await window.agentManager.updateDingTalkSettings({
         enabled: settings.enabled, clientId: settings.clientId,
         ...(clientSecret ? { clientSecret } : {}), ...(clearClientSecret ? { clearClientSecret: true } : {}),
-        allowedWorkspaces: settings.allowedWorkspaces, commandsPerMinute: settings.commandsPerMinute,
+        allowedWorkspaces: settings.allowedWorkspaces, knownWorkspaces: settings.knownWorkspaces, commandsPerMinute: settings.commandsPerMinute,
         agentModeEnabled: settings.agentModeEnabled, agentBaseUrl: settings.agentBaseUrl,
         ...(agentApiKey ? { agentApiKey } : {}), ...(clearAgentApiKey ? { clearAgentApiKey: true } : {}), agentModel: settings.agentModel, agentRetryCount: settings.agentRetryCount,
         agentProxyEnabled: settings.agentProxyEnabled, agentProxyHost: settings.agentProxyHost, agentProxyPort: settings.agentProxyPort,

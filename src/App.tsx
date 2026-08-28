@@ -459,7 +459,11 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
     }
     const parsedArgs = agentKind === 'deepseek' && !args.trim() ? DEEPSEEK_WEB_ARGS : args.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
     const resumeArgs = nativeSessionId
-      ? agentKind === 'codex' ? ['resume', nativeSessionId] : agentKind === 'claude' ? ['--resume', nativeSessionId] : undefined
+      ? agentKind === 'codex'
+        ? ['resume', nativeSessionId, ...parsedArgs]
+        : agentKind === 'claude'
+          ? ['--resume', nativeSessionId]
+          : undefined
       : undefined
     const request: StartSessionRequest = {
       displayName, agentKind, workspace, executable, args: resumeArgs ?? parsedArgs, cols: 100, rows: 30,
@@ -535,7 +539,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
       <header className='launcher-head'><h1>添加 Agent</h1><button type='button' className='icon-button' onClick={onClose} aria-label='关闭'>×</button></header>
       <div className='launcher-workspace-row'><label htmlFor='workspace'>工作区</label><div className='workspace-picker'><input id='workspace' className='launcher-field' required={agentKind !== 'deepseek'} disabled={agentKind === 'deepseek'} readOnly placeholder='请选择工作区' value={agentKind === 'deepseek' ? '在 Harness Web 内选择' : workspace} /><button type='button' className='button-secondary' disabled={busy || agentKind === 'deepseek'} onClick={() => { void chooseWorkspace() }}>选择文件夹</button></div></div>
       <div className='launcher-content'>
-        <nav className='launcher-tabs' aria-label='会话方式'><button type='button' className={`launcher-tab${launcherTab === 'new' ? ' active' : ''}`} onClick={() => setLauncherTab('new')}>新会话</button><button type='button' className={`launcher-tab${launcherTab === 'history' ? ' active' : ''}`} onClick={() => setLauncherTab('history')}>恢复历史</button><button type='button' className={`launcher-tab${launcherTab === 'external' ? ' active' : ''}`} onClick={() => setLauncherTab('external')}>迁移外部会话</button><button type='button' className={`launcher-tab${launcherTab === 'config' ? ' active' : ''}`} onClick={() => setLauncherTab('config')}>独立配置</button></nav>
+        <nav className='launcher-tabs' aria-label='会话方式'><button type='button' className={`launcher-tab${launcherTab === 'new' ? ' active' : ''}`} onClick={() => setLauncherTab('new')}>新会话</button><button type='button' className={`launcher-tab${launcherTab === 'history' ? ' active' : ''}`} onClick={() => setLauncherTab('history')}>恢复历史</button><button type='button' className={`launcher-tab${launcherTab === 'config' ? ' active' : ''}`} onClick={() => setLauncherTab('config')}>独立配置</button></nav>
         <label className='sr-only' htmlFor='agent-kind'>Agent 类型</label><select className='sr-only' id='agent-kind' value={agentKind} onChange={(event) => changeKind(event.target.value as AgentKind)}><option value='codex'>Codex</option><option value='claude'>Claude Code</option><option value='deepseek'>DeepSeek Harness</option><option value='pi'>Pi</option><option value='generic'>通用终端</option></select>
         <label className='sr-only' htmlFor='native-session'>历史会话</label><select className='sr-only' id='native-session' value={nativeSessionId} disabled={!workspace || discoveryState === 'loading' || discoveryState === 'unsupported'} onChange={(event) => setNativeSessionId(event.target.value)}><option value=''>新建会话</option>{nativeSessions.map((item) => <option key={item.id} value={item.id}>{item.title} · {new Date(item.updatedAt).toLocaleString()}</option>)}</select>
         {launcherTab === 'new' && <section className='launcher-panel'><div className='launcher-section-title'><h2>选择 Agent</h2><span>选择本机 CLI</span></div><div className='launcher-agent-options'>{agentOptions.map((option) => <button type='button' key={option.kind} disabled={option.disabled} className={`launcher-agent-option${agentKind === option.kind ? ' active' : ''}`} onClick={() => changeKind(option.kind)}><AgentLogo kind={option.kind} className={`launcher-option-logo option-${option.kind}`} label={option.title} /><span><strong>{option.title}</strong><span>{option.subtitle}</span></span></button>)}</div>
@@ -1057,8 +1061,8 @@ export default function App(): JSX.Element {
             <footer><span>仅展示最近 5 项</span><button className='button-secondary button-compact' type='button' onClick={() => { hideNotifications(); setView('attention') }}>打开处理中心</button></footer>
           </aside>}
         </div>
-        <button className='button-secondary' type='button' onClick={() => { closeOtherOverlays('approval-rules'); setShowApprovalRules(true) }}>批准规则</button>
-        <button className='button-secondary' type='button' onClick={() => { closeOtherOverlays('continue-keywords'); setShowContinueKeywords(true) }}>Continue 规则</button>
+        <button className='button-secondary' type='button' onClick={() => { closeOtherOverlays('approval-rules'); setShowApprovalRules(true) }}>安全规则</button>
+        <button className='button-secondary' type='button' onClick={() => { closeOtherOverlays('continue-keywords'); setShowContinueKeywords(true) }}>关键词续跑</button>
         <button className='button-primary' type='button' onClick={openAgentForm}>＋ 新建 Agent</button>
       </header>}
       <div className={`workspace-layout${selected ? ' workspace-layout-detail' : ''}`}>
@@ -1068,8 +1072,8 @@ export default function App(): JSX.Element {
           <button className={`nav-item${view === 'overview' ? ' active' : ''}`} type='button' onClick={() => setView('overview')}><span>▦</span><span>Agent 总览</span></button>
           <button className={`nav-item${view === 'attention' ? ' active' : ''}`} type='button' onClick={() => setView('attention')}><span>!</span><span>处理中心</span>{totalPendingCount > 0 && <i className='nav-count'>{totalPendingCount}</i>}</button>
           <button className={`nav-item${view === 'audit' ? ' active' : ''}`} type='button' aria-label='审计' onClick={() => setView('audit')}><span>↺</span><span>审计</span></button>
-          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('approval-rules'); setShowApprovalRules(true) }}><span>✓</span><span>批准规则</span></button>
-          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('continue-keywords'); setShowContinueKeywords(true) }}><span>↻</span><span>Continue 规则</span></button>
+          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('approval-rules'); setShowApprovalRules(true) }}><span>✓</span><span>安全规则</span></button>
+          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('continue-keywords'); setShowContinueKeywords(true) }}><span>↻</span><span>关键词续跑</span></button>
           <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('session-safety'); setShowSessionSafety(true) }}><span>⚙</span><span>会话安全</span></button>
           <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('dingtalk'); setShowDingTalkSettings(true) }}><span>↗</span><span>钉钉远程</span></button>
           <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('llm-review'); setLlmReviewInitialView('settings'); setShowLlmReviewSettings(true) }}><span>◇</span><span>LLM 审查</span></button>

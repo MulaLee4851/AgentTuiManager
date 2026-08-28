@@ -52,7 +52,7 @@ export default function ContinueKeywordDialog({ onClose }: { onClose: () => void
     onMouseDown={(event) => { if (event.target === event.currentTarget) armClose() }}
     onDoubleClick={(event) => { if (event.target === event.currentTarget) { resetClose(); onClose() } }}>
     <form className='rules-dialog continue-keyword-dialog' role='dialog' aria-modal='true' aria-labelledby='continue-keyword-title' onMouseDown={resetClose} onSubmit={(event) => { void save(event) }}>
-      <header><div><span className='eyebrow'>RECOVERY</span><h2 id='continue-keyword-title'>Continue 关键词</h2></div><button type='button' className='icon-button' onClick={onClose} aria-label='关闭 Continue 关键词设置'>×</button></header>
+      <header><div><span className='eyebrow'>RECOVERY</span><h2 id='continue-keyword-title'>关键词续跑</h2></div><button type='button' className='icon-button' onClick={onClose} aria-label='关闭关键词续跑设置'>×</button></header>
       <p className='rules-help'>仅在命中关键词后持续没有新输出时尝试一次。Agent 自己继续输出、等待授权、正常结束、Esc 或 Ctrl+C 都不会触发。</p>
       <label className='launcher-config-toggle'><span><strong>启用关键词 Continue</strong><small>默认关闭。每次命中最多发送一次，不循环重试。</small></span><input type='checkbox' role='switch' aria-label='启用关键词 Continue' checked={settings.enabled} onChange={(event) => setSettings((current) => ({ ...current, enabled: event.target.checked }))} /></label>
       <div className={'continue-keyword-fields' + (settings.enabled ? '' : ' disabled')}>
