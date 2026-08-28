@@ -12,6 +12,17 @@ export interface DingTalkStreamActivityPort {
   message(staffId: string, command: string): void
 }
 
+export function isDingTalkWorkspaceAllowed(settings: Pick<StoredDingTalkSettings, 'allowedWorkspaces' | 'knownWorkspaces'>, workspace: string): boolean {
+  const allowed = new Set(settings.allowedWorkspaces.map(workspaceKey))
+  const key = workspaceKey(workspace)
+  if (allowed.has(key)) return true
+  // Newly discovered workspaces are default-on in the settings UI. Until the
+  // user saves an explicit opt-out, keep remote approval notifications aligned
+  // with that visible checked state.
+  const known = settings.knownWorkspaces
+  return Array.isArray(known) && !known.some((item) => workspaceKey(item) === key)
+}
+
 type RuntimeDingTalkClient = DWClient & {
   connected: boolean
   config: { autoReconnect?: boolean }
@@ -79,8 +90,7 @@ export class DingTalkStreamService {
 
   async notifyApproval(request: ApprovalRequest, settings: StoredDingTalkSettings): Promise<boolean> {
     if (!settings.enabled || !settings.clientId || !settings.clientSecret || !settings.boundStaffId) return false
-    const allowed = new Set(settings.allowedWorkspaces.map(workspaceKey))
-    if (!allowed.has(workspaceKey(request.workspace))) return false
+    if (!isDingTalkWorkspaceAllowed(settings, request.workspace)) return false
     const now = Date.now()
     for (const [requestId, timestamp] of this.notifiedApprovals) {
       if (now - timestamp > 24 * 60 * 60_000) this.notifiedApprovals.delete(requestId)

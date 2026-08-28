@@ -82,6 +82,7 @@ export interface DingTalkSettingsInput {
   clientSecret?: string
   clearClientSecret?: boolean
   allowedWorkspaces: string[]
+  knownWorkspaces?: string[]
   commandsPerMinute: number
   agentModeEnabled: boolean
   agentBaseUrl?: string
@@ -102,6 +103,7 @@ export interface DingTalkSettingsSummary {
   clientId?: string
   hasClientSecret: boolean
   allowedWorkspaces: string[]
+  knownWorkspaces?: string[]
   commandsPerMinute: number
   bindingKey?: string
   boundStaffId?: string
@@ -209,7 +211,7 @@ export interface CCSwitchProviderSummary {
   issue?: string
 }
 export type ApprovalRisk = 'read' | 'write' | 'delete' | 'unknown'
-export type ApprovalSource = 'terminal' | 'claude-hook'
+export type ApprovalSource = 'terminal' | 'claude-hook' | 'codex-hook'
 export type DangerRuleScope = 'safe-rule' | 'bulk-approval' | 'full-auto'
 
 export interface DangerRuleSummary {
@@ -249,6 +251,13 @@ export interface ApprovalRequest {
   agentReason?: string
   filePath?: string
   targetPaths?: string[]
+  nativeTurnId?: string
+  hookCwd?: string
+  hookModel?: string
+  permissionMode?: string
+  transcriptPath?: string
+  toolInput?: unknown
+  rawPayload?: unknown
   createdAt: number
   canBulkApprove: boolean
   dangerRuleId?: string

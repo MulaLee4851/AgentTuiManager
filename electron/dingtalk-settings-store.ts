@@ -10,6 +10,7 @@ export interface StoredDingTalkSettings {
   clientId?: string
   clientSecret?: string
   allowedWorkspaces: string[]
+  knownWorkspaces?: string[]
   commandsPerMinute: number
   bindingKey?: string
   boundStaffId?: string
@@ -35,6 +36,7 @@ function defaults(): StoredDingTalkSettings {
   return {
     enabled: false,
     allowedWorkspaces: [],
+    knownWorkspaces: [],
     commandsPerMinute: 20,
     bindingKey: newBindingKey(),
     agentModeEnabled: false,
@@ -51,6 +53,7 @@ function summary(value: StoredDingTalkSettings): DingTalkSettingsSummary {
     ...(value.clientId ? { clientId: value.clientId } : {}),
     hasClientSecret: Boolean(value.clientSecret),
     allowedWorkspaces: [...value.allowedWorkspaces],
+    knownWorkspaces: [...(value.knownWorkspaces ?? [])],
     commandsPerMinute: value.commandsPerMinute,
     ...(value.bindingKey ? { bindingKey: value.bindingKey } : {}),
     ...(value.boundStaffId ? { boundStaffId: value.boundStaffId } : {}),
@@ -85,6 +88,11 @@ export class DingTalkSettingsStore {
             ...(typeof parsed.clientId === 'string' ? { clientId: parsed.clientId } : {}),
             ...(typeof parsed.clientSecret === 'string' ? { clientSecret: parsed.clientSecret } : {}),
             allowedWorkspaces: Array.isArray(parsed.allowedWorkspaces) ? parsed.allowedWorkspaces.filter((item): item is string => typeof item === 'string') : [],
+            knownWorkspaces: Array.isArray(parsed.knownWorkspaces)
+              ? parsed.knownWorkspaces.filter((item): item is string => typeof item === 'string')
+              : Array.isArray(parsed.allowedWorkspaces)
+                ? parsed.allowedWorkspaces.filter((item): item is string => typeof item === 'string')
+                : [],
             commandsPerMinute: Number.isInteger(parsed.commandsPerMinute) ? Number(parsed.commandsPerMinute) : 20,
             ...(boundStaffId ? { boundStaffId } : { bindingKey: typeof parsed.bindingKey === 'string' ? parsed.bindingKey : newBindingKey() }),
             ...(typeof parsed.boundSenderName === 'string' ? { boundSenderName: parsed.boundSenderName } : {}),
@@ -108,7 +116,13 @@ export class DingTalkSettingsStore {
   }
 
   getSummary(): DingTalkSettingsSummary { return summary(this.settings) }
-  getRuntimeSettings(): StoredDingTalkSettings { return { ...this.settings, allowedWorkspaces: [...this.settings.allowedWorkspaces] } }
+  getRuntimeSettings(): StoredDingTalkSettings {
+    return {
+      ...this.settings,
+      allowedWorkspaces: [...this.settings.allowedWorkspaces],
+      knownWorkspaces: [...(this.settings.knownWorkspaces ?? [])],
+    }
+  }
 
   async update(input: DingTalkSettingsInput): Promise<DingTalkSettingsSummary> {
     if (!this.codec.isEncryptionAvailable()) throw new Error('当前系统无法使用安全存储，钉钉配置未保存')
@@ -132,6 +146,7 @@ export class DingTalkSettingsStore {
       ...(input.clientId ? { clientId: input.clientId } : {}),
       ...(clientSecret ? { clientSecret } : {}),
       allowedWorkspaces: [...input.allowedWorkspaces],
+      knownWorkspaces: [...new Set([...(input.knownWorkspaces ?? this.settings.knownWorkspaces ?? []), ...input.allowedWorkspaces])],
       commandsPerMinute: input.commandsPerMinute,
       ...(this.settings.boundStaffId ? { boundStaffId: this.settings.boundStaffId } : { bindingKey: this.settings.bindingKey ?? newBindingKey() }),
       ...(this.settings.boundSenderName ? { boundSenderName: this.settings.boundSenderName } : {}),

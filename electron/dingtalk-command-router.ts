@@ -1,6 +1,7 @@
 import type { ApprovalRequest, AuditEntry, BulkApprovalResult, SessionSummary } from '../src/shared/manager-api'
 import type { StoredDingTalkSettings } from './dingtalk-settings-store'
 import type { DingTalkAgentInterpreter } from './dingtalk-agent-interpreter'
+import { isDingTalkWorkspaceAllowed } from './dingtalk-stream-service'
 
 export interface DingTalkCommandContext {
   staffId: string
@@ -189,8 +190,7 @@ export class DingTalkCommandRouter {
   }
 
   private allowedSessions(settings: StoredDingTalkSettings): SessionSummary[] {
-    const allowed = new Set(settings.allowedWorkspaces.map(workspaceKey))
-    return this.visibleSessions().filter((session) => allowed.has(workspaceKey(session.workspace)))
+    return this.visibleSessions().filter((session) => isDingTalkWorkspaceAllowed(settings, session.workspace))
   }
 
   private visibleSessions(): SessionSummary[] { return this.manager.listSessions() }

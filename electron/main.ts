@@ -22,7 +22,7 @@ import { SessionSafetyStore } from './session-safety-store'
 import { ManagedSessionCatalog } from './managed-session-catalog'
 import { DingTalkSettingsStore } from './dingtalk-settings-store'
 import { DingTalkCommandRouter } from './dingtalk-command-router'
-import { DingTalkStreamService } from './dingtalk-stream-service'
+import { DingTalkStreamService, isDingTalkWorkspaceAllowed } from './dingtalk-stream-service'
 import { DingTalkAgentInterpreter } from './dingtalk-agent-interpreter'
 import { migrateCodexProviderOfficial, migrateCodexSessionProvider } from './codex-session-provider-migrator'
 import { openNativeResumeTerminal } from './native-terminal'
@@ -204,6 +204,9 @@ function dingTalkSettings(value: unknown): DingTalkSettingsInput {
     return [...new Set(candidate.map((item, index) => text(item, `${label}[${index}]`, maxLength).trim()).filter(Boolean))]
   }
   const allowedWorkspaces = normalizeList(input.allowedWorkspaces, '工作区', 1_024).map(workspace)
+  const knownWorkspaces = input.knownWorkspaces === undefined
+    ? [...allowedWorkspaces]
+    : normalizeList(input.knownWorkspaces, '已知工作区', 1_024).map(workspace)
   if (!Number.isInteger(input.commandsPerMinute) || Number(input.commandsPerMinute) < 1 || Number(input.commandsPerMinute) > 120) {
     throw new Error('每分钟命令上限必须是 1 到 120 的整数')
   }
@@ -222,6 +225,7 @@ function dingTalkSettings(value: unknown): DingTalkSettingsInput {
     ...(clientSecret ? { clientSecret } : {}),
     ...(input.clearClientSecret === true ? { clearClientSecret: true } : {}),
     allowedWorkspaces,
+    knownWorkspaces: [...new Set([...knownWorkspaces, ...allowedWorkspaces])],
     commandsPerMinute: Number(input.commandsPerMinute),
     agentModeEnabled: input.agentModeEnabled === true,
     agentRetryCount: Number(input.agentRetryCount),
@@ -1405,7 +1409,18 @@ void app.whenReady().then(async () => {
           retry.unref?.()
           return
         }
-        void dingTalkStreamService?.notifyApproval(current, dingTalkSettingsStore.getRuntimeSettings()).then((sent) => {
+        const dingTalkSettings = dingTalkSettingsStore.getRuntimeSettings()
+        if (dingTalkSettings.enabled && dingTalkSettings.boundStaffId
+          && !isDingTalkWorkspaceAllowed(dingTalkSettings, current.workspace)) {
+          recordAudit({
+            level: 'info', category: 'remote', action: 'remote_approval_notification_skipped',
+            message: '钉钉待审批提醒已跳过：工作区未启用远程访问',
+            sessionId: current.sessionId,
+            details: { requestId: current.requestId, workspace: current.workspace, reason: 'workspace-not-allowed' },
+          })
+          return
+        }
+        void dingTalkStreamService?.notifyApproval(current, dingTalkSettings).then((sent) => {
           if (!sent) return
           recordAudit({
             level: 'info', category: 'remote', action: 'remote_approval_notified',

@@ -35,7 +35,7 @@ vi.mock('dingtalk-stream', () => ({
   },
 }))
 
-import { DingTalkStreamService } from '../../electron/dingtalk-stream-service'
+import { DingTalkStreamService, isDingTalkWorkspaceAllowed } from '../../electron/dingtalk-stream-service'
 
 describe('DingTalkStreamService', () => {
   beforeEach(() => { vi.clearAllMocks(); sdk.callback = undefined; sdk.client = undefined })
@@ -96,5 +96,18 @@ describe('DingTalkStreamService', () => {
     const payload = JSON.parse(sendOptions.body)
     expect(payload).toMatchObject({ robotCode: 'app-key', userIds: ['staff-1'], msgKey: 'sampleText' })
     expect(JSON.parse(payload.msgParam).content).toContain('/approve approval-1')
+  })
+
+  it('treats a newly discovered workspace as allowed until the user saves an opt-out', async () => {
+    const settings = {
+      enabled: true, clientId: 'app-key', clientSecret: 'secret',
+      allowedWorkspaces: ['B:/work'], knownWorkspaces: ['B:/work'],
+      commandsPerMinute: 20, boundStaffId: 'staff-1', agentModeEnabled: false,
+      agentRetryCount: 3, agentProxyEnabled: false, agentProxyHost: '127.0.0.1', agentProxyPort: 7897,
+    }
+
+    expect(isDingTalkWorkspaceAllowed(settings, 'A:\\淘宝直播')).toBe(true)
+    expect(isDingTalkWorkspaceAllowed({ ...settings, knownWorkspaces: ['B:/work', 'A:/淘宝直播'] }, 'A:\\淘宝直播')).toBe(false)
+    expect(isDingTalkWorkspaceAllowed({ ...settings, knownWorkspaces: [] }, 'A:\\淘宝直播')).toBe(true)
   })
 })
