@@ -26,7 +26,7 @@ const claudeSettingsPath = `${exitPath}.claude-settings.json`
 const codexHookLauncherPath = `${exitPath}.codex-hook.${process.platform === 'win32' ? 'cmd' : 'sh'}`
 const clients = new Set<Socket>()
 const permissionHookToken = randomBytes(24).toString('hex')
-const permissionHookSockets = new Map<string, Socket>()
+const permissionHookSockets = new Map<string, { socket: Socket; hookSource: 'claude' | 'codex' }>()
 let terminal: pty.IPty | undefined
 const terminalReplay = new TerminalReplayBuffer()
 let terminalStateReplay: TerminalStateReplay | undefined
@@ -190,7 +190,7 @@ function codexArgs(args: string[]): string[] {
   const quote = String.fromCharCode(34)
   const hookConfig = '[{ matcher = "*", hooks = [{ type = "command", command = '
     + JSON.stringify(codexHookCommand())
-    + ', timeoutSec = 1800, statusMessage = "请稍后" }] }]'
+    + ', timeout = 1800, statusMessage = "请稍后" }] }]'
   return [
     ...(args.includes('--no-alt-screen') ? [] : ['--no-alt-screen']),
     ...(args.includes('--enable') && args.includes('hooks') ? [] : ['--enable', 'hooks']),
@@ -292,7 +292,7 @@ function handleCommand(socket: Socket, command: HostCommand): void {
         break
       }
       clients.delete(socket)
-      permissionHookSockets.set(command.requestId, socket)
+      permissionHookSockets.set(command.requestId, { socket, hookSource: command.hookSource })
       broadcast({
         type: 'permission-request',
         requestId: command.requestId,
@@ -319,11 +319,16 @@ function handleCommand(socket: Socket, command: HostCommand): void {
       })
       break
     case 'permission-response': {
-      const hookSocket = permissionHookSockets.get(command.requestId)
-      if (hookSocket) {
-        send(hookSocket, { type: 'permission-response', requestId: command.requestId, action: command.action })
+      const hook = permissionHookSockets.get(command.requestId)
+      if (hook && !hook.socket.destroyed) {
         permissionHookSockets.delete(command.requestId)
-        hookSocket.end()
+        hook.socket.write(`${JSON.stringify({ type: 'permission-response', requestId: command.requestId, action: command.action })}\n`, (error) => {
+          send(socket, { type: 'permission-response-ack', requestId: command.requestId, delivered: !error })
+          hook.socket.end()
+        })
+      } else {
+        permissionHookSockets.delete(command.requestId)
+        send(socket, { type: 'permission-response-ack', requestId: command.requestId, delivered: false })
       }
       break
     }
@@ -389,7 +394,9 @@ const server = net.createServer((socket) => {
     clients.delete(socket)
     if (socket === managerSocket) managerSocket = undefined
     for (const [requestId, candidate] of permissionHookSockets) {
-      if (candidate === socket) permissionHookSockets.delete(requestId)
+      if (candidate.socket !== socket) continue
+      permissionHookSockets.delete(requestId)
+      broadcast({ type: 'permission-hook-closed', requestId, hookSource: candidate.hookSource })
     }
   })
 })

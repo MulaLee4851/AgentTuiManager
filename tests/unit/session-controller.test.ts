@@ -385,6 +385,40 @@ describe('SessionController recovery evidence', () => {
     expect(() => controller.approveSession(session.sessionId)).toThrow(/没有等待处理的授权请求/)
   })
 
+  it('retries a manually approved Codex terminal prompt once if the first Enter is swallowed', async () => {
+    vi.useFakeTimers()
+    try {
+      const { controller, handles } = fixture()
+      const session = await controller.startSession(request())
+      handles[0]!.emit({ type: 'output', data: '$ npm run build\r\nWould you like to run the following command?\r\n1. Yes, proceed\r\n2. No' })
+      await vi.advanceTimersByTimeAsync(0)
+
+      controller.approveSession(session.sessionId)
+      expect(handles[0]!.writes).toEqual(['\r'])
+      await vi.advanceTimersByTimeAsync(249)
+      expect(handles[0]!.writes).toEqual(['\r'])
+      await vi.advanceTimersByTimeAsync(1)
+      expect(handles[0]!.writes).toEqual(['\r', '\r'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not send a confirmation Enter for Claude terminal approvals', async () => {
+    vi.useFakeTimers()
+    try {
+      const { controller, handles } = fixture()
+      const session = await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+      handles[0]!.emit({ type: 'output', data: 'Bash command\r\nnpm run build\r\nAllow this tool use?\r\n1. Yes\r\n2. No' })
+      await vi.advanceTimersByTimeAsync(1_000)
+      controller.approveSession(session.sessionId)
+      await vi.advanceTimersByTimeAsync(500)
+      expect(handles[0]!.writes).toEqual(['\r'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('auto-approves only a recognized command allowed by policy', async () => {
     const base = fixture()
     const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
@@ -546,6 +580,72 @@ describe('SessionController recovery evidence', () => {
     controller.approveRequest('codex-shell-1')
     expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'codex-shell-1', action: 'allow' }])
     expect(base.handles[0]!.writes).toEqual([])
+  })
+
+  it('waits for a positive Host acknowledgement before completing a Codex Hook approval', async () => {
+    const base = fixture()
+    const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
+    await controller.startSession(request())
+    const handle = base.handles[0]!
+    handle.permissionHook = 'codex'
+    const checked = vi.fn(async () => true)
+    Object.assign(handle, { respondToPermissionChecked: checked })
+    handle.emit({
+      type: 'permission-request', hookSource: 'codex', requestId: 'checked-hook',
+      toolName: 'Bash', command: 'npm run build', operation: 'unknown',
+    })
+    await settle()
+
+    await controller.approveRequest('checked-hook')
+
+    expect(checked).toHaveBeenCalledWith('checked-hook', 'allow')
+    expect(handle.writes).toEqual([])
+    expect(controller.listPendingApprovals()).toEqual([])
+  })
+
+  it('falls back to the visible native Codex approval when the Hook response is no longer deliverable', async () => {
+    const base = fixture()
+    const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
+    await controller.startSession(request())
+    const handle = base.handles[0]!
+    handle.permissionHook = 'codex'
+    Object.assign(handle, { respondToPermissionChecked: vi.fn(async () => false) })
+    handle.emit({
+      type: 'output',
+      data: 'Would you like to run the following command?\r\n$ npm run build\r\n1. Yes, proceed (y)',
+    })
+    handle.emit({
+      type: 'permission-request', hookSource: 'codex', requestId: 'expired-hook',
+      toolName: 'Bash', command: 'npm run build', operation: 'unknown',
+    })
+    await settle()
+
+    await controller.approveRequest('expired-hook')
+
+    expect(handle.writes).toEqual(['\r'])
+    expect(controller.listPendingApprovals()).toEqual([])
+  })
+
+  it('replaces an unexpectedly closed Codex Hook with the native approval already visible in replay', async () => {
+    const base = fixture()
+    const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
+    await controller.startSession(request())
+    const handle = base.handles[0]!
+    handle.permissionHook = 'codex'
+    handle.emit({
+      type: 'output',
+      data: 'Would you like to run the following command?\r\n$ npm run build\r\n1. Yes, proceed (y)',
+    })
+    handle.emit({
+      type: 'permission-request', hookSource: 'codex', requestId: 'closed-hook',
+      toolName: 'Bash', command: 'npm run build', operation: 'unknown',
+    })
+    handle.emit({ type: 'permission-hook-closed', requestId: 'closed-hook', hookSource: 'codex' })
+    await settle()
+
+    expect(controller.listPendingApprovals()).toEqual([
+      expect.objectContaining({ source: 'terminal', command: 'npm run build' }),
+    ])
   })
 
   it('falls back to a complete Codex command prompt when its Hook does not arrive', async () => {
@@ -939,7 +1039,7 @@ describe('SessionController recovery evidence', () => {
     base.handles[0]!.emit({ type: 'permission-request', requestId: 'danger-delete', toolName: 'Bash', command: 'rm -rf fixtures', operation: 'delete' })
     await settle()
 
-    expect(controller.approveAllPending()).toEqual({
+    await expect(controller.approveAllPending()).resolves.toEqual({
       approved: 2,
       skipped: 1,
       failed: 0,
@@ -947,6 +1047,15 @@ describe('SessionController recovery evidence', () => {
     })
     expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'safe-write', action: 'allow' }, { requestId: 'safe-unknown', action: 'allow' }])
     expect(controller.listPendingApprovals().map((item) => item.requestId)).toEqual(['danger-delete'])
+
+    await expect(controller.approveAllPendingForced()).resolves.toEqual({
+      approved: 1,
+      skipped: 0,
+      failed: 0,
+      skippedRequestIds: [],
+    })
+    expect(base.handles[0]!.permissionResponses.at(-1)).toEqual({ requestId: 'danger-delete', action: 'allow' })
+    expect(controller.listPendingApprovals()).toEqual([])
   })
 
   it('auto-approves an in-workspace edit after full-auto is enabled and preserves deletion requests', async () => {

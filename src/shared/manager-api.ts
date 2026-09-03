@@ -81,7 +81,9 @@ export interface DingTalkSettingsInput {
   clientId?: string
   clientSecret?: string
   clearClientSecret?: boolean
-  allowedWorkspaces: string[]
+  /** @deprecated Retained only for compatibility with older saved settings. */
+  allowedWorkspaces?: string[]
+  /** @deprecated DingTalk remote access is no longer restricted by workspace. */
   knownWorkspaces?: string[]
   commandsPerMinute: number
   agentModeEnabled: boolean
@@ -102,7 +104,9 @@ export interface DingTalkSettingsSummary {
   enabled: boolean
   clientId?: string
   hasClientSecret: boolean
-  allowedWorkspaces: string[]
+  /** @deprecated Retained only for compatibility with older saved settings. */
+  allowedWorkspaces?: string[]
+  /** @deprecated DingTalk remote access is no longer restricted by workspace. */
   knownWorkspaces?: string[]
   commandsPerMinute: number
   bindingKey?: string
@@ -357,6 +361,76 @@ export interface AuditEntry {
   details?: Record<string, string | number | boolean>
 }
 
+export type TokenUsageSource = 'codex-session' | 'claude-session' | 'pi-session' | 'provider-api'
+export type TokenUsageAccuracy = 'exact' | 'estimated' | 'unknown'
+
+export interface TokenUsageRecord {
+  id: string
+  timestamp: number
+  sessionId: string
+  nativeSessionId?: string
+  turnId?: string
+  agentKind: AgentKind
+  workspace: string
+  profileId?: string
+  providerId?: string
+  providerName?: string
+  model?: string
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  reasoningTokens: number
+  totalTokens: number
+  source: TokenUsageSource
+  accuracy: TokenUsageAccuracy
+  subagent?: boolean
+}
+
+export interface TokenUsageSummary {
+  key: string
+  label: string
+  sessionId?: string
+  agentKind?: AgentKind
+  workspace?: string
+  profileId?: string
+  providerId?: string
+  providerName?: string
+  model?: string
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  reasoningTokens: number
+  totalTokens: number
+  requestCount: number
+  lastTimestamp?: number
+  accuracy: TokenUsageAccuracy
+}
+
+export interface TokenUsageQuery {
+  from?: number
+  to?: number
+  sessionId?: string
+  agentKind?: AgentKind
+  workspace?: string
+  profileId?: string
+  providerId?: string
+  model?: string
+  includeSubagents?: boolean
+  accuracy?: TokenUsageAccuracy | 'all'
+  groupBy?: 'session' | 'config' | 'model' | 'workspace' | 'day' | 'hour'
+  page?: number
+  pageSize?: number
+}
+
+export interface TokenUsagePage {
+  records: TokenUsageRecord[]
+  total: number
+  page: number
+  pageSize: number
+}
+
 export interface TerminalReplaySnapshot {
   data: string
   sequence: number
@@ -388,6 +462,8 @@ export const IPC_CHANNELS = {
   listSessions: 'agent-manager:list-sessions',
   terminalReplay: 'agent-manager:terminal-replay',
   listAuditEntries: 'agent-manager:list-audit-entries',
+  listTokenUsageSummary: 'agent-manager:list-token-usage-summary',
+  listTokenUsageDetails: 'agent-manager:list-token-usage-details',
   exportAuditEntries: 'agent-manager:export-audit-entries',
   startSession: 'agent-manager:start-session',
   write: 'agent-manager:write',
@@ -448,6 +524,8 @@ export interface AgentManagerApi {
   listSessions(): Promise<SessionSummary[]>
   terminalReplay(sessionId: string): Promise<TerminalReplaySnapshot>
   listAuditEntries(): Promise<AuditEntry[]>
+  listTokenUsageSummary?(query?: TokenUsageQuery): Promise<TokenUsageSummary[]>
+  listTokenUsageDetails?(query?: TokenUsageQuery): Promise<TokenUsagePage>
   exportAuditEntries(entryIds: string[]): Promise<string | undefined>
   startSession(request: StartSessionRequest): Promise<SessionSummary>
   write(sessionId: string, data: string): Promise<void> | void

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 
 import type { SessionSummary } from './shared/manager-api'
+import { TerminalWriteWatchdog } from './terminal-write-watchdog'
 import codexLogoUrl from '../logo/codex.png'
 import claudeLogoUrl from '../logo/claudecode.png'
 import deepseekLogoUrl from '../logo/deepseek.svg'
@@ -26,6 +27,11 @@ const MAX_FONT_SIZE = 18
 // `.xterm-viewport` keeps a thin scrollbar gutter; reserve it so the last column
 // is never clipped and the grid still fills the surface.
 const TERMINAL_SCROLLBAR_WIDTH = 9
+// xterm normally completes a write within a frame or two. If its callback is lost,
+// keeping `writeInFlight` latched forever freezes only the visible terminal while the
+// PTY and approval UI continue running. This deadline releases that renderer-side latch
+// without replaying data, resizing the PTY, or changing the user's scroll position.
+const TERMINAL_WRITE_WATCHDOG_MS = 2_000
 
 export const NATIVE_TERMINAL_THEME = {
   background: '#0b1011',
@@ -150,6 +156,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
     let disposed = false
     let terminalRefreshTimer: ReturnType<typeof setTimeout> | undefined
     let terminalRefreshPending = false
+    const writeWatchdog = new TerminalWriteWatchdog(TERMINAL_WRITE_WATCHDOG_MS)
     // How far above the newest line the user has scrolled, counted from the bottom rather
     // than as an absolute row. Once the scrollback is full xterm drops the oldest line on
     // every new one, which shifts every absolute index down; pinning to one dragged the
@@ -234,11 +241,11 @@ export default function TerminalTile({ session, detail = false, embedded = false
       resizeRedrawActive = false
       initialReplayLoading = false
       writeInFlight = true
-      terminal.write(synchronizedResizeRedraw ? `\x1b[?2026h${output}\x1b[?2026l` : output, () => {
+      const completeWrite = writeWatchdog.arm((timedOut) => {
         writeInFlight = false
         replayProtocolResponsesBlocked = false
         restoreUserScroll()
-        if (terminalRefreshPending) {
+        if (terminalRefreshPending || timedOut) {
           terminalRefreshPending = false
           if (terminalRefreshTimer) {
             clearTimeout(terminalRefreshTimer)
@@ -251,7 +258,13 @@ export default function TerminalTile({ session, detail = false, embedded = false
           requestAnimationFrame(() => requestAnimationFrame(hideResizeCover))
         }
         if (pendingOutput && !outputFrame) outputFrame = requestAnimationFrame(flushOutput)
+      }, () => {
+        // A timed-out write may still finish later. Repaint and restore only an explicit
+        // user scroll lock; never release the current generation's latch from here.
+        restoreUserScroll()
+        terminal.refresh(0, Math.max(0, terminal.rows - 1))
       })
+      terminal.write(synchronizedResizeRedraw ? `\x1b[?2026h${output}\x1b[?2026l` : output, completeWrite)
     }
     const flushTerminalInput = (): void => {
       inputFrame = 0
@@ -519,6 +532,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
       if (resizeRedrawTimer) clearTimeout(resizeRedrawTimer)
       if (resizeCoverFailsafeTimer) clearTimeout(resizeCoverFailsafeTimer)
       if (terminalRefreshTimer) clearTimeout(terminalRefreshTimer)
+      writeWatchdog.dispose()
       if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer)
       resizeCover?.remove()
       pendingOutput = ''

@@ -499,14 +499,14 @@ export class SessionController {
         : undefined
       const terminalApproval = managed.approvalRequests.find((request) => request.source === 'terminal')
       if (hookApproval) {
-        managed.adapter.acknowledgeUserInput(true)
         if (hookApproval.source === 'claude-hook') {
+          managed.adapter.acknowledgeUserInput(true)
           managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
           this.respondToClaudeHook(managed, hookApproval.requestId, 'allow')
+          this.completeManualApproval(managed, hookApproval)
         } else {
-          managed.handle.respondToPermission(hookApproval.requestId, 'allow')
+          void this.approveRequest(hookApproval.requestId).catch(() => undefined)
         }
-        this.completeManualApproval(managed, hookApproval)
         handledClaudeHookApproval = true
       } else if (terminalApproval && /[\r\n]/.test(data)) {
         managed.adapter.acknowledgeUserInput(true)
@@ -534,14 +534,14 @@ export class SessionController {
     managed.handle.resize(cols, rows)
   }
 
-  approveSession(sessionId: string): void {
+  approveSession(sessionId: string): Promise<void> {
     const managed = this.required(sessionId)
     const request = managed.approvalRequests[0]
     if (!request) throw new Error('当前 Agent 没有等待处理的授权请求')
-    this.approveRequest(request.requestId)
+    return this.approveRequest(request.requestId)
   }
 
-  approveRequest(requestId: string, recordManualApproval = true): void {
+  approveRequest(requestId: string, recordManualApproval = true): Promise<void> {
     const { managed, request } = this.requiredApproval(requestId)
     if (request.source !== 'terminal') {
       this.cancelClaudeTerminalApproval(managed)
@@ -550,13 +550,27 @@ export class SessionController {
         managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
         this.respondToClaudeHook(managed, request.requestId, 'allow')
       } else {
+        const checked = managed.handle.respondToPermissionChecked?.(request.requestId, 'allow')
+        if (checked) {
+          return checked.then((delivered) => {
+            if (!delivered && !this.approveExpiredCodexHookViaTerminal(managed, request)) {
+              throw new Error('Codex Hook 已失效，且尚未检测到原生审批界面，请稍后重试')
+            }
+            this.completeApproval(managed, request, recordManualApproval)
+          })
+        }
         managed.handle.respondToPermission(request.requestId, 'allow')
       }
     } else {
       managed.adapter.acknowledgeUserInput(true)
       managed.handle.write(managed.adapter.approvalInput())
+      // Codex can render a terminal fallback approval before its raw-input
+      // reader is ready. Reuse the bounded confirmation used by full-auto so
+      // a manual click is not silently swallowed.
+      this.schedulePendingTerminalAutoApproval(managed, request.command)
     }
     this.completeApproval(managed, request, recordManualApproval)
+    return Promise.resolve()
   }
 
   async approveAndRememberRequest(requestId: string): Promise<void> {
@@ -567,7 +581,7 @@ export class SessionController {
     }
     if (!this.approvalPolicy) throw new Error('批准规则尚未加载，请稍后重试')
     await this.approvalPolicy.addRule(request.command)
-    this.approveRequest(requestId)
+    await this.approveRequest(requestId)
   }
 
   rejectRequest(requestId: string): void {
@@ -590,7 +604,7 @@ export class SessionController {
     this.changed(managed.summary.sessionId)
   }
 
-  approveAllPending(): BulkApprovalResult {
+  async approveAllPending(): Promise<BulkApprovalResult> {
     const result: BulkApprovalResult = { approved: 0, skipped: 0, failed: 0, skippedRequestIds: [] }
     for (const request of this.listPendingApprovals()) {
       if (!(this.approvalPolicy?.canBulkApproveCommand?.(request.command) ?? canBulkApproveCommand(request.command))) {
@@ -599,7 +613,20 @@ export class SessionController {
         continue
       }
       try {
-        this.approveRequest(request.requestId)
+        await this.approveRequest(request.requestId)
+        result.approved += 1
+      } catch {
+        result.failed += 1
+      }
+    }
+    return result
+  }
+
+  async approveAllPendingForced(): Promise<BulkApprovalResult> {
+    const result: BulkApprovalResult = { approved: 0, skipped: 0, failed: 0, skippedRequestIds: [] }
+    for (const request of this.listPendingApprovals()) {
+      try {
+        await this.approveRequest(request.requestId)
         result.approved += 1
       } catch {
         result.failed += 1
@@ -728,8 +755,12 @@ export class SessionController {
         if (this.shouldReviewWithLlm(request)) {
           this.scheduleLlmReview(managed, request, result)
         } else if (result.allowed) {
-          this.approveRequest(request.requestId, false)
-          this.fullAutoActivity?.approved(request)
+          try {
+            await this.approveRequest(request.requestId, false)
+            this.fullAutoActivity?.approved(request)
+          } catch (error) {
+            this.fullAutoActivity?.blocked(request, error instanceof Error ? error.message : String(error))
+          }
         } else {
           this.fullAutoActivity?.blocked(request, result.reason)
         }
@@ -1040,11 +1071,19 @@ export class SessionController {
           ...(decision?.matchedDangerRule ? { dangerRuleId: decision.matchedDangerRule.id } : {}),
         })
         if (decision?.action === 'auto-approve' || fullAuto?.allowed && !llmReviewRequired) {
+          let delivered = true
           if (approvalSource === 'claude-hook') {
             managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
             this.respondToClaudeHook(managed, event.requestId, 'allow')
           } else {
-            managed.handle.respondToPermission(event.requestId, 'allow')
+            const checked = managed.handle.respondToPermissionChecked?.(event.requestId, 'allow')
+            if (checked) delivered = await checked
+            else managed.handle.respondToPermission(event.requestId, 'allow')
+          }
+          if (!delivered) {
+            this.restoreCodexTerminalApprovalFromReplay(managed)
+            this.changed(managed.summary.sessionId)
+            continue
           }
           if (fullAuto?.allowed && decision?.action !== 'auto-approve') {
             this.fullAutoActivity?.approved(this.approvalForActivity(managed, {
@@ -1096,6 +1135,14 @@ export class SessionController {
           }
         }
         this.changed(managed.summary.sessionId)
+      } else if (event.type === 'permission-hook-closed') {
+        const closed = managed.approvalRequests.find((request) => request.requestId === event.requestId)
+        if (closed) {
+          this.removeApproval(managed, closed.requestId)
+          this.syncApprovalSummary(managed)
+          if (event.hookSource === 'codex') this.restoreCodexTerminalApprovalFromReplay(managed)
+          this.changed(managed.summary.sessionId)
+        }
       } else if (event.type === 'exit') {
         this.emit({ sessionId: managed.summary.sessionId, ...event })
         await this.onExit(managed, generation, event.exitCode)
@@ -1645,6 +1692,31 @@ export class SessionController {
     delete managed.pendingCodexTerminalApproval
   }
 
+  private codexTerminalApprovalFromReplay(managed: ManagedSession): { observation: AgentObservation; replay: string } | undefined {
+    const replay = managed.terminalReplay.snapshot()
+    if (!replay) return undefined
+    const observation = createAgentAdapter('codex').observeOutput(replay)
+    return observation.approvalRequired ? { observation, replay } : undefined
+  }
+
+  private restoreCodexTerminalApprovalFromReplay(managed: ManagedSession): boolean {
+    const fallback = this.codexTerminalApprovalFromReplay(managed)
+    if (!fallback) return false
+    this.handleTerminalApproval(managed, fallback.observation, fallback.replay)
+    return true
+  }
+
+  private approveExpiredCodexHookViaTerminal(managed: ManagedSession, request: ApprovalRequest): boolean {
+    const fallback = this.codexTerminalApprovalFromReplay(managed)
+    if (!fallback) return false
+    this.cancelCodexTerminalApproval(managed)
+    this.removeTerminalApprovals(managed)
+    managed.adapter.acknowledgeUserInput(true)
+    managed.handle.write(managed.adapter.approvalInput())
+    this.schedulePendingTerminalAutoApproval(managed, fallback.observation.approvalCommand ?? request.command)
+    return true
+  }
+
   private removeTerminalApprovals(managed: ManagedSession): void {
     const remaining = managed.approvalRequests.filter((request) => request.source !== 'terminal')
     if (remaining.length === managed.approvalRequests.length) return
@@ -2177,8 +2249,11 @@ export class SessionController {
       this.fullAutoActivity?.reviewed?.(current, conclusion)
       if (managed.summary.fullAutoEnabled && this.llmReview?.getSettings().enabled && hardDecision.allowed
         && conclusion.verdict === 'allow' && !conclusion.requiresHumanApproval) {
-        this.approveRequest(current.requestId, false)
-        this.fullAutoActivity?.approved(current)
+        void this.approveRequest(current.requestId, false).then(() => {
+          this.fullAutoActivity?.approved(current)
+        }).catch((error) => {
+          this.fullAutoActivity?.blocked(current, error instanceof Error ? error.message : String(error))
+        })
         return
       }
       this.fullAutoActivity?.blocked(current, hardDecision.allowed ? conclusion.summary : hardDecision.reason)

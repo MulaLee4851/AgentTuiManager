@@ -1,7 +1,6 @@
 import type { ApprovalRequest, AuditEntry, BulkApprovalResult, SessionSummary } from '../src/shared/manager-api'
 import type { StoredDingTalkSettings } from './dingtalk-settings-store'
 import type { DingTalkAgentInterpreter } from './dingtalk-agent-interpreter'
-import { isDingTalkWorkspaceAllowed } from './dingtalk-stream-service'
 
 export interface DingTalkCommandContext {
   staffId: string
@@ -13,7 +12,8 @@ export interface DingTalkManagerPort {
   listPendingApprovals(): ApprovalRequest[]
   terminalReplay(sessionId: string): { data: string; sequence: number }
   approveRequest(requestId: string): void | Promise<void>
-  approveAllPending(): BulkApprovalResult
+  approveAllPending(): Promise<BulkApprovalResult>
+  approveAllPendingForced(): Promise<BulkApprovalResult>
   write(sessionId: string, data: string): void | Promise<void>
   stopSession(sessionId: string): Promise<void>
   restartSession(sessionId: string): Promise<void>
@@ -30,6 +30,7 @@ const HELP = [
   '/pending - 待审批列表',
   '/approve <审批ID> - 批准指定请求',
   '/approve-all - 按本地安全策略批准全部',
+  '/approve-all-force - 忽略风险限制，强制批准全部',
   '/status <Agent> - 查看状态和最近错误',
   '/tail <Agent> - 查看最近终端输出',
   '/workspace <名称或路径> - 查看工作区最近活动',
@@ -141,16 +142,17 @@ export class DingTalkCommandRouter {
   }
 
   private async route(verb: string, args: string, settings: StoredDingTalkSettings): Promise<string> {
-    const sessions = this.allowedSessions(settings)
+    const sessions = this.visibleSessions()
     switch (verb) {
       case '/help': return HELP
       case '/agents': {
         const visible = this.visibleSessions()
         return visible.length ? visible.map((session) => `${shortId(session.sessionId)}  ${session.displayName}  ${session.status}\n${session.workspace}`).join('\n\n') : '当前没有 Agent。'
       }
-      case '/pending': return this.pending(settings)
-      case '/approve': return this.approve(args, settings)
-      case '/approve-all': return this.approveAll(settings)
+      case '/pending': return this.pending()
+      case '/approve': return this.approve(args)
+      case '/approve-all': return this.approveAll()
+      case '/approve-all-force': return this.approveAllForced()
       case '/status': {
         const session = this.resolveSession(args, sessions)
         return `${session.displayName} (${shortId(session.sessionId)})\n状态：${session.status}\nAgent：${session.agentKind}\n工作区：${session.workspace}${session.lastError ? `\n最近错误：${session.lastError}` : ''}`
@@ -160,7 +162,7 @@ export class DingTalkCommandRouter {
         const output = cleanTerminal(this.manager.terminalReplay(session.sessionId).data)
         return output ? `${session.displayName} 最近输出：\n${output.slice(-3_500)}` : `${session.displayName} 暂无终端输出。`
       }
-      case '/workspace': return this.workspaceActivity(args, settings)
+      case '/workspace': return this.workspaceActivity(args)
       case '/send': {
         const split = args.search(/\s/)
         if (split < 1) throw new Error('用法：/send <Agent> <内容>')
@@ -184,13 +186,9 @@ export class DingTalkCommandRouter {
         return `已重新启动 ${session.displayName}。`
       }
       case '/auto': return this.setFullAutoMode(args, sessions)
-      case '/audit': return this.recentAudit(settings)
+      case '/audit': return this.recentAudit()
       default: return `未知命令：${verb}\n\n${HELP}`
     }
-  }
-
-  private allowedSessions(settings: StoredDingTalkSettings): SessionSummary[] {
-    return this.visibleSessions().filter((session) => isDingTalkWorkspaceAllowed(settings, session.workspace))
   }
 
   private visibleSessions(): SessionSummary[] { return this.manager.listSessions() }
@@ -203,12 +201,11 @@ export class DingTalkCommandRouter {
     const nameMatches = sessions.filter((session) => session.displayName.toLocaleLowerCase('en-US') === value)
     if (nameMatches.length === 1) return nameMatches[0]!
     if (idMatches.length + nameMatches.length > 1) throw new Error('匹配到多个 Agent，请使用 /agents 中的会话 ID 前缀')
-    throw new Error('找不到该 Agent，或它不在允许的工作区内')
+    throw new Error('找不到该 Agent')
   }
 
-  private pending(settings: StoredDingTalkSettings): string {
-    const allowedIds = new Set(this.allowedSessions(settings).map((session) => session.sessionId))
-    const requests = this.manager.listPendingApprovals().filter((request) => allowedIds.has(request.sessionId))
+  private pending(): string {
+    const requests = this.manager.listPendingApprovals()
     if (!requests.length) return '当前没有待审批请求。'
     return requests.map((request) => [
       request.requestId,
@@ -218,21 +215,28 @@ export class DingTalkCommandRouter {
     ].join('\n')).join('\n\n')
   }
 
-  private async approve(requestId: string, settings: StoredDingTalkSettings): Promise<string> {
+  private async approve(requestId: string): Promise<string> {
     if (!requestId) throw new Error('用法：/approve <审批ID>')
-    const allowedIds = new Set(this.allowedSessions(settings).map((session) => session.sessionId))
     const request = this.manager.listPendingApprovals().find((candidate) => candidate.requestId === requestId)
-    if (!request || !allowedIds.has(request.sessionId)) throw new Error('找不到该审批请求，或它不在允许的工作区内')
+    if (!request) throw new Error('找不到该审批请求')
     await this.manager.approveRequest(request.requestId)
     return `已批准 ${request.displayName} 的 ${request.toolName ?? '工具请求'}。`
   }
 
-  private approveAll(settings: StoredDingTalkSettings): string {
-    const allPending = this.manager.listPendingApprovals()
-    const allowedIds = new Set(this.allowedSessions(settings).map((session) => session.sessionId))
-    if (allPending.some((request) => !allowedIds.has(request.sessionId))) throw new Error('存在工作区白名单外的审批，不能远程执行一键批准；请使用 /approve 指定请求')
-    const result = this.manager.approveAllPending()
+  private async approveAll(): Promise<string> {
+    const result = await this.manager.approveAllPending()
     return `批准完成：${result.approved} 个批准，${result.skipped} 个高风险跳过，${result.failed} 个失败。`
+  }
+
+  private async approveAllForced(): Promise<string> {
+    const result = await this.manager.approveAllPendingForced()
+    this.audit.record({
+      level: 'warning',
+      action: 'remote_approval_force_all',
+      message: '钉钉已忽略风险限制并强制批准全部待审批请求',
+      details: { approved: result.approved, failed: result.failed },
+    })
+    return `强制批准完成：${result.approved} 个批准，${result.failed} 个失败。`
   }
 
   private async setFullAutoMode(args: string, sessions: SessionSummary[]): Promise<string> {
@@ -247,19 +251,22 @@ export class DingTalkCommandRouter {
       : `已为 ${session.displayName} 关闭全自动模式。`
   }
 
-  private workspaceActivity(selector: string, settings: StoredDingTalkSettings): string {
+  private workspaceActivity(selector: string): string {
     const value = selector.trim().toLocaleLowerCase('en-US')
     if (!value) throw new Error('用法：/workspace <名称或路径>')
-    const matches = settings.allowedWorkspaces.filter((workspace) => workspaceKey(workspace) === workspaceKey(selector) || workspace.split(/[\\/]/).filter(Boolean).at(-1)?.toLocaleLowerCase('en-US') === value)
-    if (matches.length !== 1) throw new Error(matches.length ? '匹配到多个工作区，请使用完整路径' : '找不到允许的工作区')
+    const workspaces = new Set(this.visibleSessions().map((session) => session.workspace))
+    for (const entry of this.audit.list()) {
+      if (typeof entry.details?.workspace === 'string') workspaces.add(String(entry.details.workspace))
+    }
+    const matches = [...workspaces].filter((candidate) => workspaceKey(candidate) === workspaceKey(selector) || candidate.split(/[\\/]/).filter(Boolean).at(-1)?.toLocaleLowerCase('en-US') === value)
+    if (matches.length !== 1) throw new Error(matches.length ? '匹配到多个工作区，请使用完整路径' : '找不到该工作区')
     const key = workspaceKey(matches[0]!)
     const entries = this.audit.list().filter((entry) => typeof entry.details?.workspace === 'string' && workspaceKey(String(entry.details.workspace)) === key).slice(0, 10)
     return entries.length ? entries.map((entry) => `${new Date(entry.timestamp).toLocaleString('zh-CN')}  ${entry.message}`).join('\n') : '该工作区暂无审计活动。'
   }
 
-  private recentAudit(settings: StoredDingTalkSettings): string {
-    const allowed = new Set(settings.allowedWorkspaces.map(workspaceKey))
-    const entries = this.audit.list().filter((entry) => typeof entry.details?.workspace !== 'string' || allowed.has(workspaceKey(String(entry.details.workspace)))).slice(0, 10)
+  private recentAudit(): string {
+    const entries = this.audit.list().slice(0, 10)
     return entries.length ? entries.map((entry) => `${new Date(entry.timestamp).toLocaleString('zh-CN')}  [${entry.level}] ${entry.message}`).join('\n') : '暂无审计记录。'
   }
 

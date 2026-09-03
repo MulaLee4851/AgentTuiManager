@@ -35,7 +35,7 @@ vi.mock('dingtalk-stream', () => ({
   },
 }))
 
-import { DingTalkStreamService, isDingTalkWorkspaceAllowed } from '../../electron/dingtalk-stream-service'
+import { DingTalkStreamService } from '../../electron/dingtalk-stream-service'
 
 describe('DingTalkStreamService', () => {
   beforeEach(() => { vi.clearAllMocks(); sdk.callback = undefined; sdk.client = undefined })
@@ -79,14 +79,14 @@ describe('DingTalkStreamService', () => {
     service.stop()
   })
 
-  it('pushes each allowed approval to the bound DingTalk account only once', async () => {
+  it('pushes approvals from every workspace to the bound DingTalk account only once', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ accessToken: 'token-1', expireIn: 7200 }) })
       .mockResolvedValueOnce({ ok: true, status: 200 })
     vi.stubGlobal('fetch', fetchMock)
     const service = new DingTalkStreamService({ execute: vi.fn() } as never)
     const settings = { enabled: true, clientId: 'app-key', clientSecret: 'secret', allowedWorkspaces: ['B:/work'], commandsPerMinute: 20, boundStaffId: 'staff-1', agentModeEnabled: false, agentRetryCount: 3, agentProxyEnabled: false, agentProxyHost: '127.0.0.1', agentProxyPort: 7897 }
-    const request = { requestId: 'approval-1', sessionId: 'session-12345678', displayName: 'Code Agent', agentKind: 'codex', workspace: 'B:/work', source: 'terminal', risk: 'write', toolName: 'Edit', reason: '需要修改文件', command: 'Set-Content app.ts value', createdAt: 1, canBulkApprove: true }
+    const request = { requestId: 'approval-1', sessionId: 'session-12345678', displayName: 'Code Agent', agentKind: 'codex', workspace: 'A:/淘宝直播', source: 'terminal', risk: 'write', toolName: 'Edit', reason: '需要修改文件', command: 'Set-Content app.ts value', createdAt: 1, canBulkApprove: true }
 
     await expect(service.notifyApproval(request as never, settings)).resolves.toBe(true)
     await expect(service.notifyApproval(request as never, settings)).resolves.toBe(false)
@@ -98,16 +98,4 @@ describe('DingTalkStreamService', () => {
     expect(JSON.parse(payload.msgParam).content).toContain('/approve approval-1')
   })
 
-  it('treats a newly discovered workspace as allowed until the user saves an opt-out', async () => {
-    const settings = {
-      enabled: true, clientId: 'app-key', clientSecret: 'secret',
-      allowedWorkspaces: ['B:/work'], knownWorkspaces: ['B:/work'],
-      commandsPerMinute: 20, boundStaffId: 'staff-1', agentModeEnabled: false,
-      agentRetryCount: 3, agentProxyEnabled: false, agentProxyHost: '127.0.0.1', agentProxyPort: 7897,
-    }
-
-    expect(isDingTalkWorkspaceAllowed(settings, 'A:\\淘宝直播')).toBe(true)
-    expect(isDingTalkWorkspaceAllowed({ ...settings, knownWorkspaces: ['B:/work', 'A:/淘宝直播'] }, 'A:\\淘宝直播')).toBe(false)
-    expect(isDingTalkWorkspaceAllowed({ ...settings, knownWorkspaces: [] }, 'A:\\淘宝直播')).toBe(true)
-  })
 })

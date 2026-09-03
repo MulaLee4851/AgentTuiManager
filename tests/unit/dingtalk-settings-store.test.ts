@@ -22,13 +22,13 @@ describe('DingTalkSettingsStore', () => {
     expect(store.getSummary()).not.toHaveProperty('clientSecret')
   })
 
-  it('allows an empty Staff ID allowlist but still requires a workspace allowlist', async () => {
+  it('enables DingTalk without requiring a workspace allowlist', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dingtalk-settings-'))
     const store = await DingTalkSettingsStore.load(join(root, 'settings.json'), codec)
 
     const base = { agentModeEnabled: false, agentRetryCount: 3, agentProxyEnabled: false }
-    await expect(store.update({ enabled: true, clientId: 'id', clientSecret: 'secret', allowedWorkspaces: [], commandsPerMinute: 20, ...base })).rejects.toThrow('至少添加一个允许的工作区')
-    await expect(store.update({ enabled: true, clientId: 'id', clientSecret: 'secret', allowedWorkspaces: ['B:/work'], commandsPerMinute: 20, ...base })).resolves.toMatchObject({ enabled: true })
+    await expect(store.update({ enabled: true, clientId: 'id', clientSecret: 'secret', commandsPerMinute: 20, ...base })).resolves.toMatchObject({ enabled: true })
+    expect(store.getRuntimeSettings().allowedWorkspaces).toEqual([])
   })
 
   it('encrypts the client secret on disk and preserves it when omitted on edit', async () => {

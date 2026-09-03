@@ -130,7 +130,6 @@ export class DingTalkSettingsStore {
     const agentApiKey = input.clearAgentApiKey ? undefined : input.agentApiKey ?? this.settings.agentApiKey
     const agentProxyPassword = input.clearAgentProxyPassword ? undefined : input.agentProxyPassword ?? this.settings.agentProxyPassword
     if (input.enabled && (!input.clientId || !clientSecret)) throw new Error('启用钉钉远程开发前，请填写 Client ID 和 Client Secret')
-    if (input.enabled && input.allowedWorkspaces.length === 0) throw new Error('启用钉钉远程开发前，请至少添加一个允许的工作区')
     if (input.agentModeEnabled && (!input.agentBaseUrl || !agentApiKey || !input.agentModel)) throw new Error('启用 Agent 模式前，请填写 Base URL、API Key 和 Model')
     if (!Number.isInteger(input.agentRetryCount) || input.agentRetryCount < 0 || input.agentRetryCount > 10) throw new Error('Agent 失败重试次数应为 0 到 10')
     if (input.agentBaseUrl) {
@@ -141,12 +140,16 @@ export class DingTalkSettingsStore {
     if (input.agentProxyEnabled && (!input.agentProxyHost || !Number.isInteger(input.agentProxyPort) || input.agentProxyPort! < 1 || input.agentProxyPort! > 65_535)) {
       throw new Error('Agent HTTP 代理主机或端口无效')
     }
+    const legacyAllowedWorkspaces = input.allowedWorkspaces ?? this.settings.allowedWorkspaces
+    const legacyKnownWorkspaces = input.knownWorkspaces ?? this.settings.knownWorkspaces ?? []
     this.settings = {
       enabled: input.enabled,
       ...(input.clientId ? { clientId: input.clientId } : {}),
       ...(clientSecret ? { clientSecret } : {}),
-      allowedWorkspaces: [...input.allowedWorkspaces],
-      knownWorkspaces: [...new Set([...(input.knownWorkspaces ?? this.settings.knownWorkspaces ?? []), ...input.allowedWorkspaces])],
+      // Keep legacy values on disk for downgrade compatibility. They no longer
+      // restrict DingTalk commands or notifications.
+      allowedWorkspaces: [...legacyAllowedWorkspaces],
+      knownWorkspaces: [...new Set([...legacyKnownWorkspaces, ...legacyAllowedWorkspaces])],
       commandsPerMinute: input.commandsPerMinute,
       ...(this.settings.boundStaffId ? { boundStaffId: this.settings.boundStaffId } : { bindingKey: this.settings.bindingKey ?? newBindingKey() }),
       ...(this.settings.boundSenderName ? { boundSenderName: this.settings.boundSenderName } : {}),

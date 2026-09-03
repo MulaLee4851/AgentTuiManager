@@ -25,7 +25,8 @@ function createRouter(overrides: Partial<{
     listPendingApprovals: vi.fn(() => approvals),
     terminalReplay: vi.fn(() => ({ data: '\u001b[32mhello\u001b[0m\r\n', sequence: 1 })),
     approveRequest: vi.fn(),
-    approveAllPending: vi.fn(() => ({ approved: 1, skipped: 0, failed: 0, skippedRequestIds: [] })),
+    approveAllPending: vi.fn(async () => ({ approved: 1, skipped: 0, failed: 0, skippedRequestIds: [] })),
+    approveAllPendingForced: vi.fn(async () => ({ approved: 2, skipped: 0, failed: 0, skippedRequestIds: [] })),
     write: vi.fn(),
     stopSession: vi.fn(async () => undefined),
     restartSession: vi.fn(async () => undefined),
@@ -52,7 +53,7 @@ describe('DingTalkCommandRouter', () => {
     expect(bind).toHaveBeenCalledWith('abc', 'staff-1', 'Tester')
   })
 
-  it('filters agents by workspace and supports status, tail, and send', async () => {
+  it('controls agents from every workspace and supports status, tail, and send', async () => {
     const { router, manager } = createRouter({ sessions: [
       { sessionId: 'allowed-1234', displayName: 'Allowed', status: 'running', agentKind: 'codex', workspace: 'B:/allowed' } as SessionSummary,
       { sessionId: 'blocked-1234', displayName: 'Blocked Claude', status: 'running', agentKind: 'claude', workspace: 'B:/blocked' } as SessionSummary,
@@ -60,27 +61,41 @@ describe('DingTalkCommandRouter', () => {
     await expect(router.execute('/agents', { staffId: 'staff-1' })).resolves.toContain('Allowed')
     await expect(router.execute('/agents', { staffId: 'staff-1' })).resolves.toContain('Blocked Claude')
     await expect(router.execute('/status allowed-', { staffId: 'staff-1' })).resolves.toContain('状态：running')
-    await expect(router.execute('/status blocked-', { staffId: 'staff-1' })).resolves.toContain('不在允许的工作区')
+    await expect(router.execute('/status blocked-', { staffId: 'staff-1' })).resolves.toContain('状态：running')
     await expect(router.execute('/tail Allowed', { staffId: 'staff-1' })).resolves.toContain('hello')
     await expect(router.execute('/send Allowed hi', { staffId: 'staff-1' })).resolves.toContain('已向 Allowed 发送消息')
     expect(manager.write).toHaveBeenNthCalledWith(1, 'allowed-1234', 'hi')
     expect(manager.write).toHaveBeenNthCalledWith(2, 'allowed-1234', '\r')
   })
 
-  it('keeps approve-all delegated to the local policy and blocks foreign workspaces', async () => {
+  it('keeps approve-all delegated to the local policy across all workspaces', async () => {
     const approval = { requestId: 'approval-1', sessionId: 'session-12345678', displayName: 'Code Agent', agentKind: 'codex', workspace: 'B:/allowed', source: 'terminal', risk: 'read', toolName: 'read', reason: '需要读取文件', createdAt: 1, canBulkApprove: true } as ApprovalRequest
     const { router, manager } = createRouter({ approvals: [approval] })
     await expect(router.execute('/approve approval-1', { staffId: 'staff-1' })).resolves.toContain('已批准')
     await expect(router.execute('/approve-all', { staffId: 'staff-1' })).resolves.toContain('批准完成')
     expect(manager.approveAllPending).toHaveBeenCalledTimes(1)
 
-    const foreign = { ...approval, sessionId: 'foreign-1' }
-    const blocked = createRouter({ approvals: [foreign] })
-    await expect(blocked.router.execute('/approve-all', { staffId: 'staff-1' })).resolves.toContain('工作区白名单外')
-    expect(blocked.manager.approveAllPending).not.toHaveBeenCalled()
+    const foreign = { ...approval, requestId: 'foreign-approval', sessionId: 'foreign-1', workspace: 'A:/outside' }
+    const unrestricted = createRouter({ approvals: [foreign] })
+    await expect(unrestricted.router.execute('/approve foreign-approval', { staffId: 'staff-1' })).resolves.toContain('已批准')
+    await expect(unrestricted.router.execute('/approve-all', { staffId: 'staff-1' })).resolves.toContain('批准完成')
+    expect(unrestricted.manager.approveAllPending).toHaveBeenCalledTimes(1)
   })
 
-  it('turns full-auto mode on and off for a selected allowed Agent', async () => {
+  it('supports an explicit force-all command and leaves the safe bulk command unchanged', async () => {
+    const { router, manager, audit } = createRouter()
+
+    await expect(router.execute('/approve-all-force', { staffId: 'staff-1' })).resolves.toContain('强制批准完成：2 个批准')
+
+    expect(manager.approveAllPendingForced).toHaveBeenCalledTimes(1)
+    expect(manager.approveAllPending).not.toHaveBeenCalled()
+    expect(audit.record).toHaveBeenCalledWith(expect.objectContaining({
+      level: 'warning',
+      action: 'remote_approval_force_all',
+    }))
+  })
+
+  it('turns full-auto mode on and off for a selected Agent', async () => {
     const { router, manager } = createRouter()
     await expect(router.execute('/auto session- on', { staffId: 'staff-1' })).resolves.toContain('已为 Code Agent 开启全自动模式')
     await expect(router.execute('/auto Code Agent off', { staffId: 'staff-1' })).resolves.toContain('已为 Code Agent 关闭全自动模式')

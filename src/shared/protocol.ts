@@ -27,6 +27,8 @@ export type HostEvent =
   | { type: 'error'; message: string }
   | { type: 'permission-request'; requestId: string; hookSource?: 'claude' | 'codex'; toolName: string; command?: string; operation?: import('./manager-api').ApprovalRisk; filePath?: string; targetPaths?: string[]; toolInputSummary?: string; reason?: string; toolUseId?: string; agentId?: string; agentType?: string; toolInputFingerprint?: string; nativeSessionId?: string; turnId?: string; cwd?: string; model?: string; permissionMode?: string; transcriptPath?: string; toolInput?: unknown; rawPayload?: unknown }
   | { type: 'permission-response'; requestId: string; action: 'allow' | 'ask' | 'deny' }
+  | { type: 'permission-response-ack'; requestId: string; delivered: boolean }
+  | { type: 'permission-hook-closed'; requestId: string; hookSource: 'claude' | 'codex' }
   | { type: 'replay'; data: string }
   | { type: 'manager-preserved'; managerId: string }
   | { type: 'pong'; ownership: 'managed' | 'preserved' | 'unclaimed' }

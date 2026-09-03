@@ -7,6 +7,7 @@ import SessionSafetyDialog from './SessionSafetyDialog'
 import DingTalkSettingsDialog from './DingTalkSettingsDialog'
 import LlmReviewSettingsDialog from './LlmReviewSettingsDialog'
 import AuditPage from './AuditPage'
+import TokenUsagePage from './TokenUsagePage'
 import AttentionCenter from './AttentionCenter'
 import type { AgentConfigSource, AgentEnvironmentSummary, AgentInstallProgress, AgentKind, ApprovalRequest, CCSwitchProviderSummary, ExternalTerminalDragProjection, NativeSessionSummary, NpmRegistryChoice, StartSessionRequest, SessionSummary } from './shared/manager-api'
 import managerLogoUrl from '../logo/AgentTuiManager.png'
@@ -794,7 +795,7 @@ export default function App(): JSX.Element {
   const [notificationBusyId, setNotificationBusyId] = useState<string>()
   const [notificationError, setNotificationError] = useState('')
   const [fullAutoSessionId, setFullAutoSessionId] = useState<string>()
-  const [view, setView] = useState<'overview' | 'attention' | 'audit'>('overview')
+  const [view, setView] = useState<'overview' | 'attention' | 'audit' | 'tokens'>('overview')
   const [overviewMode, setOverviewMode] = useState<'wall' | 'list'>(initialOverviewPreferences.current.overviewMode)
   const [groupByWorkspace, setGroupByWorkspace] = useState(initialOverviewPreferences.current.groupByWorkspace)
   const [listActiveId, setListActiveId] = useState<string>()
@@ -1071,7 +1072,7 @@ export default function App(): JSX.Element {
           <p className={`nav-label${groupByWorkspace ? ' nav-section' : ''}`}>视图</p>
           <button className={`nav-item${view === 'overview' ? ' active' : ''}`} type='button' onClick={() => setView('overview')}><span>▦</span><span>Agent 总览</span></button>
           <button className={`nav-item${view === 'attention' ? ' active' : ''}`} type='button' onClick={() => setView('attention')}><span>!</span><span>处理中心</span>{totalPendingCount > 0 && <i className='nav-count'>{totalPendingCount}</i>}</button>
-          <button className={`nav-item${view === 'audit' ? ' active' : ''}`} type='button' aria-label='审计' onClick={() => setView('audit')}><span>↺</span><span>审计</span></button>
+          <button className={`nav-item${view === 'audit' ? ' active' : ''}`} type='button' aria-label='审计' onClick={() => setView('audit')}><span>↺</span><span>审计</span></button><button className={`nav-item${view === 'tokens' ? ' active' : ''}`} type='button' aria-label='Token 用量' onClick={() => setView('tokens')}><span>∑</span><span>Token 用量</span></button>
           <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('approval-rules'); setShowApprovalRules(true) }}><span>✓</span><span>安全规则</span></button>
           <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('continue-keywords'); setShowContinueKeywords(true) }}><span>↻</span><span>关键词续跑</span></button>
           <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('session-safety'); setShowSessionSafety(true) }}><span>⚙</span><span>会话安全</span></button>
@@ -1079,7 +1080,7 @@ export default function App(): JSX.Element {
           <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('llm-review'); setLlmReviewInitialView('settings'); setShowLlmReviewSettings(true) }}><span>◇</span><span>LLM 审查</span></button>
         </nav>
         <section className='workspace-main'>
-          <div className='sectionbar'>{selected ? <span aria-hidden='true' /> : <><h1>{view === 'overview' ? 'Agent 总览' : view === 'attention' ? '处理中心' : '活动审计'}</h1><span>{view === 'overview' ? `${runningCount} 运行 · ${overviewPendingCount} 待处理 · ${overviewSessions.length} 总计` : view === 'attention' ? `${totalPendingCount} 个待处理项` : '所有会话活动记录'}</span><div className='topbar-spacer' />{view === 'overview' && <div className='overview-mode-switch' role='group' aria-label='Agent 显示模式'><button type='button' aria-pressed={overviewMode === 'wall'} title='总览模式' onClick={() => setOverviewMode('wall')}>▦ 总览</button><button type='button' aria-pressed={overviewMode === 'list'} title='列表模式' onClick={() => setOverviewMode('list')}>☰ 列表</button></div>}{view === 'overview' && <button className='workspace-scope-toggle' type='button' role='switch' aria-checked={groupByWorkspace} onClick={() => setGroupByWorkspace((enabled) => !enabled)}><i />按工作区划分</button>}<span>{view === 'attention' || !groupByWorkspace ? '全部工作区' : activeWorkspaceName}</span></>}</div>
+          <div className='sectionbar'>{selected ? <span aria-hidden='true' /> : <><h1>{view === 'overview' ? 'Agent 总览' : view === 'attention' ? '处理中心' : view === 'audit' ? '活动审计' : 'Token 用量'}</h1><span>{view === 'overview' ? `${runningCount} 运行 · ${overviewPendingCount} 待处理 · ${overviewSessions.length} 总计` : view === 'attention' ? `${totalPendingCount} 个待处理项` : view === 'audit' ? '所有会话活动记录' : '按窗口、配置和模型统计原生 usage'}</span><div className='topbar-spacer' />{view === 'overview' && <div className='overview-mode-switch' role='group' aria-label='Agent 显示模式'><button type='button' aria-pressed={overviewMode === 'wall'} title='总览模式' onClick={() => setOverviewMode('wall')}>▦ 总览</button><button type='button' aria-pressed={overviewMode === 'list'} title='列表模式' onClick={() => setOverviewMode('list')}>☰ 列表</button></div>}{view === 'overview' && <button className='workspace-scope-toggle' type='button' role='switch' aria-checked={groupByWorkspace} onClick={() => setGroupByWorkspace((enabled) => !enabled)}><i />按工作区划分</button>}<span>{view === 'attention' || !groupByWorkspace ? '全部工作区' : activeWorkspaceName}</span></>}</div>
           <div className={`workspace-overview-shell${view === 'overview' ? '' : ' workspace-view-hidden'}`}>{sessions.length === 0 && externalDrag?.phase !== 'hovering'
             ? <section className='empty-state'><div className='empty-icon'>›_</div><h2>还没有受管 Agent</h2><p>选择工作区并启动你的第一个终端 Agent。</p><button className='button-primary' type='button' onClick={openAgentForm}>新增 Agent</button></section>
             : <section className={`agent-overview-workbench${overviewMode === 'list' && !selected ? ' agent-overview-workbench-list' : ''}${selected ? ' agent-overview-workbench-detail' : ''}`}>
@@ -1107,6 +1108,7 @@ export default function App(): JSX.Element {
               {handoffError && <div className='handoff-error' role='alert'>{handoffError}</div>}
             </section>}</div>
           {view === 'attention' && <AttentionCenter sessions={sessions} approvals={approvals} onReload={reload} onOpenSession={(sessionId) => { setSelectedId(sessionId); setView('overview') }} />}
+          {view === 'tokens' && <TokenUsagePage sessions={sessions} />}
           {view === 'audit' && <AuditPage sessions={sessions} onOpenLlmReviewResults={() => { closeOtherOverlays('llm-review'); setLlmReviewInitialView('results'); setShowLlmReviewSettings(true) }} />}
         </section>
       </div>
@@ -1115,7 +1117,7 @@ export default function App(): JSX.Element {
       {showApprovalRules && <ApprovalRulesDialog onClose={() => setShowApprovalRules(false)} />}
       {showContinueKeywords && <ContinueKeywordDialog onClose={() => setShowContinueKeywords(false)} />}
       {showSessionSafety && <SessionSafetyDialog onClose={() => setShowSessionSafety(false)} />}
-      {showDingTalkSettings && <DingTalkSettingsDialog sessions={sessions} onClose={() => setShowDingTalkSettings(false)} />}
+      {showDingTalkSettings && <DingTalkSettingsDialog onClose={() => setShowDingTalkSettings(false)} />}
       {showLlmReviewSettings && <LlmReviewSettingsDialog initialView={llmReviewInitialView} onClose={() => setShowLlmReviewSettings(false)} />}
       {fullAutoSession && <FullAutoDialog session={fullAutoSession} onClose={() => setFullAutoSessionId(undefined)} onChanged={() => { void reload() }} />}
     </main>

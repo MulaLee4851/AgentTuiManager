@@ -67,6 +67,7 @@ export interface HostHandle {
   resize(cols: number, rows: number): void
   replay(timeoutMs?: number): Promise<string>
   respondToPermission(requestId: string, action: 'allow' | 'ask' | 'deny'): void
+  respondToPermissionChecked?(requestId: string, action: 'allow' | 'ask' | 'deny'): Promise<boolean>
   stop(): Promise<void>
   preserveOnDisconnect?(): Promise<void>
   resumeManagement?(): void
@@ -117,6 +118,7 @@ class PipeHostHandle implements HostHandle {
   private readonly pongWaiters: EventWaiter[] = []
   private readonly replayWaiters: EventWaiter[] = []
   private readonly preserveWaiters: EventWaiter[] = []
+  private readonly permissionResponseWaiters = new Map<string, { resolve: (delivered: boolean) => void; timer: ReturnType<typeof setTimeout> }>()
   private buffer = ''
   private closedError: Error | undefined
   private readonly timeoutMs: number
@@ -165,6 +167,29 @@ class PipeHostHandle implements HostHandle {
 
   respondToPermission(requestId: string, action: 'allow' | 'ask' | 'deny'): void {
     this.send({ type: 'permission-response', requestId, action })
+  }
+
+  respondToPermissionChecked(requestId: string, action: 'allow' | 'ask' | 'deny'): Promise<boolean> {
+    const previous = this.permissionResponseWaiters.get(requestId)
+    if (previous) {
+      clearTimeout(previous.timer)
+      previous.resolve(false)
+    }
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        if (this.permissionResponseWaiters.get(requestId)?.timer !== timer) return
+        this.permissionResponseWaiters.delete(requestId)
+        resolve(false)
+      }, Math.max(1_000, Math.min(this.timeoutMs, 5_000)))
+      this.permissionResponseWaiters.set(requestId, { resolve, timer })
+      try {
+        this.send({ type: 'permission-response', requestId, action })
+      } catch {
+        clearTimeout(timer)
+        this.permissionResponseWaiters.delete(requestId)
+        resolve(false)
+      }
+    })
   }
 
   async stop(): Promise<void> {
@@ -270,7 +295,14 @@ class PipeHostHandle implements HostHandle {
       if (!line) continue
       try {
         const event = JSON.parse(line) as HostEvent
-        if (event.type === 'pong') this.deliver(this.pongWaiters, event)
+        if (event.type === 'permission-response-ack') {
+          const waiter = this.permissionResponseWaiters.get(event.requestId)
+          if (waiter) {
+            this.permissionResponseWaiters.delete(event.requestId)
+            clearTimeout(waiter.timer)
+            waiter.resolve(event.delivered)
+          }
+        } else if (event.type === 'pong') this.deliver(this.pongWaiters, event)
         else if (event.type === 'replay') this.deliver(this.replayWaiters, event)
         else if (event.type === 'manager-preserved') this.deliver(this.preserveWaiters, event)
         else if (!this.deliver(this.waiters, event)) this.events.push(event)
@@ -300,6 +332,11 @@ class PipeHostHandle implements HostHandle {
     this.pongWaiters.length = 0
     this.replayWaiters.length = 0
     this.preserveWaiters.length = 0
+    for (const waiter of this.permissionResponseWaiters.values()) {
+      clearTimeout(waiter.timer)
+      waiter.resolve(false)
+    }
+    this.permissionResponseWaiters.clear()
   }
 }
 

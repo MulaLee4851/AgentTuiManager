@@ -876,12 +876,9 @@ describe('App terminal wall', () => {
     expect(api.listSessions).toHaveBeenCalledTimes(initialReads)
   })
 
-  it('selects newly discovered DingTalk workspaces by default and preserves explicit opt-outs', async () => {
-    const second = { ...session, sessionId: 'session-2', displayName: '医保移植Agent', agentKind: 'claude' as const, workspace: 'F:\\puwo\\his' }
-    vi.mocked(api.listSessions).mockResolvedValue([session, second])
+  it('does not expose or submit DingTalk workspace restrictions', async () => {
     vi.mocked(api.getDingTalkSettings).mockResolvedValue({
-      enabled: true, clientId: 'client-id', hasClientSecret: true,
-      allowedWorkspaces: ['B:\\projects\\api'], knownWorkspaces: [], commandsPerMinute: 20,
+      enabled: true, clientId: 'client-id', hasClientSecret: true, commandsPerMinute: 20,
       boundStaffId: 'staff-1', agentModeEnabled: false, hasAgentApiKey: false, agentRetryCount: 3,
       agentProxyEnabled: false, agentProxyHost: '127.0.0.1', agentProxyPort: 7897,
       hasAgentProxyPassword: false, connectionStatus: 'connected',
@@ -889,17 +886,13 @@ describe('App terminal wall', () => {
 
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: /钉钉远程/ }))
-    const apiWorkspace = await screen.findByRole('checkbox', { name: 'B:\\projects\\api' })
-    const medicalWorkspace = screen.getByRole('checkbox', { name: 'F:\\puwo\\his' })
-    expect(apiWorkspace).toBeChecked()
-    expect(medicalWorkspace).toBeChecked()
-
-    fireEvent.click(medicalWorkspace)
+    expect(screen.queryByText('允许远程访问的工作区')).not.toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('switch', { name: '启用钉钉远程开发' })).toBeChecked())
     fireEvent.click(screen.getByRole('button', { name: '保存并连接' }))
-    await waitFor(() => expect(api.updateDingTalkSettings).toHaveBeenCalledWith(expect.objectContaining({
-      allowedWorkspaces: ['B:\\projects\\api'],
-      knownWorkspaces: expect.arrayContaining(['B:\\projects\\api', 'F:\\puwo\\his']),
-    })))
+    await waitFor(() => expect(api.updateDingTalkSettings).toHaveBeenCalled())
+    const submitted = vi.mocked(api.updateDingTalkSettings).mock.calls.at(-1)?.[0]
+    expect(submitted).not.toHaveProperty('allowedWorkspaces')
+    expect(submitted).not.toHaveProperty('knownWorkspaces')
   })
 
   it('accepts or dismisses an approval rule suggestion on the Agent tile', async () => {

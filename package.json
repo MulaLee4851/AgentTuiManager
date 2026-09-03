@@ -1,6 +1,6 @@
 {
   "name": "agent-tui-manager",
-  "version": "0.2.1",
+  "version": "0.3.3",
   "private": true,
   "main": "dist-electron/main.js",
   "scripts": {
@@ -55,7 +55,7 @@
     "win": {
       "target": "nsis",
       "icon": "logo/AgentTuiManager.png",
-      "artifactName": "Agent-TUI-Manager-Setup-0.2.1-x64.exe",
+      "artifactName": "Agent-TUI-Manager-Setup-${version}-x64.exe",
       "extraResources": [
         {
           "from": "build/native/AgentTui.NativeBridge.exe",
@@ -70,7 +70,7 @@
       ],
       "icon": "logo/AgentTuiManager.png",
       "category": "public.app-category.developer-tools",
-      "artifactName": "Agent-TUI-Manager-0.2.1-${arch}.${ext}"
+      "artifactName": "Agent-TUI-Manager-${version}-${arch}.${ext}"
     },
     "nsis": {
       "oneClick": false,

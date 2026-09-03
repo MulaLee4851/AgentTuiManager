@@ -22,7 +22,7 @@ import { SessionSafetyStore } from './session-safety-store'
 import { ManagedSessionCatalog } from './managed-session-catalog'
 import { DingTalkSettingsStore } from './dingtalk-settings-store'
 import { DingTalkCommandRouter } from './dingtalk-command-router'
-import { DingTalkStreamService, isDingTalkWorkspaceAllowed } from './dingtalk-stream-service'
+import { DingTalkStreamService } from './dingtalk-stream-service'
 import { DingTalkAgentInterpreter } from './dingtalk-agent-interpreter'
 import { migrateCodexProviderOfficial, migrateCodexSessionProvider } from './codex-session-provider-migrator'
 import { openNativeResumeTerminal } from './native-terminal'
@@ -32,12 +32,14 @@ import { detectAgentEnvironment, installAgent, installNodeAndNpm, installRipgrep
 import { environmentWithFreshPath, pathFromEnvironment } from './platform-environment'
 import { LlmReviewSettingsStore } from './llm-review-settings-store'
 import { LlmSecurityReviewer } from './llm-security-reviewer'
+import { TokenUsageStore } from './token-usage-store'
 import { IPC_CHANNELS, type AgentConfigInput, type AgentKind, type AgentProxyInput, type ApprovalRequest, type AuditEntry, type ContinueKeywordSettings, type DingTalkSettingsInput, type ExternalTerminalDragProjection, type LlmReviewSettingsInput, type LlmRuleAuditFinding, type LlmRuleAuditResult, type LlmRuleAuditState, type ManagerEvent, type NativeSessionSummary, type NpmRegistryChoice, type RecoveryRecipe, type SessionSafetySettings, type SessionSummary, type StartSessionRequest } from '../src/shared/manager-api'
 
 let mainWindow: BrowserWindow | undefined
 let tray: Tray | undefined
 let controller: SessionController
 let auditStore: ActivityAuditStore
+let tokenUsageStore: TokenUsageStore
 let agentConfigurationStore: AgentConfigurationStore
 let agentProxyStore: AgentProxyStore
 let continueKeywordStore: ContinueKeywordStore
@@ -203,10 +205,10 @@ function dingTalkSettings(value: unknown): DingTalkSettingsInput {
     if (!Array.isArray(candidate) || candidate.length > 100) throw new Error(`${label} 最多保存 100 项`)
     return [...new Set(candidate.map((item, index) => text(item, `${label}[${index}]`, maxLength).trim()).filter(Boolean))]
   }
-  const allowedWorkspaces = normalizeList(input.allowedWorkspaces, '工作区', 1_024).map(workspace)
-  const knownWorkspaces = input.knownWorkspaces === undefined
-    ? [...allowedWorkspaces]
-    : normalizeList(input.knownWorkspaces, '已知工作区', 1_024).map(workspace)
+  // Accept legacy renderer payloads for downgrade compatibility, but workspace
+  // lists are no longer required and no longer authorize DingTalk access.
+  const allowedWorkspaces = input.allowedWorkspaces === undefined ? undefined : normalizeList(input.allowedWorkspaces, '工作区', 1_024).map(workspace)
+  const knownWorkspaces = input.knownWorkspaces === undefined ? undefined : normalizeList(input.knownWorkspaces, '已知工作区', 1_024).map(workspace)
   if (!Number.isInteger(input.commandsPerMinute) || Number(input.commandsPerMinute) < 1 || Number(input.commandsPerMinute) > 120) {
     throw new Error('每分钟命令上限必须是 1 到 120 的整数')
   }
@@ -224,8 +226,8 @@ function dingTalkSettings(value: unknown): DingTalkSettingsInput {
     ...(clientId ? { clientId } : {}),
     ...(clientSecret ? { clientSecret } : {}),
     ...(input.clearClientSecret === true ? { clearClientSecret: true } : {}),
-    allowedWorkspaces,
-    knownWorkspaces: [...new Set([...knownWorkspaces, ...allowedWorkspaces])],
+    ...(allowedWorkspaces ? { allowedWorkspaces } : {}),
+    ...(knownWorkspaces ? { knownWorkspaces } : {}),
     commandsPerMinute: Number(input.commandsPerMinute),
     agentModeEnabled: input.agentModeEnabled === true,
     agentRetryCount: Number(input.agentRetryCount),
@@ -708,6 +710,16 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
     trustedRenderer(event)
     return auditStore.list()
   })
+  ipcMain.handle(IPC_CHANNELS.listTokenUsageSummary, async (event, value: unknown) => {
+    trustedRenderer(event)
+    const query = value && typeof value === 'object' ? value as import('../src/shared/manager-api').TokenUsageQuery : {}
+    return tokenUsageStore.listSummary(query, controller.listSessions())
+  })
+  ipcMain.handle(IPC_CHANNELS.listTokenUsageDetails, async (event, value: unknown) => {
+    trustedRenderer(event)
+    const query = value && typeof value === 'object' ? value as import('../src/shared/manager-api').TokenUsageQuery : {}
+    return tokenUsageStore.listDetails(query, controller.listSessions())
+  })
   ipcMain.handle(IPC_CHANNELS.startSession, async (event, request: unknown) => {
     trustedRenderer(event)
     const validated = startRequest(request)
@@ -881,6 +893,7 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
       ? await agentConfigurationStore.save(await resolvedAgentConfig(session.agentKind, input), existingProfileId)
       : AgentConfigurationStore.localSummary()
     await controller.updateSessionConfig(target, summary)
+    tokenUsageStore.noteSessionConfig(target, summary)
     if (!summary.enabled && existingProfileId) await agentConfigurationStore.remove(existingProfileId)
     recordAudit({
       level: 'info', category: 'session', action: 'session_config_updated',
@@ -969,7 +982,7 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
     recordAudit({
       level: 'warning', category: 'remote', action: 'remote_settings_changed',
       message: saved.enabled ? '已更新并启用钉钉远程开发' : '已关闭钉钉远程开发',
-      details: { enabled: saved.enabled, bound: Boolean(saved.boundStaffId), agentModeEnabled: saved.agentModeEnabled, allowedWorkspaceCount: saved.allowedWorkspaces.length },
+      details: { enabled: saved.enabled, bound: Boolean(saved.boundStaffId), agentModeEnabled: saved.agentModeEnabled },
     })
     try {
       await dingTalkStreamService.restart(dingTalkSettingsStore.getRuntimeSettings())
@@ -1041,9 +1054,9 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
       },
     })
   })
-  ipcMain.handle(IPC_CHANNELS.approveAllPending, (event) => {
+  ipcMain.handle(IPC_CHANNELS.approveAllPending, async (event) => {
     trustedRenderer(event)
-    const result = controller.approveAllPending()
+    const result = await controller.approveAllPending()
     recordAudit({
       level: result.failed > 0 ? 'warning' : 'info', category: 'approval', action: 'approval_bulk',
       message: '批量审批完成：批准 ' + result.approved + ' 项，跳过 ' + result.skipped + ' 项，失败 ' + result.failed + ' 项',
@@ -1366,6 +1379,8 @@ void app.whenReady().then(async () => {
   const approvalPolicy = await ApprovalPolicyStore.load(join(app.getPath('userData'), 'approval-policy.json'))
   const recoveryPolicy = await RecoveryPolicyStore.load(join(app.getPath('userData'), 'recovery-policy.json'))
   auditStore = await ActivityAuditStore.load(join(app.getPath('userData'), 'activity-audit.json'))
+  tokenUsageStore = new TokenUsageStore(join(app.getPath('userData'), 'token-usage.json'))
+  await tokenUsageStore.load()
   const auditedApprovalPolicy = {
     decide(command: string | undefined) {
       const subject = approvalSubject(command)
@@ -1410,16 +1425,6 @@ void app.whenReady().then(async () => {
           return
         }
         const dingTalkSettings = dingTalkSettingsStore.getRuntimeSettings()
-        if (dingTalkSettings.enabled && dingTalkSettings.boundStaffId
-          && !isDingTalkWorkspaceAllowed(dingTalkSettings, current.workspace)) {
-          recordAudit({
-            level: 'info', category: 'remote', action: 'remote_approval_notification_skipped',
-            message: '钉钉待审批提醒已跳过：工作区未启用远程访问',
-            sessionId: current.sessionId,
-            details: { requestId: current.requestId, workspace: current.workspace, reason: 'workspace-not-allowed' },
-          })
-          return
-        }
         void dingTalkStreamService?.notifyApproval(current, dingTalkSettings).then((sent) => {
           if (!sent) return
           recordAudit({
@@ -1535,6 +1540,7 @@ void app.whenReady().then(async () => {
     terminalReplay: (id: string) => controller.terminalReplay(id),
     approveRequest: (id: string) => controller.approveRequest(id),
     approveAllPending: () => controller.approveAllPending(),
+    approveAllPendingForced: () => controller.approveAllPendingForced(),
     write: (id: string, data: string) => controller.write(id, data),
     stopSession: async (id: string) => {
       await controller.stopSession(id)
