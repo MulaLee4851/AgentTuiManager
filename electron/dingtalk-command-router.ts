@@ -1,4 +1,5 @@
 import type { ApprovalRequest, AuditEntry, BulkApprovalResult, SessionSummary } from '../src/shared/manager-api'
+import { SESSION_STATUS_LABEL, sessionDisplayStatus, parseSessionDisplayStatus, type SessionDisplayStatus } from '../src/shared/session-state'
 import type { StoredDingTalkSettings } from './dingtalk-settings-store'
 import type { DingTalkAgentInterpreter } from './dingtalk-agent-interpreter'
 
@@ -12,7 +13,6 @@ export interface DingTalkManagerPort {
   listPendingApprovals(): ApprovalRequest[]
   terminalReplay(sessionId: string): { data: string; sequence: number }
   approveRequest(requestId: string): void | Promise<void>
-  approveAllPending(): Promise<BulkApprovalResult>
   approveAllPendingForced(): Promise<BulkApprovalResult>
   write(sessionId: string, data: string): void | Promise<void>
   stopSession(sessionId: string): Promise<void>
@@ -29,12 +29,13 @@ const HELP = [
   '/agents - Agent 运行列表',
   '/pending - 待审批列表',
   '/approve <审批ID> - 批准指定请求',
-  '/approve-all - 按本地安全策略批准全部',
   '/approve-all-force - 忽略风险限制，强制批准全部',
   '/status <Agent> - 查看状态和最近错误',
   '/tail <Agent> - 查看最近终端输出',
   '/workspace <名称或路径> - 查看工作区最近活动',
   '/send <Agent> <内容> - 向终端提交消息',
+  '/send-status <状态> <内容> - 向该状态的全部 Agent 发送消息，如 /send-status 待命 continue',
+  '状态：已停止、运行中、待命、待审批、异常；批量发消息不会代替批准，也不会重启已退出窗口。',
   '/stop <Agent> - 停止 Agent',
   '/restart <Agent> - 重新启动 Agent',
   '/auto <Agent> on|off - 开启或关闭指定 Agent 的全自动模式',
@@ -64,6 +65,7 @@ function shortId(value: string): string { return value.slice(0, 8) }
 
 export class DingTalkCommandRouter {
   private readonly rateWindows = new Map<string, number[]>()
+  private readonly sending = new Set<string>()
 
   constructor(
     private readonly manager: DingTalkManagerPort,
@@ -147,15 +149,14 @@ export class DingTalkCommandRouter {
       case '/help': return HELP
       case '/agents': {
         const visible = this.visibleSessions()
-        return visible.length ? visible.map((session) => `${shortId(session.sessionId)}  ${session.displayName}  ${session.status}\n${session.workspace}`).join('\n\n') : '当前没有 Agent。'
+        return visible.length ? visible.map((session) => `${shortId(session.sessionId)}  ${session.displayName}  ${SESSION_STATUS_LABEL[sessionDisplayStatus(session)]}\n${session.workspace}`).join('\n\n') : '当前没有 Agent。'
       }
       case '/pending': return this.pending()
       case '/approve': return this.approve(args)
-      case '/approve-all': return this.approveAll()
       case '/approve-all-force': return this.approveAllForced()
       case '/status': {
         const session = this.resolveSession(args, sessions)
-        return `${session.displayName} (${shortId(session.sessionId)})\n状态：${session.status}\nAgent：${session.agentKind}\n工作区：${session.workspace}${session.lastError ? `\n最近错误：${session.lastError}` : ''}`
+        return `${session.displayName} (${shortId(session.sessionId)})\n状态：${SESSION_STATUS_LABEL[sessionDisplayStatus(session)]}\nAgent：${session.agentKind}\n工作区：${session.workspace}${session.activityError || session.lastError ? `\n最近错误：${session.activityError ?? session.lastError}` : ''}`
       }
       case '/tail': {
         const session = this.resolveSession(args, sessions)
@@ -167,13 +168,34 @@ export class DingTalkCommandRouter {
         const split = args.search(/\s/)
         if (split < 1) throw new Error('用法：/send <Agent> <内容>')
         const session = this.resolveSession(args.slice(0, split), sessions)
-        if (!['starting', 'running', 'recovering', 'needs_approval', 'needs_attention'].includes(session.status)) throw new Error('Agent 当前未运行，请先重新启动')
         const content = args.slice(split).trim()
-        if (!content || content.length > 4_000 || content.includes('\0') || /[\r\n]/.test(content)) throw new Error('发送内容应为一行且不超过 4000 个字符')
-        await this.manager.write(session.sessionId, content)
-        await wait(TERMINAL_SUBMIT_DELAY_MS)
-        await this.manager.write(session.sessionId, '\r')
+        await this.sendMessage(session.sessionId, content)
         return `已向 ${session.displayName} 发送消息。`
+      }
+      case '/send-status': {
+        const split = args.search(/\s/)
+        if (split < 1) throw new Error('用法：/send-status <状态> <内容>')
+        const status = parseSessionDisplayStatus(args.slice(0, split))
+        if (!status) throw new Error('未知状态，请使用 /agents 查看 Agent，或 /help 查看支持的状态')
+        const content = args.slice(split).trim()
+        this.validateMessage(content)
+        const targets = sessions.filter((session) => sessionDisplayStatus(session) === status)
+        if (!targets.length) return '没有处于“' + SESSION_STATUS_LABEL[status] + '”状态的 Agent。'
+        const results: string[] = []
+        let sent = 0
+        for (const session of targets) {
+          try {
+            await this.sendMessage(session.sessionId, content, status)
+            sent += 1
+            results.push('成功 · ' + session.displayName + ' (' + shortId(session.sessionId) + ')')
+            this.audit.record({ level: 'info', action: 'remote_status_message_sent', message: '已按状态批量发送消息', sessionId: session.sessionId, details: { status } })
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error)
+            results.push('未发送 · ' + session.displayName + ' (' + shortId(session.sessionId) + ')：' + reason)
+            this.audit.record({ level: 'warning', action: 'remote_status_message_skipped', message: '按状态批量发送消息未完成', sessionId: session.sessionId, details: { status, reason } })
+          }
+        }
+        return '匹配 ' + targets.length + ' 个，成功 ' + sent + ' 个，未发送 ' + (targets.length - sent) + ' 个。\n' + results.join('\n')
       }
       case '/stop': {
         const session = this.resolveSession(args, sessions)
@@ -188,6 +210,35 @@ export class DingTalkCommandRouter {
       case '/auto': return this.setFullAutoMode(args, sessions)
       case '/audit': return this.recentAudit()
       default: return `未知命令：${verb}\n\n${HELP}`
+    }
+  }
+
+  private validateMessage(content: string): void {
+    if (!content || content.length > 4000 || /[\x00-\x1f\x7f]/.test(content)) throw new Error('发送内容应为一行且不超过 4000 个字符，不能包含控制字符')
+  }
+
+  private async sendMessage(sessionId: string, content: string, expectedStatus?: SessionDisplayStatus): Promise<void> {
+    this.validateMessage(content)
+    if (this.sending.has(sessionId)) throw new Error('该 Agent 正在发送其他消息，请稍后重试')
+    const check = (): void => {
+      const current = this.manager.listSessions().find((session) => session.sessionId === sessionId)
+      if (!current) throw new Error('Agent 已移除')
+      if (['completed', 'stopped', 'failed'].includes(current.status) || current.recoveryAction === 'resume') throw new Error('Agent 当前未运行，请先重新启动')
+      if (current.agentKind === 'deepseek') throw new Error('DeepSeek Harness 请在官方 Web 界面发送消息')
+      if (current.status === 'starting' || current.status === 'recovering' || current.activity === 'starting') throw new Error('Agent 尚未就绪，请稍后重试')
+      if (current.status === 'needs_approval' || this.manager.listPendingApprovals().some((request) => request.sessionId === sessionId)) throw new Error('Agent 正在等待授权，请先处理审批；发送消息不会代替批准')
+      if (expectedStatus && sessionDisplayStatus(current) !== expectedStatus) throw new Error('Agent 状态已变化，本次跳过')
+    }
+    this.sending.add(sessionId)
+    try {
+      check()
+      await this.manager.write(sessionId, content)
+      await wait(TERMINAL_SUBMIT_DELAY_MS)
+      // A new approval must not consume the Enter intended for a chat message.
+      check()
+      await this.manager.write(sessionId, '\r')
+    } finally {
+      this.sending.delete(sessionId)
     }
   }
 
@@ -221,11 +272,6 @@ export class DingTalkCommandRouter {
     if (!request) throw new Error('找不到该审批请求')
     await this.manager.approveRequest(request.requestId)
     return `已批准 ${request.displayName} 的 ${request.toolName ?? '工具请求'}。`
-  }
-
-  private async approveAll(): Promise<string> {
-    const result = await this.manager.approveAllPending()
-    return `批准完成：${result.approved} 个批准，${result.skipped} 个高风险跳过，${result.failed} 个失败。`
   }
 
   private async approveAllForced(): Promise<string> {

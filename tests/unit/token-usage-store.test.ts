@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import type { SessionSummary } from '../../src/shared/manager-api'
+import { readNativeSessionUsage } from '../../electron/native-session-usage'
 
 vi.mock('../../electron/native-session-usage', () => ({
   readNativeSessionUsage: vi.fn(async () => [
@@ -29,5 +30,29 @@ describe('TokenUsageStore', () => {
     expect(page.records.map((record) => [record.timestamp, record.profileId, record.model])).toEqual([
       [3_000, 'config-c', 'model-c'], [2_000, 'config-b', 'model-b'], [1_000, 'config-a', 'model-a'],
     ])
+  })
+
+  it('summarizes every record in the requested range instead of only the first page', async () => {
+    const from = 10_000
+    const events = Array.from({ length: 602 }, (_, index) => ({
+      sourceKey: `usage:${index}`,
+      timestamp: from - 1 + index,
+      inputTokens: 1,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      reasoningTokens: 0,
+      totalTokens: 1,
+    }))
+    vi.mocked(readNativeSessionUsage).mockResolvedValue(events)
+    const store = new TokenUsageStore()
+
+    const summary = await store.listSummary({ from, to: from + 599 }, [session])
+    const details = await store.listDetails({ from, to: from + 599, pageSize: 100_000 }, [session])
+
+    expect(summary).toHaveLength(1)
+    expect(summary[0]).toMatchObject({ requestCount: 600, inputTokens: 600, totalTokens: 600 })
+    expect(details.total).toBe(600)
+    expect(details.records).toHaveLength(500)
   })
 })

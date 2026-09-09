@@ -24,7 +24,7 @@ import { isTerminalProtocolResponse } from '../../src/TerminalTile'
 
 const session: SessionSummary = {
   sessionId: 'session-1', displayName: 'Codex API 重构', agentKind: 'codex', workspace: 'B:\\projects\\api',
-  status: 'running', recoveryAttempts: 0, userStopRequested: false,
+  status: 'running', activity: 'running', recoveryAttempts: 0, userStopRequested: false,
 }
 
 describe('App terminal wall', () => {
@@ -230,6 +230,49 @@ describe('App terminal wall', () => {
     expect(Terminal).toHaveBeenCalledTimes(2)
   })
 
+  it('filters both overview modes by task activity without rebuilding terminals or scrolling to bottom', async () => {
+    vi.mocked(api.listSessions).mockResolvedValue([
+      { ...session, activity: 'running' },
+      { ...session, sessionId: 'idle-agent', displayName: 'Idle Agent', activity: 'idle' },
+      { ...session, sessionId: 'waiting-agent', displayName: 'Waiting Agent', status: 'needs_approval', activity: 'idle' },
+    ])
+    render(<App />)
+    const busy = await screen.findByTestId('terminal-tile-session-1')
+    const idle = await screen.findByTestId('terminal-tile-idle-agent')
+    const waiting = await screen.findByTestId('terminal-tile-waiting-agent')
+    await waitFor(() => expect(Terminal).toHaveBeenCalledTimes(3))
+    const filter = screen.getByRole('button', { name: '筛选 Agent 状态' })
+    fireEvent.click(filter)
+    const options = screen.getByRole('group', { name: 'Agent 状态选项' })
+    expect(within(options).getAllByRole('checkbox')).toHaveLength(5)
+    const toggle = (name: string): void => { fireEvent.click(within(options).getByRole('checkbox', { name })) }
+    toggle('运行中')
+    expect(busy).not.toHaveClass('terminal-card-hidden')
+    expect(idle).toHaveClass('terminal-card-hidden')
+    expect(waiting).toHaveClass('terminal-card-hidden')
+    toggle('待审批')
+    expect(waiting).not.toHaveClass('terminal-card-hidden')
+    expect(within(waiting).getByText('待审批')).toBeInTheDocument()
+    const modes = screen.getByRole('group', { name: 'Agent 显示模式' })
+    fireEvent.click(within(modes).getByRole('button', { name: /列表/ }))
+    expect(screen.queryByRole('button', { name: '切换到 Idle Agent' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '切换到 Waiting Agent' })).toBeInTheDocument()
+    toggle('运行中')
+    toggle('待审批')
+    toggle('待命')
+    expect(screen.getByRole('button', { name: '切换到 Idle Agent' })).toBeInTheDocument()
+    expect(busy).toHaveClass('terminal-card-hidden')
+    expect(idle).not.toHaveClass('terminal-card-hidden')
+    toggle('待命')
+    toggle('异常')
+    expect(screen.getByText('没有符合当前状态的 Agent')).toBeInTheDocument()
+    fireEvent.click(within(options).getByRole('button', { name: '显示全部状态' }))
+    fireEvent.click(within(modes).getByRole('button', { name: /总览/ }))
+    expect(Terminal).toHaveBeenCalledTimes(3)
+    expect(terminalMocks.dispose).not.toHaveBeenCalled()
+    expect(terminalMocks.scrollToBottom).not.toHaveBeenCalled()
+  })
+
   it('shows one compact placeholder while an external terminal hovers over the overview', async () => {
     const listeners: Array<Parameters<AgentManagerApi['subscribe']>[0]> = []
     vi.mocked(api.subscribe).mockImplementation((listener) => { listeners.push(listener); return () => undefined })
@@ -315,7 +358,7 @@ describe('App terminal wall', () => {
     }])
     render(<App />)
     const tile = await screen.findByTestId('terminal-tile-session-1')
-    expect(within(tile).getByText('待授权')).toBeInTheDocument()
+    expect(within(tile).getByText('待审批')).toBeInTheDocument()
     fireEvent.click(within(tile).getByRole('button', { name: '批准' }))
     expect(api.approveSession).toHaveBeenCalledWith('session-1')
     expect(screen.getByRole('heading', { name: 'Agent 总览' })).toBeInTheDocument()
@@ -821,7 +864,7 @@ describe('App terminal wall', () => {
     await act(async () => { resolveIntermediate?.([session]) })
 
     const tile = await screen.findByTestId('terminal-tile-session-1')
-    await waitFor(() => expect(within(tile).getByText('待授权')).toBeInTheDocument())
+    await waitFor(() => expect(within(tile).getByText('待审批')).toBeInTheDocument())
     expect(api.listSessions).toHaveBeenCalledTimes(3)
   })
 
@@ -862,7 +905,7 @@ describe('App terminal wall', () => {
     })))
 
     const tile = await screen.findByTestId('terminal-tile-session-1')
-    await waitFor(() => expect(within(tile).getByText('待授权')).toBeInTheDocument())
+    await waitFor(() => expect(within(tile).getByText('待审批')).toBeInTheDocument())
     expect(within(tile).getByText(/2 笔 · Set-Content result\.txt done/)).toBeInTheDocument()
     expect(api.listSessions).toHaveBeenCalledTimes(initialReads)
 
@@ -872,7 +915,7 @@ describe('App terminal wall', () => {
       session,
       approvals: [],
     })))
-    await waitFor(() => expect(within(tile).queryByText('待授权')).not.toBeInTheDocument())
+    await waitFor(() => expect(within(tile).queryByText(/2 笔 · Set-Content result\.txt done/)).not.toBeInTheDocument())
     expect(api.listSessions).toHaveBeenCalledTimes(initialReads)
   })
 

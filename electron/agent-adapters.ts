@@ -94,6 +94,7 @@ abstract class EvidenceAdapter implements AgentAdapter {
       ? this.classify(this.evidence)
       : { ready: false, approvalRequired: false }
     const freshApprovalSignal = /\x1b\]9;(?:Approval requested:|Codex wants to edit|Approval requested by)[^\x07]*(?:\x07|\x1b\\)/i.test(raw.complete)
+      || this.kind === 'codex' && /would you like to (?:run the following command|make the following edits|grant these permissions)\?|allow\s+(?:the\s+)?[\w.-]+\s+mcp\s+server\s+to\s+run\s+tool\s+["']/i.test(output)
     if (!observation.approvalRequired) {
       this.pendingApprovalCommand = undefined
     } else if (freshApprovalSignal) {
@@ -269,6 +270,9 @@ class CodexAdapter extends EvidenceAdapter {
       /needs your approval\./i,
       /do you want to (?:allow|run|execute) (?:this|the) command/i,
       /allow command execution/i,
+      // Ratatui can leave the title unchanged between consecutive approvals.
+      // Its native choice pair still proves an approval, even without a command.
+      /yes,\s*proceed\s*\(y\)[\s\S]*no,\s*and tell codex what to do differently\s*\(esc\)/i,
     ])
     const approvalCommand = approvalPhrase ? extractApprovalCommand(evidence) : undefined
     const approvalReason = approvalPhrase ? extractApprovalReason(evidence) : undefined

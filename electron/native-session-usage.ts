@@ -48,14 +48,14 @@ function usage(value: unknown): Omit<NativeUsageEvent, 'sourceKey' | 'timestamp'
   return { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens, totalTokens }
 }
 
-function timestamp(record: Record<string, unknown>): number {
+function timestamp(record: Record<string, unknown>): number | undefined {
   const value = record.timestamp ?? record.created_at ?? record.createdAt
   if (typeof value === 'number' && Number.isFinite(value)) return value < 10_000_000_000 ? value * 1000 : value
   if (typeof value === 'string') {
     const parsed = Date.parse(value)
     if (Number.isFinite(parsed)) return parsed
   }
-  return Date.now()
+  return undefined
 }
 
 function stringValue(value: unknown): string | undefined {
@@ -89,7 +89,8 @@ function codexUsage(record: Record<string, unknown>): { event?: Omit<NativeUsage
   const total = usage(info.total_token_usage)
   if (!last && !total) return undefined
   const turnId = stringValue(record.turn_id ?? payload.turn_id ?? info.turn_id)
-  const make = (item: ReturnType<typeof usage>) => item ? { ...item, timestamp: timestamp(record), ...(turnId ? { turnId } : {}) } : undefined
+  const occurredAt = timestamp(record)
+  const make = (item: ReturnType<typeof usage>) => item && occurredAt !== undefined ? { ...item, timestamp: occurredAt, ...(turnId ? { turnId } : {}) } : undefined
   return { event: make(last), cumulative: make(total) }
 }
 
@@ -100,7 +101,9 @@ function claudeUsage(record: Record<string, unknown>): Omit<NativeUsageEvent, 's
   if (!item) return undefined
   const turnId = stringValue(record.uuid ?? record.id ?? message?.id)
   const model = stringValue(message?.model ?? record.model)
-  return { ...item, timestamp: timestamp(record), ...(turnId ? { turnId } : {}), ...(model ? { model } : {}) }
+  const occurredAt = timestamp(record)
+  if (occurredAt === undefined) return undefined
+  return { ...item, timestamp: occurredAt, ...(turnId ? { turnId } : {}), ...(model ? { model } : {}) }
 }
 
 export async function readNativeSessionUsage(agentKind: AgentKind, sessionId: string | undefined): Promise<NativeUsageEvent[]> {

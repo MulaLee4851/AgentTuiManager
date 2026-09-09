@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 
 import type { SessionSummary } from './shared/manager-api'
+import { SESSION_STATUS_LABEL, sessionDisplayStatus } from './shared/session-state'
 import { TerminalWriteWatchdog } from './terminal-write-watchdog'
 import codexLogoUrl from '../logo/codex.png'
 import claudeLogoUrl from '../logo/claudecode.png'
@@ -80,11 +81,7 @@ function isClosedPreviousHostError(message: string): boolean {
   return /Host\s+[0-9a-f-]+\s+connection (?:is )?closed/i.test(message)
 }
 
-const STATUS_LABEL: Record<SessionSummary['status'], string> = {
-  starting: '启动中', running: '运行中', needs_approval: '待授权', recovering: '请稍后…',
-  needs_attention: '需要处理',
-  completed: '已完成', stopped: '已停止', failed: '失败', unknown: '未知',
-}
+
 
 interface TerminalTileProps {
   session: SessionSummary
@@ -582,7 +579,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
           <div><h2>{session.displayName}</h2><p title={session.workspace}>{session.workspace}</p></div>
         </div>
         <div className="terminal-actions">
-          <span className={`status-badge status-${session.status}`}>{STATUS_LABEL[session.status]}</span>
+          <span title={session.activityError ?? session.lastError} className={'status-badge status-' + sessionDisplayStatus(session)}>{SESSION_STATUS_LABEL[sessionDisplayStatus(session)]}</span>
           {!terminalEnded && !deepSeekWeb && onFullAuto && <button className={'full-auto-tile-button' + (session.fullAutoEnabled ? ' active' : '')} type="button" title={session.fullAutoEnabled ? '关闭全自动模式' : '开启全自动模式'} onClick={(event) => { event.stopPropagation(); onFullAuto() }}>{session.fullAutoEnabled ? '全自动中' : '全自动'}</button>}
           {onEdit && <button className="button-ghost" type="button" title="编辑 Agent" onClick={(event) => { event.stopPropagation(); onEdit() }} aria-label={`编辑 ${session.displayName}`}>✎</button>}
           {!detail && !embedded && !terminalEnded && <button className="button-ghost" type="button" onClick={(event) => { event.stopPropagation(); onOpen?.() }} aria-label={`查看 ${session.displayName}`}>⛶</button>}
@@ -613,7 +610,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
       </div>}
       {!terminalEnded && <div className="terminal-status-slot">
         {actionError && session.status !== 'needs_approval' && session.status !== 'needs_attention' ? <div className="tile-error">{actionError}</div>
-          : session.status === 'needs_approval' ? <div className="inline-request"><span title={session.pendingApprovalCommand ?? session.approvalInputSummary ?? session.approvalToolName ?? '授权详情待确认'}>Agent 正在等待授权 · {(session.pendingApprovalCount ?? 1) > 1 ? `${session.pendingApprovalCount} 笔 · ` : ''}{session.pendingApprovalCommand ?? session.approvalInputSummary ?? session.approvalToolName ?? '详情待确认'}</span><button className="button-approve" type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.approveSession(session.sessionId) }}>批准</button></div>
+          : session.status === 'needs_approval' ? <div className="inline-request"><span title={session.pendingApprovalCommand ?? session.approvalInputSummary ?? session.approvalToolName ?? '授权详情待确认'}>Agent 正在等待授权 · {(session.pendingApprovalCount ?? 1) > 1 ? `${session.pendingApprovalCount} 笔 · ` : ''}{session.pendingApprovalCommand ?? session.approvalInputSummary ?? session.approvalToolName ?? '详情待确认'}</span><button className="button-approve" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.approveSession(session.sessionId)) }}>批准</button></div>
             : session.status === 'needs_attention' ? <div className="inline-request attention-request"><span title={session.lastError}>{session.attentionKind === 'host-unresponsive' ? 'Agent 窗口疑似卡死，是否重启？' : '检测到异常：' + (session.lastError ?? '原因未知')}</span><button className="button-secondary button-compact" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.dismissRecoverySuggestion(session.sessionId)) }}>{session.attentionKind === 'host-unresponsive' ? '暂不重启' : '忽略'}</button>{session.attentionKind !== 'host-unresponsive' && <button className="button-secondary button-compact" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.acceptRecoverySuggestion(session.sessionId)) }}>采纳</button>}<button className="button-approve" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.tryRecoveryOnce(session.sessionId)) }}>{session.attentionKind === 'host-unresponsive' ? '重启 Agent' : '尝试一次'}</button></div>
               : session.status === 'recovering' ? <div className="recovery-bar"><span>↻</span><span>请稍后…</span></div>
                 : session.approvalSuggestion ? <div className="approval-suggestion"><span className="approval-suggestion-summary" tabIndex={0} data-tooltip={`已手动批准 ${session.approvalSuggestion.approvalCount} 次\n命令：${session.approvalSuggestion.command}\n加入后，相同命令将按安全规则自动批准。`}>已手动批准 {session.approvalSuggestion.approvalCount} 次 · {session.approvalSuggestion.command}</span><button type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.acceptApprovalSuggestion(session.sessionId) }}>加入</button><button type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.dismissApprovalSuggestion(session.sessionId) }}>暂不</button></div>

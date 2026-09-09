@@ -1,6 +1,6 @@
 {
   "name": "agent-tui-manager",
-  "version": "0.3.3",
+  "version": "0.3.5",
   "private": true,
   "main": "dist-electron/main.js",
   "scripts": {
@@ -49,6 +49,7 @@
     "appId": "com.agenttuimanager.desktop",
     "productName": "Agent TUI Manager",
     "asar": true,
+    "afterSign": "scripts/verify-windows-executable.cjs",
     "directories": {
       "output": "release"
     },

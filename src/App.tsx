@@ -1,6 +1,7 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import TerminalTile from './TerminalTile'
+import { SESSION_STATUS_LABEL, sessionDisplayStatus, type SessionDisplayStatus } from './shared/session-state'
 import ApprovalRulesDialog from './ApprovalRulesDialog'
 import ContinueKeywordDialog from './ContinueKeywordDialog'
 import SessionSafetyDialog from './SessionSafetyDialog'
@@ -15,6 +16,7 @@ import codexLogoUrl from '../logo/codex.png'
 import claudeLogoUrl from '../logo/claudecode.png'
 import deepseekLogoUrl from '../logo/deepseek.svg'
 
+import SessionStatusFilter, { normalizeStatusFilter } from './SessionStatusFilter'
 const AGENT_LOGO_URLS: Partial<Record<AgentKind, string>> = { codex: codexLogoUrl, claude: claudeLogoUrl, deepseek: deepseekLogoUrl }
 const DEEPSEEK_WEB_ARGS = ['web', '--host', '127.0.0.1', '--port', '0']
 function AgentLogo({ kind, className = '', label }: { kind: AgentKind; className?: string; label?: string }): JSX.Element {
@@ -56,6 +58,7 @@ interface OverviewPreferences {
   groupByWorkspace: boolean
   activeWorkspace?: string
   sessionOrder?: string[]
+  statusFilter?: SessionDisplayStatus[]
 }
 
 type OverlayKind = 'agent-form' | 'agent-editor' | 'approval-rules' | 'continue-keywords' | 'session-safety' | 'dingtalk' | 'llm-review' | 'full-auto'
@@ -69,6 +72,7 @@ function readOverviewPreferences(): OverviewPreferences {
     return {
       overviewMode: value.overviewMode === 'list' ? 'list' : 'wall',
       groupByWorkspace: value.groupByWorkspace === true,
+      statusFilter: normalizeStatusFilter(value.statusFilter),
       ...(typeof value.activeWorkspace === 'string' && value.activeWorkspace ? { activeWorkspace: value.activeWorkspace } : {}),
       ...(Array.isArray(value.sessionOrder) ? { sessionOrder: value.sessionOrder.filter((item): item is string => typeof item === 'string') } : {}),
     }
@@ -85,10 +89,6 @@ function writeOverviewPreferences(preferences: OverviewPreferences): void {
   }
 }
 
-const SESSION_STATUS_LABEL: Record<SessionSummary['status'], string> = {
-  starting: '启动中', running: '运行中', needs_approval: '待授权', recovering: '恢复中',
-  needs_attention: '待处理', completed: '已完成', stopped: '已停止', failed: '失败', unknown: '未知',
-}
 
 function providerHost(baseUrl?: string): string {
   if (!baseUrl) return '未配置地址'
@@ -799,6 +799,7 @@ export default function App(): JSX.Element {
   const [overviewMode, setOverviewMode] = useState<'wall' | 'list'>(initialOverviewPreferences.current.overviewMode)
   const [groupByWorkspace, setGroupByWorkspace] = useState(initialOverviewPreferences.current.groupByWorkspace)
   const [listActiveId, setListActiveId] = useState<string>()
+  const [statusFilter, setStatusFilter] = useState<SessionDisplayStatus[]>(initialOverviewPreferences.current.statusFilter ?? [])
   const [activeWorkspace, setActiveWorkspace] = useState<string | undefined>(initialOverviewPreferences.current.activeWorkspace)
   const [sessionOrder, setSessionOrder] = useState<string[]>(initialOverviewPreferences.current.sessionOrder ?? [])
   const [draggingSessionId, setDraggingSessionId] = useState<string>()
@@ -809,8 +810,8 @@ export default function App(): JSX.Element {
   const notificationRef = useRef<HTMLDivElement>(null)
   const notificationHideTimer = useRef<ReturnType<typeof setTimeout>>()
   useEffect(() => {
-    writeOverviewPreferences({ overviewMode, groupByWorkspace, ...(activeWorkspace ? { activeWorkspace } : {}), sessionOrder })
-  }, [activeWorkspace, groupByWorkspace, overviewMode, sessionOrder])
+    writeOverviewPreferences({ overviewMode, groupByWorkspace, ...(activeWorkspace ? { activeWorkspace } : {}), sessionOrder, statusFilter })
+  }, [activeWorkspace, groupByWorkspace, overviewMode, sessionOrder, statusFilter])
   const closeOtherOverlays = useCallback((except: OverlayKind): void => {
     if (except !== 'agent-form') setShowForm(false)
     if (except !== 'agent-editor') setShowEditor(false)
@@ -965,11 +966,13 @@ export default function App(): JSX.Element {
     setExternalDrag(null)
   }, [closeOtherOverlays, externalDrag?.phase, externalDrag?.transactionId])
   const visibleSessions = useMemo(() => orderedSessions.filter((session) => currentWorkspace && workspaceKey(session.workspace) === workspaceKey(currentWorkspace)), [currentWorkspace, orderedSessions])
-  const overviewSessions = groupByWorkspace ? visibleSessions : orderedSessions
+  const scopedSessions = groupByWorkspace ? visibleSessions : orderedSessions
+  const overviewSessions = useMemo(() => scopedSessions.filter((session) => statusFilter.length === 0
+    || statusFilter.includes(sessionDisplayStatus(session))), [scopedSessions, statusFilter])
   const overviewSessionIds = useMemo(() => new Set(overviewSessions.map((session) => session.sessionId)), [overviewSessions])
   const listSessions = overviewSessions
   const activeListSessionId = listSessions.some((session) => session.sessionId === listActiveId) ? listActiveId : listSessions[0]?.sessionId
-  const runningCount = useMemo(() => overviewSessions.filter((session) => ['starting', 'running', 'recovering'].includes(session.status)).length, [overviewSessions])
+  const runningCount = useMemo(() => overviewSessions.filter((session) => sessionDisplayStatus(session) === 'running').length, [overviewSessions])
   const pendingCount = useMemo(() => approvals.filter((request) => currentWorkspace && workspaceKey(request.workspace) === workspaceKey(currentWorkspace)).length
     + visibleSessions.filter((session) => session.status === 'needs_attention').length, [approvals, currentWorkspace, visibleSessions])
   const totalPendingCount = useMemo(() => approvals.length + sessions.filter((session) => session.status === 'needs_attention').length, [approvals, sessions])
@@ -1080,11 +1083,11 @@ export default function App(): JSX.Element {
           <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('llm-review'); setLlmReviewInitialView('settings'); setShowLlmReviewSettings(true) }}><span>◇</span><span>LLM 审查</span></button>
         </nav>
         <section className='workspace-main'>
-          <div className='sectionbar'>{selected ? <span aria-hidden='true' /> : <><h1>{view === 'overview' ? 'Agent 总览' : view === 'attention' ? '处理中心' : view === 'audit' ? '活动审计' : 'Token 用量'}</h1><span>{view === 'overview' ? `${runningCount} 运行 · ${overviewPendingCount} 待处理 · ${overviewSessions.length} 总计` : view === 'attention' ? `${totalPendingCount} 个待处理项` : view === 'audit' ? '所有会话活动记录' : '按窗口、配置和模型统计原生 usage'}</span><div className='topbar-spacer' />{view === 'overview' && <div className='overview-mode-switch' role='group' aria-label='Agent 显示模式'><button type='button' aria-pressed={overviewMode === 'wall'} title='总览模式' onClick={() => setOverviewMode('wall')}>▦ 总览</button><button type='button' aria-pressed={overviewMode === 'list'} title='列表模式' onClick={() => setOverviewMode('list')}>☰ 列表</button></div>}{view === 'overview' && <button className='workspace-scope-toggle' type='button' role='switch' aria-checked={groupByWorkspace} onClick={() => setGroupByWorkspace((enabled) => !enabled)}><i />按工作区划分</button>}<span>{view === 'attention' || !groupByWorkspace ? '全部工作区' : activeWorkspaceName}</span></>}</div>
+          <div className='sectionbar'>{selected ? <span aria-hidden='true' /> : <><h1>{view === 'overview' ? 'Agent 总览' : view === 'attention' ? '处理中心' : view === 'audit' ? '活动审计' : 'Token 用量'}</h1><span>{view === 'overview' ? `${runningCount} 运行 · ${overviewPendingCount} 待处理 · ${overviewSessions.length} 总计` : view === 'attention' ? `${totalPendingCount} 个待处理项` : view === 'audit' ? '所有会话活动记录' : '按窗口、配置和模型统计原生 usage'}</span><div className='topbar-spacer' />{view === 'overview' && <SessionStatusFilter value={statusFilter} onChange={setStatusFilter} />}{view === 'overview' && <div className='overview-mode-switch' role='group' aria-label='Agent 显示模式'><button type='button' aria-pressed={overviewMode === 'wall'} title='总览模式' onClick={() => setOverviewMode('wall')}>▦ 总览</button><button type='button' aria-pressed={overviewMode === 'list'} title='列表模式' onClick={() => setOverviewMode('list')}>☰ 列表</button></div>}{view === 'overview' && <button className='workspace-scope-toggle' type='button' role='switch' aria-checked={groupByWorkspace} onClick={() => setGroupByWorkspace((enabled) => !enabled)}><i />按工作区划分</button>}<span>{view === 'attention' || !groupByWorkspace ? '全部工作区' : activeWorkspaceName}</span></>}</div>
           <div className={`workspace-overview-shell${view === 'overview' ? '' : ' workspace-view-hidden'}`}>{sessions.length === 0 && externalDrag?.phase !== 'hovering'
             ? <section className='empty-state'><div className='empty-icon'>›_</div><h2>还没有受管 Agent</h2><p>选择工作区并启动你的第一个终端 Agent。</p><button className='button-primary' type='button' onClick={openAgentForm}>新增 Agent</button></section>
             : <section className={`agent-overview-workbench${overviewMode === 'list' && !selected ? ' agent-overview-workbench-list' : ''}${selected ? ' agent-overview-workbench-detail' : ''}`}>
-              {overviewMode === 'list' && !selected && <aside className='agent-session-list' aria-label='Agent 列表'>{listSessions.map((session) => <button type='button' className={session.sessionId === activeListSessionId ? 'active' : ''} aria-pressed={session.sessionId === activeListSessionId} aria-label={`切换到 ${session.displayName}`} key={session.sessionId} onClick={() => setListActiveId(session.sessionId)}><AgentLogo kind={session.agentKind} className={`agent-dot agent-${session.agentKind}`} label={session.agentKind} /><span><strong>{session.displayName}</strong><small title={session.workspace}>{session.workspace}</small></span><em className={`status-${session.status}`}>{SESSION_STATUS_LABEL[session.status]}</em></button>)}</aside>}
+              {overviewMode === 'list' && !selected && <aside className='agent-session-list' aria-label='Agent 列表'>{listSessions.map((session) => <button type='button' className={session.sessionId === activeListSessionId ? 'active' : ''} aria-pressed={session.sessionId === activeListSessionId} aria-label={`切换到 ${session.displayName}`} key={session.sessionId} onClick={() => setListActiveId(session.sessionId)}><AgentLogo kind={session.agentKind} className={`agent-dot agent-${session.agentKind}`} label={session.agentKind} /><span><strong>{session.displayName}</strong><small title={session.workspace}>{session.workspace}</small></span><em className={`status-${sessionDisplayStatus(session)}`}>{SESSION_STATUS_LABEL[sessionDisplayStatus(session)]}</em></button>)}</aside>}
               <section key='terminal-grid' className={`terminal-grid terminal-grid-count-${Math.min(selected ? 1 : overviewSessions.length + (externalDrag?.phase === 'hovering' ? 1 : 0), 6)}${overviewMode === 'list' && !selected ? ' terminal-grid-list' : ''}${selected ? ' terminal-grid-detail' : ''}`}>{mountedSessions.map((session) => <TerminalTile
                 key={session.sessionId}
                 session={session}
@@ -1099,7 +1102,7 @@ export default function App(): JSX.Element {
                 onDragStart={() => { setDraggingSessionId(session.sessionId); setHandoffError('') }}
                 onDragEnd={() => { if (!detachBusy) setDraggingSessionId(undefined) }}
                 onDragOver={() => moveDraggedBefore(session.sessionId)}
-              />)}{externalDrag?.phase === 'hovering' && view === 'overview' && !selected && <div className='external-handoff-placeholder' data-testid='handoff-placeholder' aria-live='polite'>请稍后…</div>}</section>
+              />)}{!selected && overviewSessions.length === 0 && <div className='overview-filter-empty' role='status'>没有符合当前状态的 Agent</div>}{externalDrag?.phase === 'hovering' && view === 'overview' && !selected && <div className='external-handoff-placeholder' data-testid='handoff-placeholder' aria-live='polite'>请稍后…</div>}</section>
               {draggingSessionId && <div
                 className={'native-terminal-dropzone' + (detachBusy ? ' busy' : '')}
                 onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'move' }}

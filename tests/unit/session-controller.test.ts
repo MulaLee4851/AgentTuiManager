@@ -85,6 +85,81 @@ async function settle(): Promise<void> {
 }
 
 describe('SessionController recovery evidence', () => {
+  it('retains a second Codex terminal approval alongside an unrelated Hook', async () => {
+    vi.useFakeTimers()
+    try {
+      const { controller, handles } = fixture()
+      const session = await controller.startSession(request())
+      const handle = handles[0]!
+      handle.permissionHook = 'codex'
+      handle.emit({ type: 'permission-request', hookSource: 'codex',
+        requestId: 'hook-one', toolName: 'Bash', command: 'npm run build' })
+      await vi.advanceTimersByTimeAsync(0)
+      handle.emit({ type: 'output', data: 'Would you like to run the following command?\r\n$ npm run test\r\n1. Yes, proceed (y)\r\n2. No' })
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(controller.listPendingApprovals()).toHaveLength(2)
+      await controller.approveRequest('hook-one')
+      expect(controller.listSessions()[0]).toMatchObject({ status: 'needs_approval', pendingApprovalCount: 1 })
+      await controller.approveSession(session.sessionId)
+      expect(handle.writes).toEqual(['\r'])
+      expect(handle.permissionResponses).toEqual([{ requestId: 'hook-one', action: 'allow' }])
+    } finally { vi.useRealTimers() }
+  })
+
+  it('shows an option-only approval after a truncated notification without guessing the command', async () => {
+    const { controller, handles } = fixture()
+    await controller.startSession(request())
+    handles[0]!.emit({ type: 'output', data: '\x1b]9;Approval requested: npm test\x07' })
+    await settle()
+    expect(controller.listPendingApprovals()).toHaveLength(0)
+    handles[0]!.emit({ type: 'output', data: '\r\n1. Yes, proceed\r\n2. No' })
+    await settle()
+    expect(controller.listPendingApprovals()).toEqual([
+      expect.objectContaining({ source: 'terminal', command: 'tool:Shell' }),
+    ])
+    expect(handles[0]!.writes).toEqual([])
+  })
+
+  it('detects a consecutive command without a resize after the first approval', async () => {
+    const { controller, handles } = fixture()
+    const session = await controller.startSession(request())
+    for (const command of ['npm run build', 'npm run test']) {
+      handles[0]!.emit({ type: 'output', data: 'Would you like to run the following command?\r\n$ ' + command + '\r\n1. Yes, proceed (y)\r\n2. No' })
+      await settle()
+      expect(controller.listPendingApprovals()).toEqual([expect.objectContaining({ command })])
+      await controller.approveSession(session.sessionId)
+    }
+    expect(handles[0]!.writes).toEqual(['\r', '\r'])
+  })
+
+  it('keeps task activity separate from approvals and ignores stale or foreign session observations', async () => {
+    const { controller, handles } = fixture()
+    const first = await controller.startSession({ ...request(), nativeSessionId: 'native-one' })
+    const second = await controller.startSession({ ...request(), nativeSessionId: 'native-two' })
+    const timestamp = Date.now() + 1000
+    controller.observeNativeActivity(first, { activity: 'completed', timestamp })
+    expect(controller.listSessions()[0]).toMatchObject({ status: 'running', activity: 'completed' })
+    expect(controller.listSessions()[1]).toMatchObject({ sessionId: second.sessionId, activity: 'starting' })
+    controller.observeNativeActivity({ ...first, nativeSessionId: 'wrong-session' }, { activity: 'error', timestamp: timestamp + 1 })
+    controller.observeNativeActivity(first, { activity: 'running', timestamp: timestamp - 1 })
+    expect(controller.listSessions()[0]?.activity).toBe('completed')
+    handles[0]!.emit({ type: 'permission-request', hookSource: 'codex', requestId: 'pending',
+      toolName: 'Bash', command: 'npm run test' })
+    await settle()
+    controller.observeNativeActivity(first, { activity: 'completed', timestamp: timestamp + 2 })
+    expect(controller.listSessions()[0]).toMatchObject({ status: 'needs_approval', activity: 'completed' })
+    expect(handles[0]!.writes).toEqual([])
+  })
+
+  it('still refuses to restart an unbound native session without a recovery recipe', async () => {
+    const { controller, handles, starts } = fixture()
+    const session = await controller.startSession(request())
+    handles[0]!.emit({ type: 'exit', exitCode: 0 })
+    await settle()
+    await expect(controller.restartSession(session.sessionId)).rejects.toThrow()
+    expect(starts).toHaveLength(1)
+  })
+
   it('renames a managed Agent without restarting its Host and persists the display name', async () => {
     const { controller, manager, starts } = fixture()
     const session = await controller.startSession(request())

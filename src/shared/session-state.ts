@@ -16,6 +16,43 @@ export interface SessionState {
   recoveryAttempts: number
   userStopRequested: boolean
   lastError?: string
+  /** Task activity is independent from the PTY lifecycle used by recovery. */
+  activity?: SessionActivity
+  activityError?: string
+  activitySince?: number
+  activityUpdatedAt?: number
+}
+
+export type SessionActivity = 'starting' | 'idle' | 'running' | 'completed' | 'error'
+export type SessionDisplayStatus = 'stopped' | 'running' | 'idle' | 'needs_approval' | 'error'
+
+export const SESSION_STATUS_LABEL: Record<SessionDisplayStatus, string> = {
+  stopped: '已停止', running: '运行中', idle: '待命', needs_approval: '待审批', error: '异常',
+}
+
+export function sessionDisplayStatus(session: Pick<SessionState, 'status' | 'activity'>): SessionDisplayStatus {
+  // Presentation only: keep lifecycle/approval states intact for safety and recovery.
+  switch (session.status) {
+    case 'stopped': case 'completed': return 'stopped'
+    case 'failed': case 'needs_attention': case 'unknown': return 'error'
+    case 'needs_approval': return 'needs_approval'
+    case 'recovering': return 'running'
+    case 'starting': return 'idle'
+    case 'running':
+      if (session.activity === 'error') return 'error'
+      return session.activity === 'running' ? 'running' : 'idle'
+  }
+}
+
+export function parseSessionDisplayStatus(value: string): SessionDisplayStatus | undefined {
+  const normalized = value.trim().toLowerCase()
+  if (normalized === '待授权' || normalized === '等待审批') return 'needs_approval'
+  if (Object.prototype.hasOwnProperty.call(SESSION_STATUS_LABEL, normalized)) return normalized as SessionDisplayStatus
+  const entry = Object.entries(SESSION_STATUS_LABEL).find(([, label]) => label === normalized)
+  if (entry) return entry[0] as SessionDisplayStatus
+  if (normalized === '错误') return 'error'
+  if (normalized === '空闲' || normalized === '已启动') return 'idle'
+  return undefined
 }
 
 export type SessionEvent =

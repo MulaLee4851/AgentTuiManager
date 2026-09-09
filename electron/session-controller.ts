@@ -5,6 +5,7 @@ import type { HostEvent, HostExitFact } from '../src/shared/protocol'
 import type { AgentConfigSummary, AgentKind, AgentProxySummary, ApprovalRequest, BulkApprovalResult, LlmReviewConclusion, LlmReviewLevel, ManagerEvent, NativeSessionSummary, SessionSummary, StartSessionRequest } from '../src/shared/manager-api'
 import { reduceSession } from '../src/shared/session-state'
 import { createAgentAdapter, extractApprovalCommand, type AgentAdapter, type AgentObservation } from './agent-adapters'
+import type { NativeActivityEvent } from './native-session-activity'
 import { canBulkApproveCommand, canFullAutoApprove, type ApprovalDecision } from './approval-policy'
 import { TerminalReplayBuffer } from './terminal-replay-buffer'
 import { terminalScrollbackArgs } from './start-request-policy'
@@ -107,6 +108,7 @@ interface ManagedSession {
   pendingHostInput: string
   awaitingRecoveryReady: boolean
   agentReady: boolean
+  activityInputPending?: boolean
   suppressTransientRetryUntilReady: boolean
   terminalReplay: TerminalReplayBuffer
   outputSequence: number
@@ -254,6 +256,37 @@ export class SessionController {
     return this.required(sessionId).agentReady
   }
 
+  observeNativeActivity(snapshot: SessionSummary, event: NativeActivityEvent): void {
+    const managed = this.sessions.get(snapshot.sessionId)
+    if (!managed || isTerminalStatus(managed.summary.status)
+      || managed.summary.nativeSessionId !== snapshot.nativeSessionId
+      || managed.summary.activitySince !== snapshot.activitySince
+      || event.timestamp < (managed.summary.activitySince ?? 0)
+      || event.timestamp < (managed.summary.activityUpdatedAt ?? 0)) return
+    this.setActivity(managed, event.activity, event.timestamp, event.error)
+  }
+
+  private setActivity(managed: ManagedSession, activity: NonNullable<SessionSummary['activity']>, timestamp = Date.now(), error?: string): void {
+    const changed = managed.summary.activity !== activity || managed.summary.activityError !== error
+    managed.summary = { ...managed.summary, activity, activityUpdatedAt: timestamp, activityError: error }
+    if (changed) this.changed(managed.summary.sessionId)
+  }
+
+  private observeActivityInput(managed: ManagedSession, data: string): void {
+    if (isTerminalProtocolResponse(data) || managed.approvalRequests.length > 0) return
+    if (data === '\x03' || data === '\x1b') {
+      managed.activityInputPending = false
+      this.setActivity(managed, 'idle')
+      return
+    }
+    const text = data.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/[\x00-\x1f\x7f]/g, '')
+    if (text) managed.activityInputPending = true
+    if (/[\r\n]/.test(data) && managed.activityInputPending && !data.includes('\x1b[200~')) {
+      managed.activityInputPending = false
+      this.setActivity(managed, 'running')
+    }
+  }
+
   async startSession(request: StartSessionRequest): Promise<SessionSummary> {
     const adapter = createAgentAdapter(request.agentKind)
     const nativeCapture = !request.nativeSessionId && adapter.supportsNativeSessions
@@ -268,6 +301,8 @@ export class SessionController {
         agentKind: request.agentKind,
         workspace: request.workspace,
         status: 'running',
+        activity: 'starting',
+        activitySince: Date.now(),
         recoveryAttempts: 0,
         userStopRequested: false,
         ...(request.nativeSessionId ? { nativeSessionId: request.nativeSessionId } : {}),
@@ -335,6 +370,8 @@ export class SessionController {
             agentKind,
             workspace: record.cwd,
             status: 'running',
+            activity: replayObservation.ready ? 'idle' : 'starting',
+            activitySince: Number.isFinite(Date.parse(record.createdAt)) ? Date.parse(record.createdAt) : Date.now(),
             recoveryAttempts: 0,
             userStopRequested: false,
             ...(replayObservation.webUrl ? { webUrl: replayObservation.webUrl } : {}),
@@ -523,6 +560,7 @@ export class SessionController {
       return
     }
     managed.handle.write(data)
+    this.observeActivityInput(managed, data)
   }
 
   resize(sessionId: string, cols: number, rows: number): void {
@@ -821,7 +859,10 @@ export class SessionController {
     if (!managed.summary.nativeSessionId && managed.adapter.supportsNativeSessions && managed.nativeCapture) {
       await this.tryCaptureNativeSession(managed)
     }
-    if (!managed.summary.nativeSessionId && managed.adapter.supportsNativeSessions) {
+    // A persisted recovery recipe is already a valid native-session binding.
+    // The summary can lag behind it after a host exit or an app restart; do not
+    // force the user through "new Agent -> restore" again in that case.
+    if (!managed.summary.nativeSessionId && managed.adapter.supportsNativeSessions && !request.recovery) {
       throw new Error('该窗口尚未绑定原生会话，已阻止启动新 Agent。请在“新增 Agent”中选择对应历史会话进行恢复。')
     }
 
@@ -881,6 +922,10 @@ export class SessionController {
     managed.summary = {
       ...summary,
       status: 'starting',
+      activity: 'starting',
+      activitySince: Date.now(),
+      activityUpdatedAt: undefined,
+      activityError: undefined,
       recoveryAttempts: 0,
       userStopRequested: false,
     }
@@ -998,6 +1043,7 @@ export class SessionController {
           managed.summary = { ...managed.summary, webUrl: observation.webUrl }
           this.changed(managed.summary.sessionId)
         }
+        if (observation.ready && managed.summary.activity === 'starting') this.setActivity(managed, 'idle')
         if (observation.ready || observation.approvalRequired) managed.agentReady = true
         this.observeContinueKeyword(managed, event.data, observation)
         if (observation.approvalRequired) {
@@ -1035,11 +1081,13 @@ export class SessionController {
         this.scheduleNativeCapture(managed)
       } else if (event.type === 'permission-request') {
         managed.agentReady = true
+        this.setActivity(managed, 'running')
         this.cancelClaudeTerminalApproval(managed)
         this.cancelCodexTerminalApproval(managed)
-        this.removeTerminalApprovals(managed)
-        managed.adapter.acknowledgeUserInput(true)
         const hookSource = event.hookSource ?? (managed.summary.agentKind === 'codex' ? 'codex' : 'claude')
+        if (hookSource === 'codex') this.removeTerminalApproval(managed, event.command ?? 'tool:' + event.toolName)
+        else this.removeTerminalApprovals(managed)
+        if (!managed.approvalRequests.some((request) => request.source === 'terminal')) managed.adapter.acknowledgeUserInput(true)
         if (hookSource === 'claude') {
           const hookIdentity = this.rememberClaudeHookIdentity(managed, event)
           if (hookIdentity.agentId && this.resolveDuplicateClaudeHook(managed, hookIdentity)) {
@@ -1150,6 +1198,7 @@ export class SessionController {
       } else if (event.type === 'error') {
         this.emit({ sessionId: managed.summary.sessionId, ...event })
         managed.summary = { ...managed.summary, lastError: event.message }
+        this.setActivity(managed, 'error', Date.now(), event.message)
         this.changed(managed.summary.sessionId)
       } else if (event.type !== 'permission-response' && event.type !== 'replay') {
         this.emit({ sessionId: managed.summary.sessionId, ...event })
@@ -1257,6 +1306,8 @@ export class SessionController {
       managed.pendingUserInterrupt = false
       managed.awaitingRecoveryReady = true
       managed.agentReady = false
+      managed.activityInputPending = false
+      managed.summary = { ...managed.summary, activity: 'starting', activitySince: Date.now(), activityUpdatedAt: undefined, activityError: undefined }
       managed.suppressTransientRetryUntilReady = false
       managed.adapter.resetForRecovery()
       delete managed.lastTerminalAutoApproval
@@ -1276,6 +1327,7 @@ export class SessionController {
     managed.pendingHostInput = ''
     if (!input || managed.pendingUserInterrupt || managed.summary.userStopRequested) return
     managed.handle.write(input)
+    this.observeActivityInput(managed, input)
   }
 
   private requestRecovery(managed: ManagedSession, reason: string, action: 'continue' | 'resume'): void {
@@ -1661,7 +1713,7 @@ export class SessionController {
   }
 
   private scheduleCodexTerminalApproval(managed: ManagedSession, observation: AgentObservation, eventData: string): void {
-    if (managed.approvalRequests.some((request) => request.source === 'codex-hook')) return
+    if (this.codexHookCoversTerminalApproval(managed, observation)) return
     const pending = managed.pendingCodexTerminalApproval
     if (pending) {
       pending.observation = observation
@@ -1678,12 +1730,19 @@ export class SessionController {
         delete managed.pendingCodexTerminalApproval
         if (managed.generation !== generation || managed.summary.userStopRequested
           || isTerminalStatus(managed.summary.status)
-          || managed.approvalRequests.some((request) => request.source === 'codex-hook')) return
+          || this.codexHookCoversTerminalApproval(managed, scheduled.observation)) return
         this.handleTerminalApproval(managed, scheduled.observation, scheduled.eventData)
       }, CODEX_TERMINAL_APPROVAL_FALLBACK_MS),
     }
     scheduled.timer.unref?.()
     managed.pendingCodexTerminalApproval = scheduled
+  }
+
+  private codexHookCoversTerminalApproval(managed: ManagedSession, observation: AgentObservation): boolean {
+    const command = observation.approvalCommand
+    if (!command || command.startsWith('tool:')) return false
+    return managed.approvalRequests.some((request) => request.source === 'codex-hook'
+      && request.command === command)
   }
 
   private cancelCodexTerminalApproval(managed: ManagedSession): void {
@@ -1725,8 +1784,27 @@ export class SessionController {
   }
 
   private handleTerminalApproval(managed: ManagedSession, observation: AgentObservation, eventData: string): void {
-    if (observation.approvalRequired && managed.summary.status !== 'needs_approval') {
+    // Every terminal observation represents the currently painted approval prompt.
+    // Process it even when another request is already queued; a session can expose
+    // several approvals during one turn and the queue must keep them addressable.
+    if (observation.approvalRequired) {
+      this.setActivity(managed, 'running')
       const approvalCommand = observation.approvalCommand ?? extractApprovalCommand(eventData)
+      // Codex emits a short OSC "approval requested" notification before the
+      // actual ratatui modal. It is only a signal, not an actionable command;
+      // wait for the complete modal so a truncated repaint cannot create a
+      // phantom approval request.
+      if (managed.summary.agentKind === 'codex'
+        && approvalCommand === 'tool:Shell'
+        && !/(?:would you like to|allow\s+(?:the\s+)?[\w.-]+\s+mcp\s+server|yes,\s*proceed\b|do you want to (?:allow|run|execute))/i.test(eventData)) {
+        return
+      }
+      const existing = managed.approvalRequests.find((request) => request.source === 'terminal'
+        && request.command === approvalCommand)
+      if (existing) {
+        this.syncApprovalSummary(managed)
+        return
+      }
       const decision = this.approvalPolicy?.decide(approvalCommand)
       const fullAuto = managed.summary.fullAutoEnabled
         ? this.approvalPolicy?.canFullAutoApprove?.({ command: approvalCommand, risk: decision?.risk ?? 'unknown', workspace: managed.summary.workspace })
@@ -1766,7 +1844,6 @@ export class SessionController {
           if (activityRequest) this.fullAutoActivity?.approved(activityRequest)
           this.schedulePendingTerminalAutoApproval(managed, approvalCommand)
         }
-        managed.summary = reduceSession(managed.summary, { type: 'started' }) as SessionSummary
         this.emit({ type: 'terminal-refresh-requested', sessionId: managed.summary.sessionId })
       } else {
         const queued = this.queueApproval(managed, {
@@ -1788,70 +1865,6 @@ export class SessionController {
         }
       }
       this.changed(managed.summary.sessionId)
-    }
-    if (observation.approvalRequired && managed.summary.status === 'needs_approval') {
-      const approvalCommand = observation.approvalCommand ?? extractApprovalCommand(eventData)
-      if (approvalCommand && approvalCommand !== managed.pendingApprovalCommand) {
-        const decision = this.approvalPolicy?.decide(approvalCommand)
-        const fullAuto = managed.summary.fullAutoEnabled
-          ? this.approvalPolicy?.canFullAutoApprove?.({ command: approvalCommand, risk: decision?.risk ?? 'unknown', workspace: managed.summary.workspace })
-            ?? canFullAutoApprove({ command: approvalCommand, risk: decision?.risk ?? 'unknown', workspace: managed.summary.workspace })
-          : undefined
-        const llmReviewRequired = decision?.action !== 'auto-approve' && this.shouldReviewWithLlm({
-          risk: decision?.risk ?? 'unknown',
-          ...(decision?.matchedDangerRule ? { dangerRuleId: decision.matchedDangerRule.id } : {}),
-        })
-        if (decision?.action === 'auto-approve' || fullAuto?.allowed && !llmReviewRequired) {
-          const duplicate = this.isDuplicateTerminalAutoApproval(managed, approvalCommand)
-          const activityRequest = !duplicate && fullAuto?.allowed && decision?.action !== 'auto-approve'
-            ? this.approvalForActivity(managed, {
-              requestId: 'terminal:auto-' + randomUUID(), source: 'terminal',
-              risk: decision?.risk ?? 'unknown', reason: observation.approvalReason ?? fullAuto.reason,
-              command: approvalCommand,
-              ...(observation.approvalReason ? { agentReason: observation.approvalReason } : {}),
-            })
-            : undefined
-          managed.adapter.acknowledgeUserInput(true)
-          if (!duplicate) {
-            try {
-              managed.handle.write(managed.adapter.approvalInput())
-            } catch {
-              // Keep the request queued when the host rejects input.
-              this.queueApproval(managed, {
-                requestId: 'terminal:' + randomUUID(), source: 'terminal',
-                risk: decision?.risk ?? 'unknown',
-                reason: observation.approvalReason ?? fullAuto?.reason ?? '终端未确认自动批准，请人工确认',
-                ...(approvalCommand ? { command: approvalCommand } : {}),
-              })
-              this.changed(managed.summary.sessionId)
-              return
-            }
-            this.removeTerminalApproval(managed, approvalCommand)
-            // Record only after the write was accepted by the live host socket.
-            if (activityRequest) this.fullAutoActivity?.approved(activityRequest)
-            this.schedulePendingTerminalAutoApproval(managed, approvalCommand)
-          }
-          this.emit({ type: 'terminal-refresh-requested', sessionId: managed.summary.sessionId })
-        } else {
-          const queued = this.queueApproval(managed, {
-            requestId: 'terminal:' + randomUUID(), source: 'terminal',
-            risk: decision?.risk ?? 'unknown',
-            reason: decision?.matchedDangerRule
-              ? decision.reason
-              : observation.approvalReason ?? decision?.reason ?? managed.summary.approvalReason ?? '未能识别授权请求的具体影响，需要人工确认',
-            command: approvalCommand,
-            ...(decision?.matchedDangerRule ? {
-              dangerRuleId: decision.matchedDangerRule.id,
-              dangerRuleName: decision.matchedDangerRule.name,
-            } : {}),
-          })
-          if (managed.summary.fullAutoEnabled && fullAuto) {
-            if (llmReviewRequired) this.scheduleLlmReview(managed, queued, fullAuto)
-            else if (!fullAuto.allowed) this.fullAutoActivity?.blocked(queued, fullAuto.reason)
-          }
-        }
-        this.changed(managed.summary.sessionId)
-      }
     }
   }
 

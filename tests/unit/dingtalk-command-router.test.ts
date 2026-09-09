@@ -25,7 +25,6 @@ function createRouter(overrides: Partial<{
     listPendingApprovals: vi.fn(() => approvals),
     terminalReplay: vi.fn(() => ({ data: '\u001b[32mhello\u001b[0m\r\n', sequence: 1 })),
     approveRequest: vi.fn(),
-    approveAllPending: vi.fn(async () => ({ approved: 1, skipped: 0, failed: 0, skippedRequestIds: [] })),
     approveAllPendingForced: vi.fn(async () => ({ approved: 2, skipped: 0, failed: 0, skippedRequestIds: [] })),
     write: vi.fn(),
     stopSession: vi.fn(async () => undefined),
@@ -39,6 +38,63 @@ function createRouter(overrides: Partial<{
 }
 
 describe('DingTalkCommandRouter', () => {
+  it('sends only to matching activity states and audits each target', async () => {
+    const sessions = ['idle', 'running', 'idle'].map((activity, index) => ({
+      sessionId: 'agent-' + index, displayName: 'Agent ' + index,
+      status: 'running', activity, agentKind: 'codex', workspace: 'B:/demo',
+    } as SessionSummary))
+    const { router, manager, audit } = createRouter({ sessions })
+    await router.execute('/send-status idle continue', { staffId: 'staff-1' })
+    expect(manager.write.mock.calls).toEqual([
+      ['agent-0', 'continue'], ['agent-0', '\r'],
+      ['agent-2', 'continue'], ['agent-2', '\r'],
+    ])
+    expect(audit.record).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'remote_status_message_sent', sessionId: 'agent-2',
+    }))
+  })
+
+  it('does not send or approve a waiting approval through send-status', async () => {
+    const sessions = [{
+      sessionId: 'waiting', displayName: 'Waiting', status: 'needs_approval',
+      agentKind: 'codex', workspace: 'B:/demo',
+    } as SessionSummary]
+    const { router, manager } = createRouter({ sessions })
+    const result = await router.execute('/send-status needs_approval continue', { staffId: 'staff-1' })
+    expect(result).toContain('匹配 1 个，成功 0 个，未发送 1 个')
+    expect(result).toContain('正在等待授权')
+    expect(manager.write).not.toHaveBeenCalled()
+    expect(manager.approveRequest).not.toHaveBeenCalled()
+    expect(manager.approveAllPendingForced).not.toHaveBeenCalled()
+  })
+
+  it('does not submit Enter when an approval appears during message delivery', async () => {
+    const sessions = [{
+      sessionId: 'changing', displayName: 'Changing', status: 'running', activity: 'idle',
+      agentKind: 'codex', workspace: 'B:/demo',
+    } as SessionSummary]
+    const { router, manager, audit } = createRouter({ sessions })
+    manager.write.mockImplementationOnce(() => { sessions[0]!.status = 'needs_approval' })
+    await router.execute('/send-status idle continue', { staffId: 'staff-1' })
+    expect(manager.write.mock.calls).toEqual([['changing', 'continue']])
+    expect(audit.record).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'remote_status_message_skipped', sessionId: 'changing',
+    }))
+  })
+
+  it('continues sending to other targets after one delivery fails', async () => {
+    const sessions = ['one', 'two'].map((sessionId) => ({
+      sessionId, displayName: sessionId, status: 'running', activity: 'completed',
+      agentKind: 'claude', workspace: 'B:/demo',
+    } as SessionSummary))
+    const { router, manager } = createRouter({ sessions })
+    manager.write.mockImplementationOnce(() => { throw new Error('host disconnected') })
+    await router.execute('/send-status idle next task', { staffId: 'staff-1' })
+    expect(manager.write.mock.calls).toEqual([
+      ['one', 'next task'], ['two', 'next task'], ['two', '\r'],
+    ])
+  })
+
   it('rejects non-command messages and unauthorized staff', async () => {
     const { router } = createRouter()
     await expect(router.execute('hello', { staffId: 'staff-1' })).resolves.toContain('只接受 /')
@@ -60,35 +116,32 @@ describe('DingTalkCommandRouter', () => {
     ] })
     await expect(router.execute('/agents', { staffId: 'staff-1' })).resolves.toContain('Allowed')
     await expect(router.execute('/agents', { staffId: 'staff-1' })).resolves.toContain('Blocked Claude')
-    await expect(router.execute('/status allowed-', { staffId: 'staff-1' })).resolves.toContain('状态：running')
-    await expect(router.execute('/status blocked-', { staffId: 'staff-1' })).resolves.toContain('状态：running')
+    await expect(router.execute('/status allowed-', { staffId: 'staff-1' })).resolves.toContain('状态：待命')
+    await expect(router.execute('/status blocked-', { staffId: 'staff-1' })).resolves.toContain('状态：待命')
     await expect(router.execute('/tail Allowed', { staffId: 'staff-1' })).resolves.toContain('hello')
     await expect(router.execute('/send Allowed hi', { staffId: 'staff-1' })).resolves.toContain('已向 Allowed 发送消息')
     expect(manager.write).toHaveBeenNthCalledWith(1, 'allowed-1234', 'hi')
     expect(manager.write).toHaveBeenNthCalledWith(2, 'allowed-1234', '\r')
   })
 
-  it('keeps approve-all delegated to the local policy across all workspaces', async () => {
+  it('approves a request by id across all workspaces and removes the safe bulk command', async () => {
     const approval = { requestId: 'approval-1', sessionId: 'session-12345678', displayName: 'Code Agent', agentKind: 'codex', workspace: 'B:/allowed', source: 'terminal', risk: 'read', toolName: 'read', reason: '需要读取文件', createdAt: 1, canBulkApprove: true } as ApprovalRequest
     const { router, manager } = createRouter({ approvals: [approval] })
     await expect(router.execute('/approve approval-1', { staffId: 'staff-1' })).resolves.toContain('已批准')
-    await expect(router.execute('/approve-all', { staffId: 'staff-1' })).resolves.toContain('批准完成')
-    expect(manager.approveAllPending).toHaveBeenCalledTimes(1)
+    await expect(router.execute('/approve-all', { staffId: 'staff-1' })).resolves.toContain('未知命令：/approve-all')
+    expect(manager.approveAllPendingForced).not.toHaveBeenCalled()
 
     const foreign = { ...approval, requestId: 'foreign-approval', sessionId: 'foreign-1', workspace: 'A:/outside' }
     const unrestricted = createRouter({ approvals: [foreign] })
     await expect(unrestricted.router.execute('/approve foreign-approval', { staffId: 'staff-1' })).resolves.toContain('已批准')
-    await expect(unrestricted.router.execute('/approve-all', { staffId: 'staff-1' })).resolves.toContain('批准完成')
-    expect(unrestricted.manager.approveAllPending).toHaveBeenCalledTimes(1)
   })
 
-  it('supports an explicit force-all command and leaves the safe bulk command unchanged', async () => {
+  it('keeps only the explicit force-all command for bulk approval', async () => {
     const { router, manager, audit } = createRouter()
 
     await expect(router.execute('/approve-all-force', { staffId: 'staff-1' })).resolves.toContain('强制批准完成：2 个批准')
 
     expect(manager.approveAllPendingForced).toHaveBeenCalledTimes(1)
-    expect(manager.approveAllPending).not.toHaveBeenCalled()
     expect(audit.record).toHaveBeenCalledWith(expect.objectContaining({
       level: 'warning',
       action: 'remote_approval_force_all',
@@ -113,7 +166,7 @@ describe('DingTalkCommandRouter', () => {
     const interpreter = { translate: vi.fn(async () => '/status Code Agent') }
     const { manager, audit } = createRouter()
     const router = new DingTalkCommandRouter(manager, audit, () => ({ ...settings, agentModeEnabled: true, agentBaseUrl: 'https://model.example/v1', agentApiKey: 'secret', agentModel: 'model-x' }), undefined, interpreter as never)
-    await expect(router.execute('看看代码 Agent 状态', { staffId: 'staff-1' })).resolves.toContain('状态：running')
+    await expect(router.execute('看看代码 Agent 状态', { staffId: 'staff-1' })).resolves.toContain('状态：待命')
     expect(interpreter.translate).toHaveBeenCalledTimes(1)
   })
 

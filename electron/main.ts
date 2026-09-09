@@ -33,6 +33,7 @@ import { environmentWithFreshPath, pathFromEnvironment } from './platform-enviro
 import { LlmReviewSettingsStore } from './llm-review-settings-store'
 import { LlmSecurityReviewer } from './llm-security-reviewer'
 import { TokenUsageStore } from './token-usage-store'
+import { NativeSessionActivityMonitor } from './native-session-activity'
 import { IPC_CHANNELS, type AgentConfigInput, type AgentKind, type AgentProxyInput, type ApprovalRequest, type AuditEntry, type ContinueKeywordSettings, type DingTalkSettingsInput, type ExternalTerminalDragProjection, type LlmReviewSettingsInput, type LlmRuleAuditFinding, type LlmRuleAuditResult, type LlmRuleAuditState, type ManagerEvent, type NativeSessionSummary, type NpmRegistryChoice, type RecoveryRecipe, type SessionSafetySettings, type SessionSummary, type StartSessionRequest } from '../src/shared/manager-api'
 
 let mainWindow: BrowserWindow | undefined
@@ -40,6 +41,7 @@ let tray: Tray | undefined
 let controller: SessionController
 let auditStore: ActivityAuditStore
 let tokenUsageStore: TokenUsageStore
+let nativeActivityMonitor: NativeSessionActivityMonitor | undefined
 let agentConfigurationStore: AgentConfigurationStore
 let agentProxyStore: AgentProxyStore
 let continueKeywordStore: ContinueKeywordStore
@@ -366,6 +368,15 @@ function approvalSubject(command: string | undefined): string {
   if (/^tool:Shell$/i.test(command ?? '')) return '命令（参数待确认）'
   if (command?.startsWith('tool:')) return command.slice('tool:'.length)
   return command ? 'Shell' : '未识别'
+}
+
+function approvalReasonDetails(request: ApprovalRequest | undefined): { reason?: string; policyReason?: string } {
+  if (!request) return {}
+  const reason = request.agentReason ?? request.reason
+  return {
+    ...(reason ? { reason } : {}),
+    ...(request.agentReason && request.reason !== request.agentReason ? { policyReason: request.reason } : {}),
+  }
 }
 
 function auditSessionTransition(sessionId: string): void {
@@ -763,6 +774,7 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
           requestId: handled.requestId,
           toolName: handled.toolName ?? approvalSubject(handled.command),
           ...(handled.command ? { command: handled.command } : {}),
+          ...approvalReasonDetails(handled),
           risk: handled.risk,
         },
       })
@@ -868,7 +880,7 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
         requestId: request?.requestId ?? 'legacy',
         toolName: request?.toolName ?? approvalSubject(request?.command),
         ...(request?.command ? { command: request.command } : {}),
-        ...(request?.agentReason ? { reason: request.agentReason } : {}),
+        ...approvalReasonDetails(request),
         ...(request?.risk ? { risk: request.risk } : {}),
       },
     })
@@ -1014,6 +1026,7 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
         requestId,
         toolName: request?.toolName ?? approvalSubject(request?.command),
         ...(request?.command ? { command: request.command } : {}),
+        ...approvalReasonDetails(request),
         ...(request?.risk ? { risk: request.risk } : {}),
       },
     })
@@ -1031,7 +1044,7 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
         requestId,
         toolName: request?.toolName ?? approvalSubject(request?.command),
         ...(request?.command ? { command: request.command } : {}),
-        ...(request?.agentReason ? { reason: request.agentReason } : {}),
+        ...approvalReasonDetails(request),
         ...(request?.risk ? { originalRisk: request.risk } : {}),
       },
     })
@@ -1049,7 +1062,7 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
         requestId,
         toolName: request?.toolName ?? approvalSubject(request?.command),
         ...(request?.command ? { command: request.command } : {}),
-        ...(request?.agentReason ? { reason: request.agentReason } : {}),
+        ...approvalReasonDetails(request),
         ...(request?.risk ? { risk: request.risk } : {}),
       },
     })
@@ -1411,7 +1424,7 @@ void app.whenReady().then(async () => {
           workspace: request.workspace,
            ...(request.command ? { command: request.command } : {}),
            risk: request.risk,
-           reason: request.agentReason ?? request.reason,
+           ...approvalReasonDetails(request),
            ...(request.dangerRuleId ? { dangerRuleId: request.dangerRuleId } : {}),
            ...(request.dangerRuleName ? { dangerRuleName: request.dangerRuleName } : {}),
          },
@@ -1454,7 +1467,7 @@ void app.whenReady().then(async () => {
           requestId: request.requestId,
           toolName: request.toolName ?? approvalSubject(request.command),
           ...(request.command ? { command: request.command } : {}),
-          ...(request.agentReason ? { reason: request.agentReason } : {}),
+          ...approvalReasonDetails(request),
           risk: request.risk,
           decision: 'full-auto',
         },
@@ -1469,7 +1482,8 @@ void app.whenReady().then(async () => {
           requestId: request.requestId,
           toolName: request.toolName ?? approvalSubject(request.command),
           ...(request.command ? { command: request.command } : {}),
-          reason,
+          ...approvalReasonDetails(request),
+          policyReason: reason,
           risk: request.risk,
           decision: 'blocked',
         },
@@ -1538,8 +1552,23 @@ void app.whenReady().then(async () => {
     listSessions: () => controller.listSessions(),
     listPendingApprovals: () => controller.listPendingApprovals(),
     terminalReplay: (id: string) => controller.terminalReplay(id),
-    approveRequest: (id: string) => controller.approveRequest(id),
-    approveAllPending: () => controller.approveAllPending(),
+    approveRequest: async (id: string) => {
+      const request = controller.listPendingApprovals().find((item) => item.requestId === id)
+      await controller.approveRequest(id)
+      recordAudit({
+        level: 'info', category: 'approval', action: 'approval_manual_remote',
+        message: '已通过钉钉批准 ' + (request?.toolName ?? approvalSubject(request?.command)),
+        sessionId: request?.sessionId,
+        details: {
+          requestId: id,
+          toolName: request?.toolName ?? approvalSubject(request?.command),
+          ...(request?.command ? { command: request.command } : {}),
+          ...approvalReasonDetails(request),
+          ...(request?.risk ? { risk: request.risk } : {}),
+          source: 'dingtalk',
+        },
+      })
+    },
     approveAllPendingForced: () => controller.approveAllPendingForced(),
     write: (id: string, data: string) => controller.write(id, data),
     stopSession: async (id: string) => {
@@ -1577,6 +1606,11 @@ void app.whenReady().then(async () => {
   registerIpc(approvalPolicy)
   scheduleLlmRuleAudit(approvalPolicy)
   await controller.restoreSessions(sessionSafetyStore.getSettings().preserveWorkspaceOnCrash)
+  nativeActivityMonitor = new NativeSessionActivityMonitor(
+    () => controller.listSessions(),
+    (session, event) => controller.observeNativeActivity(session, event),
+  )
+  nativeActivityMonitor.start()
   for (const session of controller.listSessions()) {
     if (session.status === 'stopped' || session.status === 'failed') {
       await restoreNativeSessionProvider(session)
@@ -1607,4 +1641,6 @@ app.on('before-quit', (event) => {
   if (quitting) dingTalkStreamService?.stop()
   if (quitting) nativeDragBridge?.stop()
 })
+
+app.on('will-quit', () => { nativeActivityMonitor?.stop() })
 }

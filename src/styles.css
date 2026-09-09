@@ -112,6 +112,19 @@ button:disabled { cursor: default; opacity: .55; }
 .workspace-main { min-width: 0; min-height: 0; display: grid; grid-template-rows: 46px minmax(0, 1fr); }
 .sectionbar { min-width: 0; display: flex; align-items: center; gap: 10px; padding: 0 12px; color: var(--muted); background: #192225; border-bottom: 1px solid var(--line); font-size: 10px; }
 .sectionbar h1 { margin: 0; color: var(--text); font-size: 13px; }
+.overview-status-filter { position: relative; flex: 0 0 156px; width: 156px; }
+.overview-status-filter > button { display: flex; align-items: center; justify-content: space-between; gap: 6px; width: 100%; min-height: 30px; padding: 0 8px; color: var(--text); background: #0e1517; border: 1px solid #39474b; border-radius: 5px; font-size: 10px; }
+.overview-status-filter > button > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.overview-status-filter button:focus-visible { outline: 1px solid var(--green); }
+.overview-status-options { position: absolute; top: calc(100% + 4px); right: 0; z-index: 50; width: 188px; padding: 6px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 16px 40px rgba(0,0,0,.42); }
+.overview-status-options > button { width: 100%; min-height: 28px; font-size: 11px; }
+.overview-status-options label { display: flex; align-items: center; gap: 8px; min-height: 30px; padding: 0 6px; color: var(--text); font-size: 11px; cursor: pointer; }
+.overview-status-options label:hover { background: var(--panel-2); }
+.overview-status-options input { width: 13px; height: 13px; min-height: 0; margin: 0; accent-color: var(--green); }
+.overview-status-options small { display: block; padding: 4px 6px; color: var(--muted); font-size: 10px; }
+.overview-filter-empty { grid-column: 1 / -1; margin: auto; padding: 24px; color: var(--muted); text-align: center; }
+.status-error::before, .agent-session-list em.status-error::before { background: var(--red); }
+.status-idle::before, .agent-session-list em.status-idle::before { background: var(--muted); }
 .sectionbar > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .overview-mode-switch { display: flex; padding: 3px; background: #101719; border: 1px solid var(--line); border-radius: 6px; }
 .overview-mode-switch button { min-height: 28px; padding: 0 9px; color: var(--muted); background: transparent; border: 0; border-radius: 4px; font-size: 9px; }

@@ -6,6 +6,7 @@ describe('DingTalkAgentInterpreter output policy', () => {
   it('maps structured actions to the existing fixed command router', () => {
     expect(commandFromAgentResponse({ action: 'agents' })).toBe('/agents')
     expect(commandFromAgentResponse({ action: 'approve', requestId: 'approval-1' })).toBe('/approve approval-1')
+    expect(commandFromAgentResponse({ action: 'approve_all_force' })).toBe('/approve-all-force')
     expect(commandFromAgentResponse({ action: 'auto_on', target: 'Code Agent' })).toBe('/auto Code Agent on')
     expect(commandFromAgentResponse({ action: 'auto_off', target: 'session-1' })).toBe('/auto session-1 off')
     expect(commandFromAgentResponse({ action: 'send', target: 'Agent A', content: '继续检查登录问题' })).toBe('/send Agent A 继续检查登录问题')
@@ -33,6 +34,7 @@ describe('DingTalkAgentInterpreter output policy', () => {
   })
 
   it('rejects arbitrary actions and multiline terminal content', () => {
+    expect(() => commandFromAgentResponse({ action: 'approve_all' })).toThrow('不受支持')
     expect(() => commandFromAgentResponse({ action: 'shell', content: 'rm -rf /' })).toThrow('不受支持')
     expect(() => commandFromAgentResponse({ action: 'send', target: 'Agent A', content: 'first\nsecond' })).toThrow('不符合发送限制')
   })

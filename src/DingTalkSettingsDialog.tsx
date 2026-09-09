@@ -93,7 +93,7 @@ export default function DingTalkSettingsDialog({ onClose }: { onClose: () => voi
           {settings.hasAgentProxyPassword && <label className='dingtalk-clear-secret'><input type='checkbox' checked={clearProxyPassword} onChange={(event) => setClearProxyPassword(event.target.checked)} />清除已保存的代理密码</label>}
         </div></section>
       </div>
-      <div className='launcher-config-security'><strong>可执行范围</strong><span>/agents、/pending、/approve、/approve-all、/approve-all-force、/status、/tail、/workspace、/send、/stop、/restart、/audit；自然语言最终也只会转换为这些操作。</span></div>
+      <div className='launcher-config-security'><strong>可执行范围</strong><span>/agents、/pending、/approve、/approve-all-force、/status、/tail、/workspace、/send、/send-status、/stop、/restart、/auto、/audit；自然语言最终也只会转换为这些操作。/approve-all-force 会忽略风险限制，请谨慎使用。</span></div>
       <div className='launcher-config-security'><strong>凭据保护</strong><span>Client Secret、Agent API Key 和代理密码使用系统安全存储加密，不返回页面、不写审计。</span></div>
       {error && <p className='form-error'>{error}</p>}{closeArmed && <p className='launcher-dismiss-hint rules-dismiss-hint'>再点击一次空白处关闭</p>}
       <footer><button type='button' className='button-secondary' onClick={onClose}>取消</button><button type='submit' className='button-primary' disabled={busy}>{busy ? '请稍后…' : '保存并连接'}</button></footer>

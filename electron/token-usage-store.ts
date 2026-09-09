@@ -10,8 +10,12 @@ type ConfigSnapshot = SessionSummary['agentConfig']
 
 function clean(value: string | undefined): string | undefined { return value?.trim() || undefined }
 function sameWorkspace(a: string, b: string): boolean { return a.replace(/[\\/]+$/, '').toLocaleLowerCase() === b.replace(/[\\/]+$/, '').toLocaleLowerCase() }
-function accuracy(records: TokenUsageRecord[]): TokenUsageAccuracy { return records.every((record) => record.accuracy === 'exact') ? 'exact' : records.some((record) => record.accuracy === 'estimated') ? 'estimated' : 'unknown' }
-function label(session: SessionSummary): string { return `${session.displayName} · ${session.agentConfig?.model ?? '继承模型'}` }
+function mergeAccuracy(left: TokenUsageAccuracy, right: TokenUsageAccuracy): TokenUsageAccuracy {
+  if (left === 'estimated' || right === 'estimated') return 'estimated'
+  if (left === 'unknown' || right === 'unknown') return 'unknown'
+  return 'exact'
+}
+function label(session: SessionSummary): string { return session.displayName }
 
 export class TokenUsageStore {
   private readonly cache = new Map<string, CacheEntry>()
@@ -97,9 +101,9 @@ export class TokenUsageStore {
     await this.persist()
   }
 
-  async listDetails(query: TokenUsageQuery = {}, sessions: SessionSummary[] = []): Promise<TokenUsagePage> {
+  private async matchingRecords(query: TokenUsageQuery, sessions: SessionSummary[]): Promise<TokenUsageRecord[]> {
     await this.refresh(sessions)
-    const records = [...this.cache.values()].flatMap((entry) => entry.records).filter((record) => {
+    return [...this.cache.values()].flatMap((entry) => entry.records).filter((record) => {
       if (!query.includeSubagents && record.subagent) return false
       if (query.sessionId && record.sessionId !== query.sessionId) return false
       if (query.agentKind && record.agentKind !== query.agentKind) return false
@@ -112,16 +116,20 @@ export class TokenUsageStore {
       if (query.accuracy && query.accuracy !== 'all' && record.accuracy !== query.accuracy) return false
       return true
     }).sort((a, b) => b.timestamp - a.timestamp)
+  }
+
+  async listDetails(query: TokenUsageQuery = {}, sessions: SessionSummary[] = []): Promise<TokenUsagePage> {
+    const records = await this.matchingRecords(query, sessions)
     const pageSize = Math.max(1, Math.min(500, query.pageSize ?? 100))
     const page = Math.max(1, query.page ?? 1)
     return { records: records.slice((page - 1) * pageSize, page * pageSize), total: records.length, page, pageSize }
   }
 
   async listSummary(query: TokenUsageQuery = {}, sessions: SessionSummary[] = []): Promise<TokenUsageSummary[]> {
-    const details = await this.listDetails({ ...query, page: 1, pageSize: 100_000 }, sessions)
+    const records = await this.matchingRecords(query, sessions)
     const groupBy = query.groupBy ?? 'session'
     const grouped = new Map<string, TokenUsageSummary>()
-    for (const record of details.records) {
+    for (const record of records) {
       const key = groupBy === 'session' ? record.sessionId
         : groupBy === 'config' ? `${record.providerId ?? ''}:${record.profileId ?? ''}:${record.model ?? ''}`
           : groupBy === 'model' ? (record.model ?? '未指定模型')
@@ -138,9 +146,10 @@ export class TokenUsageStore {
         ...(record.providerName ? { providerName: record.providerName } : {}),
         ...(record.model ? { model: record.model } : {}),
         inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, totalTokens: 0, requestCount: 0,
-        accuracy: 'exact' as const,
+        accuracy: record.accuracy,
       }
-      current.inputTokens += record.inputTokens; current.outputTokens += record.outputTokens; current.cacheReadTokens += record.cacheReadTokens; current.cacheWriteTokens += record.cacheWriteTokens; current.reasoningTokens += record.reasoningTokens; current.totalTokens += record.totalTokens; current.requestCount += 1; current.lastTimestamp = Math.max(current.lastTimestamp ?? 0, record.timestamp); current.accuracy = accuracy([...(details.records.filter((item) => item.sessionId === record.sessionId))])
+      if (current.requestCount > 0) current.accuracy = mergeAccuracy(current.accuracy, record.accuracy)
+      current.inputTokens += record.inputTokens; current.outputTokens += record.outputTokens; current.cacheReadTokens += record.cacheReadTokens; current.cacheWriteTokens += record.cacheWriteTokens; current.reasoningTokens += record.reasoningTokens; current.totalTokens += record.totalTokens; current.requestCount += 1; current.lastTimestamp = Math.max(current.lastTimestamp ?? 0, record.timestamp)
       grouped.set(key, current)
     }
     return [...grouped.values()].sort((a, b) => (b.totalTokens - a.totalTokens))
