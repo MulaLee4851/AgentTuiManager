@@ -1,6 +1,6 @@
 {
   "name": "agent-tui-manager",
-  "version": "0.3.5",
+  "version": "0.3.16",
   "private": true,
   "main": "dist-electron/main.js",
   "scripts": {

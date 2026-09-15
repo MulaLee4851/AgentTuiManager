@@ -11,6 +11,7 @@ import { environmentForAgent } from './agent-environment'
 import { ensureMacPtySpawnHelper } from './macos-pty-helper'
 import { TerminalReplayBuffer } from './terminal-replay-buffer'
 import { TerminalStateReplay } from './terminal-state-replay'
+import { claudeWindowsHookLauncher, claudeWindowsHookCommand } from './claude-hook-launcher'
 
 function argument(name: string): string {
   const index = process.argv.indexOf(name)
@@ -23,6 +24,7 @@ const hostId = argument('--host-id')
 const endpoint = argument('--endpoint')
 const exitPath = argument('--exit-path')
 const claudeSettingsPath = `${exitPath}.claude-settings.json`
+const claudeHookLauncherPath = `${exitPath}.claude-hook.cmd`
 const codexHookLauncherPath = `${exitPath}.codex-hook.${process.platform === 'win32' ? 'cmd' : 'sh'}`
 const clients = new Set<Socket>()
 const permissionHookToken = randomBytes(24).toString('hex')
@@ -87,6 +89,7 @@ async function finalizeExit(exitCode: number, signal?: number, reason: HostExitF
     broadcast({ type: 'error', message: `Failed to persist final exit: ${error instanceof Error ? error.message : String(error)}` })
   } finally {
     await unlink(claudeSettingsPath).catch(() => undefined)
+    await unlink(claudeHookLauncherPath).catch(() => undefined)
     await unlink(codexHookLauncherPath).catch(() => undefined)
     terminal = undefined
     terminalStateReplay?.dispose()
@@ -119,11 +122,13 @@ function ensureManagerLeaseTimer(): void {
 }
 
 function hookCommand(scriptName = 'claude-permission-hook.js'): string {
+  if (process.platform === 'win32') {
+    writeFileSync(claudeHookLauncherPath, claudeWindowsHookLauncher(process.execPath, join(__dirname, scriptName)), { encoding: 'utf8', mode: 0o700 })
+    return claudeWindowsHookCommand(claudeHookLauncherPath)
+  }
   const executable = process.execPath.replace(/"/g, '""')
   const script = join(__dirname, scriptName).replace(/"/g, '""')
-  return process.platform === 'win32'
-    ? `set "ELECTRON_RUN_AS_NODE=1" && "${executable}" "${script}"`
-    : `ELECTRON_RUN_AS_NODE=1 "${executable}" "${script}"`
+  return `ELECTRON_RUN_AS_NODE=1 "${executable}" "${script}"`
 }
 
 function codexHookCommand(): string {

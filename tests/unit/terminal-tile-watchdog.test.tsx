@@ -8,6 +8,7 @@ import type { AgentManagerApi, ManagerEvent, SessionSummary } from '../../src/sh
 const terminalMocks = vi.hoisted(() => ({
   cols: 100,
   rows: 30,
+  _core: { _renderService: { dimensions: { css: { cell: { width: 8, height: 16 } } } } },
   open: vi.fn(),
   write: vi.fn(),
   resize: vi.fn(),
@@ -49,6 +50,13 @@ describe('TerminalTile write watchdog', () => {
     vi.clearAllMocks()
     listener = undefined
     terminalMocks.write.mockReset()
+    terminalMocks.cols = 100
+    terminalMocks.rows = 30
+    terminalMocks.options.fontSize = 12
+    terminalMocks.resize.mockImplementation((cols, rows) => {
+      terminalMocks.cols = cols
+      terminalMocks.rows = rows
+    })
     window.agentManager = {
       subscribe: vi.fn((next) => {
         listener = next
@@ -63,7 +71,53 @@ describe('TerminalTile write watchdog', () => {
 
   afterEach(() => {
     cleanup()
+    vi.restoreAllMocks()
     vi.useRealTimers()
+  })
+
+  it('settles the grid and PTY together and does not resize on same-size visibility changes', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(753)
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(320)
+    terminalMocks.write.mockImplementation((_data, done) => done?.())
+    const view = render(<TerminalTile session={session} />)
+    await act(async () => { await Promise.resolve(); vi.advanceTimersByTime(100) })
+    expect(terminalMocks.resize).not.toHaveBeenCalled()
+    expect(window.agentManager.resize).not.toHaveBeenCalled()
+    await act(async () => vi.advanceTimersByTime(150))
+    expect(terminalMocks.resize).toHaveBeenCalledTimes(1)
+    expect(terminalMocks.resize).toHaveBeenCalledWith(93, 20)
+    expect(window.agentManager.resize).toHaveBeenCalledTimes(1)
+    expect(window.agentManager.resize).toHaveBeenCalledWith(session.sessionId, 93, 20)
+    terminalMocks.scrollToBottom.mockClear()
+    view.rerender(<TerminalTile session={session} hidden />)
+    view.rerender(<TerminalTile session={session} />)
+    await act(async () => vi.advanceTimersByTime(5000))
+    expect(terminalMocks.resize).toHaveBeenCalledTimes(1)
+    expect(window.agentManager.resize).toHaveBeenCalledTimes(1)
+    expect(terminalMocks.scrollToBottom).not.toHaveBeenCalled()
+  })
+
+  it('does not inject control codes between replay and a split live ANSI command', async () => {
+    vi.useFakeTimers()
+    terminalMocks.write.mockImplementation((_data, done) => done?.())
+    vi.mocked(window.agentManager.terminalReplay).mockResolvedValue({ data: '\x1b[2', sequence: 1 })
+    const view = render(<TerminalTile session={session} />)
+    await act(async () => { await Promise.resolve(); vi.advanceTimersByTime(20) })
+    act(() => listener?.({ type: 'output', sessionId: session.sessionId, sequence: 2, data: 'J\x1b[Hcurrent' }))
+    await act(async () => vi.advanceTimersByTime(20))
+    expect(terminalMocks.write.mock.calls.map(call => call[0]).join('')).toBe('\x1b[2J\x1b[Hcurrent')
+    terminalMocks.resize.mockClear()
+    terminalMocks.scrollToBottom.mockClear()
+    terminalMocks.refresh.mockClear()
+    const writeCount = terminalMocks.write.mock.calls.length
+    view.rerender(<TerminalTile session={session} hidden />)
+    view.rerender(<TerminalTile session={session} />)
+    await act(async () => vi.advanceTimersByTime(5000))
+    expect(terminalMocks.write).toHaveBeenCalledTimes(writeCount)
+    expect(terminalMocks.resize).not.toHaveBeenCalled()
+    expect(terminalMocks.refresh).not.toHaveBeenCalled()
+    expect(terminalMocks.scrollToBottom).not.toHaveBeenCalled()
   })
 
   it('continues consuming output after a lost xterm callback without resizing or scrolling', async () => {

@@ -9,6 +9,33 @@ export interface DingTalkAgentTranslation { commands: string[]; reason?: string 
 
 const ACTIONS = new Set(['help', 'agents', 'pending', 'approve', 'approve_all_force', 'status', 'tail', 'workspace', 'send', 'send_status', 'stop', 'restart', 'auto_on', 'auto_off', 'audit'])
 const BASE_RETRY_DELAY_MS = 500
+export class AgentResponseFormatError extends Error {}
+
+export function parseAgentJson(content: unknown): unknown {
+  if (Array.isArray(content)) content = content.map(part => part?.type === 'text' && typeof part.text === 'string' ? part.text : '').join('')
+  if (typeof content !== 'string' || content.length > 20000) throw new AgentResponseFormatError('模型响应格式无效')
+  const text = content.trim().replace(/^\uFEFF/, '').replace(/^\x60{3}(?:json)?\s*([\s\S]*?)\s*\x60{3}$/i, '$1').trim()
+  try { return JSON.parse(text) } catch { /* tolerate prose around one complete object */ }
+  // Do not salvage a nested action from a malformed outer JSON document.
+  if (/^[{[]/.test(text)) throw new AgentResponseFormatError('模型返回了不完整的 JSON，未执行任何操作')
+  let depth = 0, start = -1, quoted = false, escaped = false
+  const objects: string[] = []
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i]
+    if (start < 0) { if (char === '{') { start = i; depth = 1 }; continue }
+    if (quoted) {
+      if (escaped) escaped = false
+      else if (char === '\\') escaped = true
+      else if (char === '"') quoted = false
+    } else if (char === '"') quoted = true
+    else if (char === '{') depth++
+    else if (char === '}' && --depth === 0) { objects.push(text.slice(start, i + 1)); start = -1 }
+  }
+  if (objects.length === 1 && start < 0) {
+    try { return JSON.parse(objects[0]!) } catch { /* never execute partial JSON */ }
+  }
+  throw new AgentResponseFormatError('模型未返回完整且唯一的合法 JSON，未执行任何操作')
+}
 
 function wait(milliseconds: number): Promise<void> {
   return new Promise((resolve) => {
@@ -18,6 +45,7 @@ function wait(milliseconds: number): Promise<void> {
 }
 
 export function isRetryableAgentError(error: unknown): boolean {
+  if (error instanceof AgentResponseFormatError) return true
   if (!axios.isAxiosError(error)) return false
   if (!error.response) return true
   const status = error.response.status
@@ -112,11 +140,11 @@ export class DingTalkAgentInterpreter {
       } : false,
       maxContentLength: 256 * 1024,
     })
-    const response = await withAgentRetries(request, settings.agentRetryCount)
-    const content = response.data?.choices?.[0]?.message?.content
-    if (typeof content !== 'string' || content.length > 20_000) throw new Error('模型响应格式无效')
-    let parsed: unknown
-    try { parsed = JSON.parse(content) } catch { throw new Error('模型没有返回合法 JSON') }
-    return commandsFromAgentResponse(parsed)
+    return withAgentRetries(async () => {
+      const response = await request()
+      const choice = response.data?.choices?.[0]
+      if (choice?.finish_reason === 'length') throw new AgentResponseFormatError('模型响应被截断，未执行任何操作')
+      return commandsFromAgentResponse(parseAgentJson(choice?.message?.content))
+    }, settings.agentRetryCount)
   }
 }

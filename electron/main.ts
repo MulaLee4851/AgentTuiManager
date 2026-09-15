@@ -4,6 +4,9 @@ import { writeFile } from 'node:fs/promises'
 import { delimiter, isAbsolute, join } from 'node:path'
 
 import { SessionController } from './session-controller'
+import { parseUnattendedSettings } from '../src/shared/unattended-settings'
+import { DeepSeekWebWindows } from './deepseek-web-window'
+import { openExternalWeb, routeExternalLinks } from './external-links'
 import { SessionHostManager } from './session-host-manager'
 import { discoverNativeSessions, discoverRecentNativeSessions } from './native-session-discovery'
 import { canonicalNativeRecovery, terminalScrollbackArgs, validateExecutable } from './start-request-policy'
@@ -37,6 +40,7 @@ import { NativeSessionActivityMonitor } from './native-session-activity'
 import { IPC_CHANNELS, type AgentConfigInput, type AgentKind, type AgentProxyInput, type ApprovalRequest, type AuditEntry, type ContinueKeywordSettings, type DingTalkSettingsInput, type ExternalTerminalDragProjection, type LlmReviewSettingsInput, type LlmRuleAuditFinding, type LlmRuleAuditResult, type LlmRuleAuditState, type ManagerEvent, type NativeSessionSummary, type NpmRegistryChoice, type RecoveryRecipe, type SessionSafetySettings, type SessionSummary, type StartSessionRequest } from '../src/shared/manager-api'
 
 let mainWindow: BrowserWindow | undefined
+const deepSeekWebWindows = new DeepSeekWebWindows()
 let tray: Tray | undefined
 let controller: SessionController
 let auditStore: ActivityAuditStore
@@ -427,7 +431,7 @@ function flushOutputEvents(): void {
   const events = [...pendingOutputEvents.values()]
   pendingOutputEvents.clear()
   for (const event of events) {
-    for (const window of BrowserWindow.getAllWindows()) {
+    for (const window of mainWindow ? [mainWindow] : []) {
       if (!window.isDestroyed()) window.webContents.send(IPC_CHANNELS.event, { type: 'output', ...event })
     }
   }
@@ -451,7 +455,8 @@ function broadcast(event: ManagerEvent): void {
     return
   }
   if (event.type === 'sessions-changed') auditSessionTransition(event.sessionId)
-  for (const window of BrowserWindow.getAllWindows()) {
+  if (event.type === 'sessions-changed') deepSeekWebWindows.sync(event.sessionId, controller.listSessions().find(item => item.sessionId === event.sessionId))
+  for (const window of mainWindow ? [mainWindow] : []) {
     if (!window.isDestroyed()) window.webContents.send(IPC_CHANNELS.event, event)
   }
 }
@@ -709,6 +714,15 @@ async function restoreNativeSessionProvider(session: SessionSummary | undefined)
 }
 
 function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
+  ipcMain.handle(IPC_CHANNELS.openExternalWeb, async (event, url: unknown) => {
+    trustedRenderer(event)
+    await openExternalWeb(url)
+  })
+  ipcMain.handle(IPC_CHANNELS.openDeepSeekWeb, async (event, id: unknown) => {
+    trustedRenderer(event)
+    const target = sessionId(id)
+    await deepSeekWebWindows.open(controller.listSessions().find(item => item.sessionId === target), mainWindow!)
+  })
   ipcMain.handle(IPC_CHANNELS.listSessions, (event) => {
     trustedRenderer(event)
     return controller.listSessions()
@@ -946,6 +960,20 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
       sessionId: target,
       details: { enabled: value, deletionAllowed: false, workspaceEscapeAllowed: false },
     })
+  })
+  ipcMain.handle(IPC_CHANNELS.setUnattendedMode, async (event, id: unknown, value: unknown) => {
+    trustedRenderer(event)
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('无监管配置无效')
+    const input = value as Record<string, unknown>
+    if (input.enabled === false) {
+      await controller.setUnattendedMode(sessionId(id), { enabled: false, recoveryWord: '' })
+      return
+    }
+    await controller.setUnattendedMode(sessionId(id), parseUnattendedSettings(value))
+  })
+  ipcMain.handle(IPC_CHANNELS.saveUnattendedSettings, async (event, id: unknown, value: unknown) => {
+    trustedRenderer(event)
+    await controller.saveUnattendedSettings(sessionId(id), parseUnattendedSettings(value))
   })
   ipcMain.handle(IPC_CHANNELS.listCCSwitchProviders, (event, kind: unknown) => {
     trustedRenderer(event)
@@ -1216,12 +1244,17 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
     trustedRenderer(event)
     await installNodeAndNpm((progress) => broadcast({ type: 'agent-install-progress', progress: { target: 'node', ...progress } }))
   })
-  ipcMain.handle(IPC_CHANNELS.installAgent, async (event, kind: unknown, registry: unknown) => {
+  ipcMain.handle(IPC_CHANNELS.installAgent, async (event, kind: unknown, registry: unknown, operation: unknown) => {
     trustedRenderer(event)
     const agentKind = validatedAgentKind(kind)
     const registryChoice = registry === undefined ? 'configured' : text(registry, 'npm registry', 32)
     if (!['configured', 'official', 'npmmirror', 'tencent', 'huawei'].includes(registryChoice)) throw new Error('不支持的 npm 镜像源')
-    await installAgent(agentKind, registryChoice as NpmRegistryChoice, (progress) => broadcast({ type: 'agent-install-progress', progress: { target: 'agent', agentKind, ...progress } }))
+    const mode = operation ?? 'install'
+    if (mode !== 'install' && mode !== 'update') throw new Error('不支持的安装操作')
+    if (mode === 'update' && controller.listSessions().some(session => session.agentKind === agentKind && !['stopped', 'completed', 'failed'].includes(session.status))) {
+      throw new Error('请先停止正在运行的同类型 Agent，再更新 CLI；Manager 不会自动停止你的会话。')
+    }
+    await installAgent(agentKind, registryChoice as NpmRegistryChoice, (progress) => broadcast({ type: 'agent-install-progress', progress: { target: 'agent', agentKind, ...progress } }), mode)
   })
   ipcMain.handle(IPC_CHANNELS.installRipgrep, async (event) => {
     trustedRenderer(event)
@@ -1239,6 +1272,7 @@ function createWindow(): BrowserWindow {
     webPreferences: { preload: join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   })
   window.setMenuBarVisibility(false)
+  routeExternalLinks(window.webContents)
   window.on('close', (event) => {
     if (!quitting) { event.preventDefault(); window.hide() }
   })
@@ -1541,7 +1575,8 @@ void app.whenReady().then(async () => {
     reviewApproval: (request: ApprovalRequest, hardBlockedReason?: string) =>
       llmSecurityReviewer.reviewApproval(request, llmReviewSettingsStore.getRuntimeSettings(), hardBlockedReason),
   }
-  controller = new SessionController(manager, broadcast, { discover: discoverNativeSessions }, auditedApprovalPolicy, recoveryPolicy, fullAutoActivity, continueKeywordStore, recoveryActivity, sessionCatalog, llmApprovalReview)
+  controller = new SessionController(manager, broadcast, { discover: discoverNativeSessions }, auditedApprovalPolicy, recoveryPolicy, fullAutoActivity, continueKeywordStore, recoveryActivity, sessionCatalog, llmApprovalReview,
+    entry => recordAudit({ ...entry, category: 'approval', level: 'warning' }))
   const remoteAudit = {
     list: () => auditStore.list(),
     record: (entry: { level: 'info' | 'warning' | 'error'; action: string; message: string; sessionId?: string; details?: Record<string, string | number | boolean> }) => {
@@ -1552,6 +1587,7 @@ void app.whenReady().then(async () => {
     listSessions: () => controller.listSessions(),
     listPendingApprovals: () => controller.listPendingApprovals(),
     terminalReplay: (id: string) => controller.terminalReplay(id),
+    terminalText: (id: string) => controller.terminalText(id),
     approveRequest: async (id: string) => {
       const request = controller.listPendingApprovals().find((item) => item.requestId === id)
       await controller.approveRequest(id)
@@ -1571,6 +1607,7 @@ void app.whenReady().then(async () => {
     },
     approveAllPendingForced: () => controller.approveAllPendingForced(),
     write: (id: string, data: string) => controller.write(id, data),
+    sendMessage: (id: string, content: string) => controller.sendSessionMessage(id, content),
     stopSession: async (id: string) => {
       await controller.stopSession(id)
       await restoreNativeSessionProvider(controller.listSessions().find((session) => session.sessionId === id))

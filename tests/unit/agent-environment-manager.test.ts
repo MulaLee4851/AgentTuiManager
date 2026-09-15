@@ -1,9 +1,16 @@
 import { describe, expect, it } from 'vitest'
 
-import { installCommandForAgent, installedExecutableVersion, needsMacNpmCompatibility, npmCompatibilityArchiveUrl, packageForAgent, registryUrl, supportsDeepSeekNode } from '../../electron/agent-environment-manager'
+import { installCommandForAgent, installedExecutableVersion, needsMacNpmCompatibility, npmCompatibilityArchiveUrl, packageForAgent, updatePackageForAgent, registryUrl, supportsDeepSeekNode } from '../../electron/agent-environment-manager'
 import { mergeWindowsPaths } from '../../electron/windows-environment'
 
 describe('Agent environment installation catalog', () => {
+  it('updates every managed CLI using its supported release channel', () => {
+    expect(updatePackageForAgent('codex')).toBe('@openai/codex@latest')
+    expect(updatePackageForAgent('claude')).toBe('@anthropic-ai/claude-code@latest')
+    expect(updatePackageForAgent('deepseek')).toBe('@deepseek-ai/dsh@latest')
+    expect(updatePackageForAgent('pi')).toBe('@earendil-works/pi-coding-agent@legacy-node20')
+    expect(updatePackageForAgent('generic')).toBeUndefined()
+  })
   it('uses fixed official npm packages instead of renderer-provided commands', () => {
     expect(packageForAgent('codex')).toBe('@openai/codex')
     expect(packageForAgent('claude')).toBe('@anthropic-ai/claude-code')

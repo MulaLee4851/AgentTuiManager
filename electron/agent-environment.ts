@@ -65,7 +65,7 @@ export function environmentForAgent(
   source: NodeJS.ProcessEnv = process.env,
   pathRefreshOptions: WindowsPathRefreshOptions = {},
 ): Record<string, string> {
-  const environment: NodeJS.ProcessEnv = agentKind === 'pi' || process.platform === 'darwin'
+  const environment: NodeJS.ProcessEnv = agentKind !== 'generic' || process.platform === 'darwin'
     ? environmentWithFreshPath(source, pathRefreshOptions)
     : { ...source }
   if (agentKind === 'codex' && CODEX_PARENT_MARKERS.some((name) => keyOf(source, name) !== undefined)) {

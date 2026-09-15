@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { IPC_CHANNELS } from '../../src/shared/manager-api'
@@ -20,10 +21,23 @@ describe('preload agentManager contract', () => {
   it('exposes only the narrow manager API including native session discovery', async () => {
     await import('../../electron/preload')
     const api = electron.exposeInMainWorld.mock.calls.at(-1)?.[1] as Record<string, (...args: unknown[]) => unknown>
-    expect(Object.keys(api).sort()).toEqual(['acceptApprovalSuggestion', 'acceptRecoverySuggestion', 'addApprovalRule', 'addDangerRule', 'approveAllPending', 'approveAndRememberRequest', 'approveRequest', 'approveSession', 'chooseExecutable', 'chooseWorkspace', 'continueSession', 'detachSession', 'detectAgentEnvironment', 'discoverSessions', 'dismissApprovalSuggestion', 'dismissRecoverySuggestion', 'exportAuditEntries', 'getContinueKeywordSettings', 'getDingTalkSettings', 'getLlmReviewSettings', 'getSessionSafetySettings', 'installAgent', 'installNodeAndNpm', 'installRipgrep', 'listApprovalRules', 'listAuditEntries', 'listCCSwitchProviders', 'listDangerRules', 'listPendingApprovals', 'listSessions', 'listTokenUsageDetails', 'listTokenUsageSummary', 'platform', 'readClipboardText', 'rejectRequest', 'removeApprovalRule', 'removeDangerRule', 'removeSession', 'renameSession', 'resetDingTalkBinding', 'resize', 'restartSession', 'reviewApprovalRules', 'setDangerRuleEnabled', 'setFullAutoMode', 'startSession', 'stopSession', 'subscribe', 'terminalReplay', 'testDangerCommand', 'tryRecoveryOnce', 'updateContinueKeywordSettings', 'updateDingTalkSettings', 'updateLlmReviewSettings', 'updateSessionConfig', 'updateSessionProxy', 'updateSessionSafetySettings', 'write', 'writeClipboardText'])
+    expect(Object.keys(api).sort()).toEqual(['acceptApprovalSuggestion', 'acceptRecoverySuggestion', 'addApprovalRule', 'addDangerRule', 'approveAllPending', 'approveAndRememberRequest', 'approveRequest', 'approveSession', 'chooseExecutable', 'chooseWorkspace', 'continueSession', 'detachSession', 'detectAgentEnvironment', 'discoverSessions', 'dismissApprovalSuggestion', 'dismissRecoverySuggestion', 'exportAuditEntries', 'getContinueKeywordSettings', 'getDingTalkSettings', 'getLlmReviewSettings', 'getSessionSafetySettings', 'installAgent', 'installNodeAndNpm', 'installRipgrep', 'listApprovalRules', 'listAuditEntries', 'listCCSwitchProviders', 'listDangerRules', 'listPendingApprovals', 'listSessions', 'listTokenUsageDetails', 'listTokenUsageSummary', 'openDeepSeekWeb', 'openExternalWeb', 'platform', 'readClipboardText', 'rejectRequest', 'removeApprovalRule', 'removeDangerRule', 'removeSession', 'renameSession', 'resetDingTalkBinding', 'resize', 'restartSession', 'reviewApprovalRules', 'saveUnattendedSettings', 'setDangerRuleEnabled', 'setFullAutoMode', 'setUnattendedMode', 'startSession', 'stopSession', 'subscribe', 'terminalReplay', 'testDangerCommand', 'tryRecoveryOnce', 'updateContinueKeywordSettings', 'updateDingTalkSettings', 'updateLlmReviewSettings', 'updateSessionConfig', 'updateSessionProxy', 'updateSessionSafetySettings', 'write', 'writeClipboardText'])
     expect(api.platform).toBe(process.platform)
+    const saved = { enabled: false, endWord: 'DONE', recoveryWord: 'continue', approvalEnterDelaySeconds: 7, approvalEnterCount: 3 }
+    await api.saveUnattendedSettings?.('session-1', saved)
+    expect(electron.invoke).toHaveBeenCalledWith(IPC_CHANNELS.saveUnattendedSettings, 'session-1', saved)
+    await api.openDeepSeekWeb?.('session-1')
+    expect(electron.invoke).toHaveBeenCalledWith(IPC_CHANNELS.openDeepSeekWeb, 'session-1')
+    await api.openExternalWeb?.('https://example.com/')
+    expect(electron.invoke).toHaveBeenCalledWith(IPC_CHANNELS.openExternalWeb, 'https://example.com/')
+    const drop = new Event('drop', { cancelable: true })
+    Object.defineProperty(drop, 'dataTransfer', { value: { types: ['Files'], files: [{}], dropEffect: 'copy' } })
+    window.dispatchEvent(drop)
+    expect(drop.defaultPrevented).toBe(true)
     await api.setFullAutoMode?.('session-1', true)
     expect(electron.invoke).toHaveBeenCalledWith(IPC_CHANNELS.setFullAutoMode, 'session-1', true)
+    await api.setUnattendedMode?.('session-1', { enabled: true, endWord: 'TASK-DONE', recoveryWord: 'continue' })
+    expect(electron.invoke).toHaveBeenCalledWith(IPC_CHANNELS.setUnattendedMode, 'session-1', { enabled: true, endWord: 'TASK-DONE', recoveryWord: 'continue' })
     await api.listCCSwitchProviders?.('codex')
     expect(electron.invoke).toHaveBeenCalledWith(IPC_CHANNELS.listCCSwitchProviders, 'codex')
     await api.discoverSessions?.('codex', 'B:\\work')

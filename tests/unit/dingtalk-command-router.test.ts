@@ -38,6 +38,34 @@ function createRouter(overrides: Partial<{
 }
 
 describe('DingTalkCommandRouter', () => {
+  it('uses the requested Agent parsed screen without reading raw redraw traffic', async () => {
+    const { manager, audit } = createRouter()
+    const terminalText = vi.fn(async () => '当前屏幕\n等待审批')
+    const router = new DingTalkCommandRouter({ ...manager, terminalText }, audit, () => settings)
+    const result = await router.execute('/tail session-12345678', { staffId: 'staff-1' })
+    expect(result).toContain('当前屏幕\n等待审批')
+    expect(terminalText).toHaveBeenCalledWith('session-12345678')
+    expect(manager.terminalReplay).not.toHaveBeenCalled()
+    expect(manager.write).not.toHaveBeenCalled()
+  })
+
+  it('interprets cursor movement even for the legacy raw replay port', async () => {
+    const { router, manager } = createRouter()
+    manager.terminalReplay.mockReturnValue({ data: 'stale output\r\x1b[2Kcurrent', sequence: 1 })
+    const result = await router.execute('/tail session-12345678', { staffId: 'staff-1' })
+    expect(result).toContain('current')
+    expect(result).not.toContain('stale output')
+  })
+  it('does not report sent when the confirmed delivery port rejects', async () => {
+    const { manager, audit } = createRouter()
+    const sendMessage = vi.fn().mockRejectedValue(new Error('未确认 Agent 接收'))
+    const router = new DingTalkCommandRouter({ ...manager, sendMessage }, audit, () => settings)
+    const result = await router.execute('/send session-12345678 continue', { staffId: 'staff-1' })
+    expect(result).toContain('未确认 Agent 接收')
+    expect(result).not.toContain('发送消息。')
+    expect(manager.write).not.toHaveBeenCalled()
+    expect(sendMessage).toHaveBeenCalledWith('session-12345678', 'continue')
+  })
   it('sends only to matching activity states and audits each target', async () => {
     const sessions = ['idle', 'running', 'idle'].map((activity, index) => ({
       sessionId: 'agent-' + index, displayName: 'Agent ' + index,

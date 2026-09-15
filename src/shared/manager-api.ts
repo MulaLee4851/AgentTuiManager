@@ -343,6 +343,7 @@ export interface SessionSummary extends SessionState {
   agentConfig?: AgentConfigSummary
   agentProxy?: AgentProxySummary
   fullAutoEnabled?: boolean
+  unattended?: UnattendedSettings
   /** Local browser surface exposed by a managed Web Agent such as DeepSeek Harness. */
   webUrl?: string
 }
@@ -461,6 +462,8 @@ export type ManagerEvent =
 export const IPC_CHANNELS = {
   listSessions: 'agent-manager:list-sessions',
   terminalReplay: 'agent-manager:terminal-replay',
+  openDeepSeekWeb: 'agent-manager:open-deepseek-web',
+  openExternalWeb: 'agent-manager:open-external-web',
   listAuditEntries: 'agent-manager:list-audit-entries',
   listTokenUsageSummary: 'agent-manager:list-token-usage-summary',
   listTokenUsageDetails: 'agent-manager:list-token-usage-details',
@@ -480,6 +483,8 @@ export const IPC_CHANNELS = {
   updateSessionConfig: 'agent-manager:update-session-config',
   updateSessionProxy: 'agent-manager:update-session-proxy',
   setFullAutoMode: 'agent-manager:set-full-auto-mode',
+  setUnattendedMode: 'agent-manager:set-unattended-mode',
+  saveUnattendedSettings: 'agent-manager:save-unattended-settings',
   listCCSwitchProviders: 'agent-manager:list-ccswitch-providers',
   getContinueKeywordSettings: 'agent-manager:get-continue-keyword-settings',
   updateContinueKeywordSettings: 'agent-manager:update-continue-keyword-settings',
@@ -523,6 +528,8 @@ export interface AgentManagerApi {
   readonly platform: NodeJS.Platform
   listSessions(): Promise<SessionSummary[]>
   terminalReplay(sessionId: string): Promise<TerminalReplaySnapshot>
+  openDeepSeekWeb(sessionId: string): Promise<void>
+  openExternalWeb(url: string): Promise<void>
   listAuditEntries(): Promise<AuditEntry[]>
   listTokenUsageSummary?(query?: TokenUsageQuery): Promise<TokenUsageSummary[]>
   listTokenUsageDetails?(query?: TokenUsageQuery): Promise<TokenUsagePage>
@@ -542,6 +549,8 @@ export interface AgentManagerApi {
   updateSessionConfig(sessionId: string, config: AgentConfigInput): Promise<void>
   updateSessionProxy(sessionId: string, proxy: AgentProxyInput): Promise<void>
   setFullAutoMode(sessionId: string, enabled: boolean): Promise<void>
+  setUnattendedMode?(sessionId: string, settings: UnattendedSettings): Promise<void>
+  saveUnattendedSettings?(sessionId: string, settings: UnattendedSettings): Promise<void>
   listCCSwitchProviders(agentKind: AgentKind): Promise<CCSwitchProviderSummary[]>
   getContinueKeywordSettings(): Promise<ContinueKeywordSettings>
   updateContinueKeywordSettings(settings: ContinueKeywordSettings): Promise<ContinueKeywordSettings>
@@ -574,9 +583,22 @@ export interface AgentManagerApi {
   discoverSessions(agentKind: AgentKind, workspace: string): Promise<NativeSessionSummary[]>
   detectAgentEnvironment?(agentKind: AgentKind, executable: string): Promise<AgentEnvironmentSummary>
   installNodeAndNpm?(): Promise<void>
-  installAgent?(agentKind: AgentKind, registry?: NpmRegistryChoice): Promise<void>
+  installAgent?(agentKind: AgentKind, registry?: NpmRegistryChoice, operation?: 'install' | 'update'): Promise<void>
   installRipgrep?(): Promise<void>
   readClipboardText(): Promise<string>
   writeClipboardText(text: string): Promise<void>
   subscribe(listener: (event: ManagerEvent) => void): () => void
+}
+export interface UnattendedSettings {
+  enabled: boolean
+  /** Legacy field; new writes retain the first configured word here. */
+  endWord?: string
+  endWords?: string[]
+  /** Exactly one configured end word to include in recovery instructions. */
+  recoveryEndWord?: string
+  recoveryWord: string
+  /** Optional one-shot Enter workaround after auto approval. 0 disables it. */
+  approvalEnterDelaySeconds?: number
+  approvalEnterCount?: number
+  reason?: string
 }

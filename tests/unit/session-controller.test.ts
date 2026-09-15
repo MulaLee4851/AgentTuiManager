@@ -5,6 +5,8 @@ import type { HostEvent } from '../../src/shared/protocol'
 import type { StartSessionRequest } from '../../src/shared/manager-api'
 import type { HostHandle, HostRecord, StartHostOptions } from '../../electron/session-host-manager'
 import { ApprovalPolicyEngine } from '../../electron/approval-policy'
+import { TerminalReplayBuffer } from '../../electron/terminal-replay-buffer'
+import { parseNativeActivity } from '../../electron/native-session-activity'
 
 class FakeHandle implements HostHandle {
   readonly writes: string[] = []
@@ -85,6 +87,352 @@ async function settle(): Promise<void> {
 }
 
 describe('SessionController recovery evidence', () => {
+  it('persists saved settings and reports a failed disk flush instead of claiming success', async () => {
+    const { manager } = fixture()
+    const catalog = { list: () => [], upsert: vi.fn(async () => undefined), flush: vi.fn(async () => undefined), remove: vi.fn(async () => undefined), clear: vi.fn(async () => undefined) }
+    const controller = new SessionController(manager, undefined, undefined, undefined, undefined, undefined, undefined, undefined, catalog)
+    const session = await controller.startSession(request())
+    const config = { enabled: false, endWord: 'DONE', recoveryWord: 'continue', approvalEnterDelaySeconds: 7, approvalEnterCount: 3 }
+    await controller.saveUnattendedSettings(session.sessionId, config)
+    expect(catalog.upsert).toHaveBeenLastCalledWith(expect.objectContaining({ summary: expect.objectContaining({ unattended: expect.objectContaining(config) }) }))
+    expect(catalog.flush).toHaveBeenCalled()
+    catalog.flush.mockRejectedValueOnce(new Error('disk unavailable'))
+    await expect(controller.saveUnattendedSettings(session.sessionId, config)).rejects.toThrow('disk unavailable')
+  })
+  it('saves inactive settings and retains them across enable/disable without resetting delay', async () => {
+    const { controller } = fixture()
+    const session = await controller.startSession(request())
+    const input = { enabled: false, endWord: 'DONE', recoveryWord: 'continue', approvalEnterDelaySeconds: 7, approvalEnterCount: 3 }
+    await controller.saveUnattendedSettings(session.sessionId, input)
+    expect(controller.listSessions()[0]!.unattended).toMatchObject(input)
+    await controller.setUnattendedMode(session.sessionId, { ...input, enabled: true })
+    await controller.setUnattendedMode(session.sessionId, { enabled: false, recoveryWord: '' })
+    expect(controller.listSessions()[0]!.unattended).toMatchObject(input)
+  })
+  it('writes one real CR after unattended hook approval even with an empty Manager queue', async () => {
+    vi.useFakeTimers()
+    try {
+      const { controller, handles } = fixture()
+      const session = await controller.startSession({ ...request(), nativeSessionId: 'native-one' })
+      await controller.setUnattendedMode(session.sessionId, {
+        enabled: true, endWord: 'TASK-DONE', recoveryWord: 'continue', approvalEnterDelaySeconds: 5,
+      })
+      handles[0]!.emit({ type: 'permission-request', hookSource: 'codex', requestId: 'late-menu', toolName: 'Bash', command: 'npm test' })
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(handles[0]!.permissionResponses).toEqual([{ requestId: 'late-menu', action: 'allow' }])
+      expect(controller.listPendingApprovals()).toEqual([])
+      expect(handles[0]!.writes).toEqual([])
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(handles[0]!.writes).toEqual(['\r'])
+      await controller.setUnattendedMode(session.sessionId, { enabled: false, recoveryWord: 'continue' })
+    } finally { vi.useRealTimers() }
+  })
+  it('coalesces only concurrent remote reads and parses using current dimensions', async () => {
+    const { controller, handles } = fixture()
+    const session = await controller.startSession(request())
+    controller.resize(session.sessionId, 24, 8)
+    const replay = vi.spyOn(handles[0]!, 'replay').mockResolvedValue('stale\r\x1b[2Kcurrent\x1b[2;24H!')
+    const first = controller.terminalText(session.sessionId)
+    const second = controller.terminalText(session.sessionId)
+    expect(second).toBe(first)
+    expect(await first).toBe('current\n                       !')
+    expect(replay).toHaveBeenCalledTimes(1)
+    await controller.terminalText(session.sessionId)
+    expect(replay).toHaveBeenCalledTimes(2)
+    expect(handles[0]!.writes).toEqual([])
+  })
+  it.each(['paste-submit', 'protocol', 'native-consumed', 'draft', 'late-receipt'] as const)(
+    'handles unattended error recovery with %s input evidence', async scenario => {
+      vi.useFakeTimers()
+      try {
+        const { controller, handles } = fixture()
+        const session = await controller.startSession({ ...request(), nativeSessionId: 'native-one' })
+        const oldTimestamp = Date.now()
+        await vi.advanceTimersByTimeAsync(10)
+        if (scenario === 'paste-submit') controller.write(session.sessionId, '\x1b[200~continue\x1b[201~\r')
+        if (scenario === 'protocol') {
+          controller.write(session.sessionId, '\x1b]4;0;rgb:ffff/')
+          controller.write(session.sessionId, 'ffff/ffff\x07')
+        }
+        if (scenario === 'native-consumed' || scenario === 'draft' || scenario === 'late-receipt') {
+          controller.write(session.sessionId, 'continue')
+        }
+        const snapshot = controller.listSessions()[0]!
+        controller.observeNativeActivity(snapshot, {
+          activity: 'error', timestamp: Date.now(), error: 'network retries exhausted',
+          ...(scenario === 'native-consumed' || scenario === 'late-receipt'
+            ? { userMessage: { text: 'continue', timestamp: scenario === 'late-receipt' ? oldTimestamp : Date.now() } } : {}),
+        })
+        handles[0]!.writes.length = 0
+        await controller.setUnattendedMode(session.sessionId, {
+          enabled: true, endWord: 'TASK-DONE', recoveryWord: 'continue',
+        })
+        await vi.advanceTimersByTimeAsync(7000)
+        if (scenario === 'draft' || scenario === 'late-receipt') {
+          expect(handles[0]!.writes).toEqual([])
+        } else {
+          expect(handles[0]!.writes).toHaveLength(2)
+          expect(handles[0]!.writes[0]).toContain('continue')
+          expect(handles[0]!.writes[1]).toBe('\r')
+        }
+        expect(controller.listSessions()[0]!.unattended?.enabled).toBe(true)
+        await controller.setUnattendedMode(session.sessionId, { enabled: false, recoveryWord: 'continue' })
+      } finally { vi.useRealTimers() }
+    })
+  it('keeps unattended enabled after recovery without a transcript receipt', async () => {
+    vi.useFakeTimers()
+    try {
+      const { controller, handles } = fixture()
+      const session = await controller.startSession({ ...request(), nativeSessionId: 'native-one' })
+      // No recognized terminal prompt or permission event: native evidence
+      // alone must make a completed/idle CLI eligible for unattended recovery.
+      controller.observeNativeActivity(session, { activity: 'idle', timestamp: Date.now() })
+      await controller.setUnattendedMode(session.sessionId, {
+        enabled: true, endWords: ['TASK-DONE', 'OTHER-DONE'], recoveryEndWord: 'TASK-DONE', recoveryWord: 'continue',
+      })
+      await vi.advanceTimersByTimeAsync(6000)
+      expect(handles[0]!.writes).toHaveLength(2)
+      expect(handles[0]!.writes[0]).toContain('仅输出 TASK-DONE')
+      expect(handles[0]!.writes[1]).toBe('\r')
+      await vi.advanceTimersByTimeAsync(60000)
+      expect(controller.listSessions()[0]!.unattended?.enabled).toBe(true)
+      expect(handles[0]!.writes).toHaveLength(2)
+      await controller.setUnattendedMode(session.sessionId, { enabled: false, recoveryWord: 'continue' })
+    } finally { vi.useRealTimers() }
+  })
+  it.each(['codex', 'claude'] as const)('ignores recovery input and PTY end-word echoes for %s', async kind => {
+    vi.useFakeTimers()
+    try {
+      const { controller, handles } = fixture()
+      const session = await controller.startSession({ ...request(), agentKind: kind, executable: kind, nativeSessionId: 'native-one' })
+      await controller.setUnattendedMode(session.sessionId, { enabled: true,
+        endWords: ['TASK-DONE', 'OTHER-DONE'], recoveryEndWord: 'TASK-DONE', recoveryWord: 'continue' })
+      const user = kind === 'codex'
+        ? { timestamp: Date.now(), type: 'event_msg', payload: { type: 'user_message', message: 'continue。如果没有剩余任务，仅输出 TASK-DONE' } }
+        : { timestamp: Date.now(), type: 'user', message: { content: 'continue。如果没有剩余任务，仅输出 TASK-DONE' } }
+      controller.observeNativeActivity(session, parseNativeActivity(kind, user, 'native-one')!)
+      handles[0]!.emit({ type: 'output', data: 'TASK-DONE\r\n' })
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(controller.listSessions()[0]!.unattended?.enabled).toBe(true)
+      const assistant = kind === 'codex'
+        ? { timestamp: Date.now(), type: 'event_msg', payload: { type: 'task_complete', last_agent_message: 'OTHER-DONE' } }
+        : { timestamp: Date.now(), type: 'assistant', message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'OTHER-DONE' }] } }
+      controller.observeNativeActivity(session, parseNativeActivity(kind, assistant, 'native-one')!)
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(controller.listSessions()[0]!.unattended?.enabled).toBe(false)
+      expect(handles[0]!.writes).toEqual([])
+    } finally { vi.useRealTimers() }
+  })
+  it('confirms a remote submission using only its native user message, not the optimistic running status', async () => {
+    vi.useFakeTimers()
+    try {
+      const { controller, handles } = fixture()
+      const session = await controller.startSession({ ...request(), nativeSessionId: 'native-one' })
+      handles[0]!.emit({ type: 'output', data: '› ' })
+      await vi.advanceTimersByTimeAsync(0)
+      let complete = false
+      const sending = controller.sendSessionMessage(session.sessionId, 'continue').then(() => { complete = true })
+      await vi.advanceTimersByTimeAsync(600)
+      expect(handles[0]!.writes).toEqual(['\x1b[200~continue\x1b[201~', '\r'])
+      expect(complete).toBe(false)
+      const snapshot = controller.listSessions()[0]!
+      controller.observeNativeActivity(snapshot, { activity: 'running', timestamp: Date.now(), userMessage: { text: 'continue', timestamp: Date.now() } })
+      await vi.advanceTimersByTimeAsync(100)
+      await sending
+      expect(complete).toBe(true)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('auto-approves high-risk hooks only for the unattended window and stops on its own completion word', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const audit = vi.fn()
+      const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine(),
+        undefined, undefined, undefined, undefined, undefined, undefined, audit)
+      const first = await controller.startSession({ ...request(), nativeSessionId: 'native-one' })
+      await controller.startSession({ ...request(), nativeSessionId: 'native-two' })
+      await controller.setUnattendedMode(first.sessionId, { enabled: true, endWord: 'TASK-DONE', recoveryWord: 'continue' })
+      for (let i = 0; i < 2; i++) base.handles[i]!.emit({ type: 'permission-request', hookSource: 'codex', requestId: 'danger-' + i,
+        toolName: 'Bash', command: 'rm -rf demo', operation: 'delete' })
+      await vi.advanceTimersByTimeAsync(5500)
+      expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'danger-0', action: 'allow' }])
+      expect(base.handles[1]!.permissionResponses).toEqual([])
+      expect(base.handles[0]!.writes).toEqual([])
+      expect(audit).toHaveBeenCalledWith(expect.objectContaining({ action: 'unattended_approved' }))
+      controller.observeNativeActivity(controller.listSessions()[0]!, {
+        activity: 'completed', timestamp: Date.now(), assistantMessage: { text: 'TASK-DONE', timestamp: Date.now() },
+      })
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(controller.listSessions()[0]!.unattended?.enabled).toBe(false)
+      await vi.advanceTimersByTimeAsync(10000)
+      expect(base.handles[0]!.writes).toEqual([])
+    } finally { vi.useRealTimers() }
+  })
+  it('captures the native ID on Ctrl+C exit even after startup capture expired and host metadata disappeared', async () => {
+    vi.useFakeTimers()
+    try {
+      const start = Date.now()
+      let calls = 0
+      const discovery: NativeSessionDiscoveryPort = { discover: vi.fn(async () => ++calls === 1 ? [] : [
+        { id: 'exit-native', title: 'Task', updatedAt: start + 600000, workspace: 'B:\\work' },
+      ]) }
+      const { controller, handles, manager, starts } = fixture(discovery)
+      const session = await controller.startSession(request())
+      vi.setSystemTime(start + 600000)
+      vi.mocked(manager.updateMetadata).mockRejectedValueOnce(new Error('Host metadata gone'))
+      controller.write(session.sessionId, '\x03')
+      handles[0]!.emit({ type: 'exit', exitCode: 130 })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(controller.listSessions()[0]).toMatchObject({ nativeSessionId: 'exit-native', status: 'stopped' })
+      await controller.restartSession(session.sessionId)
+      expect(starts[1]?.args).toContain('exit-native')
+      expect(handles[1]!.writes).toEqual([])
+    } finally { vi.useRealTimers() }
+  })
+
+  it('does not guess a native ID when multiple new sessions are found on exit', async () => {
+    vi.useFakeTimers()
+    try {
+      let calls = 0
+      const discovery: NativeSessionDiscoveryPort = { discover: vi.fn(async () => ++calls === 1 ? [] :
+        ['native-a', 'native-b'].map(id => ({ id, title: id, updatedAt: Date.now(), workspace: 'B:\\work' }))) }
+      const { controller, handles } = fixture(discovery)
+      await controller.startSession(request())
+      handles[0]!.emit({ type: 'exit', exitCode: 0 })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(controller.listSessions()[0]?.nativeSessionId).toBeUndefined()
+    } finally { vi.useRealTimers() }
+  })
+
+  it('falls back for a complete native Claude approval menu even when a configured hook never arrives', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      await base.controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+      base.handles[0]!.permissionHook = 'claude'
+      base.handles[0]!.emit({ type: 'output', data: 'Read file\r\nRead(B:\\demo.txt)\r\nDo you want to proceed?\r\n❯ 1. Yes\r\n  2. No\r\nEsc to cancel · Tab to amend\r\n' })
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(base.controller.listPendingApprovals()).toEqual([expect.objectContaining({ source: 'terminal' })])
+      expect(base.handles[0]!.writes).toEqual([])
+    } finally { vi.useRealTimers() }
+  })
+  it('does not materialize full scrollback for streaming approval confirmation', async () => {
+    vi.useFakeTimers()
+    const snapshot = vi.spyOn(TerminalReplayBuffer.prototype, 'snapshot')
+    try {
+      const base = fixture()
+      const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
+      const session = await controller.startSession(request())
+      await controller.setFullAutoMode(session.sessionId, true)
+      const handle = base.handles[0]!
+      handle.emit({ type: 'output', data: 'history '.repeat(400000) })
+      handle.emit({ type: 'output', data: '\x1b[2J\x1b[HWould you like to run the following command?\r\n$ pnpm --dir frontend build\r\n1. Yes, proceed\r\n2. No' })
+      await vi.advanceTimersByTimeAsync(0)
+      snapshot.mockClear()
+      for (let i = 0; i < 200; i++) handle.emit({ type: 'output', data: ' ' })
+      await vi.advanceTimersByTimeAsync(1100)
+      expect(snapshot).not.toHaveBeenCalled()
+    } finally { snapshot.mockRestore(); vi.useRealTimers() }
+  })
+  it.each(['echo', 'typing', 'approval', 'running'])('guards the separate Hook submit key during %s', async (scenario) => {
+    vi.useFakeTimers()
+    try {
+      const { controller, handles } = fixture()
+      const session = await controller.startSession(request())
+      const handle = handles[0]!
+      handle.emit({ type: 'permission-request', hookSource: 'codex', requestId: 'split', toolName: 'Bash', command: 'npm test' })
+      await vi.advanceTimersByTimeAsync(0)
+      controller.observeNativeActivity(session, { activity: 'completed', timestamp: Date.now() + 1 })
+      await controller.approveRequest('split')
+      await vi.advanceTimersByTimeAsync(750)
+      expect(handle.writes).toEqual(['continue'])
+      if (scenario === 'echo') handle.emit({ type: 'output', data: 'continue' })
+      if (scenario === 'typing') controller.write(session.sessionId, 'x')
+      if (scenario === 'approval') handle.emit({ type: 'permission-request', hookSource: 'codex', requestId: 'next', toolName: 'Bash', command: 'npm build' })
+      if (scenario === 'running') controller.observeNativeActivity(session, { activity: 'running', timestamp: Date.now() })
+      await vi.advanceTimersByTimeAsync(299)
+      expect(handle.writes).not.toContain('\r')
+      await vi.advanceTimersByTimeAsync(1)
+      expect(handle.writes).toEqual(scenario === 'echo' ? ['continue', '\r'] : scenario === 'typing' ? ['continue', 'x'] : ['continue'])
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(handle.writes.filter((value) => value === '\r')).toHaveLength(scenario === 'echo' ? 1 : 0)
+    } finally { vi.useRealTimers() }
+  })
+  it.each(['idle', 'running', 'typing', 'another-approval'])('sends Hook follow-up only to the approved idle session: %s', async (scenario) => {
+    vi.useFakeTimers()
+    try {
+      const { controller, handles } = fixture()
+      const session = await controller.startSession(request())
+      await controller.startSession(request())
+      const handle = handles[0]!
+      handle.emit({ type: 'permission-request', hookSource: 'codex', requestId: 'follow-up', toolName: 'Bash', command: 'npm test' })
+      await vi.advanceTimersByTimeAsync(0)
+      controller.observeNativeActivity(session, { activity: scenario === 'running' ? 'running' : 'completed', timestamp: Date.now() + 1 })
+      await controller.approveRequest('follow-up')
+      if (scenario === 'typing') controller.write(session.sessionId, 'hello')
+      if (scenario === 'another-approval') {
+        handle.emit({ type: 'permission-request', hookSource: 'codex', requestId: 'still-blocked', toolName: 'Bash', command: 'npm run build' })
+      }
+      await vi.advanceTimersByTimeAsync(1100)
+      expect(handle.writes).toEqual(scenario === 'idle' ? ['continue', '\r'] : scenario === 'typing' ? ['hello'] : [])
+      expect(handles[1]!.writes).toEqual([])
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(handle.writes).toHaveLength(scenario === 'idle' ? 2 : scenario === 'typing' ? 1 : 0)
+    } finally { vi.useRealTimers() }
+  })
+
+  it.each(['ready', 'next-command', 'user-input'])('cancels fallback retries on %s without leaking Enter', async (scenario) => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const activity = { approved: vi.fn(), blocked: vi.fn() }
+      const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine(), undefined, activity)
+      const session = await controller.startSession(request())
+      await controller.setFullAutoMode(session.sessionId, true)
+      const handle = base.handles[0]!
+      handle.emit({ type: 'output', data: 'Would you like to run the following command?\r\n$ pnpm --dir frontend build\r\n1. Yes, proceed\r\n2. No' })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(handle.writes).toEqual(['\r'])
+      expect(activity.approved).not.toHaveBeenCalled()
+      if (scenario === 'user-input') {
+        controller.write(session.sessionId, 'x')
+      } else {
+        handle.emit({ type: 'output', data: '\x1b[2J\x1b[H' + (scenario === 'ready'
+          ? 'Codex\r\n› \r\n'
+          : 'Would you like to run the following command?\r\n$ Remove-Item important.txt\r\n1. Yes, proceed\r\n2. No') })
+      }
+      await vi.advanceTimersByTimeAsync(4000)
+      expect(handle.writes).toEqual(scenario === 'user-input' ? ['\r', 'x'] : ['\r'])
+      expect(activity.approved).toHaveBeenCalledTimes(scenario === 'ready' ? 1 : 0)
+      if (scenario === 'next-command') {
+        expect(controller.listPendingApprovals()).toEqual([expect.objectContaining({ command: 'Remove-Item important.txt' })])
+      }
+    } finally { vi.useRealTimers() }
+  })
+
+  it('retries a repainted identical modal without restarting its bounded confirmation window', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
+      const session = await controller.startSession(request())
+      await controller.setFullAutoMode(session.sessionId, true)
+      const prompt = 'Would you like to run the following command?\r\n$ pnpm --dir frontend build\r\n1. Yes, proceed\r\n2. No'
+      const handle = base.handles[0]!
+      handle.emit({ type: 'output', data: prompt })
+      await vi.advanceTimersByTimeAsync(300)
+      expect(handle.writes).toHaveLength(2)
+      handle.emit({ type: 'output', data: '\x1b[2J\x1b[H' + prompt })
+      await vi.advanceTimersByTimeAsync(800)
+      expect(handle.writes).toHaveLength(3)
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(controller.listPendingApprovals()).toHaveLength(1)
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(handle.writes).toHaveLength(3)
+    } finally { vi.useRealTimers() }
+  })
+
   it('retains a second Codex terminal approval alongside an unrelated Hook', async () => {
     vi.useFakeTimers()
     try {
@@ -1174,7 +1522,7 @@ describe('SessionController recovery evidence', () => {
     expect(activity.approved).toHaveBeenCalledTimes(2)
   })
 
-  it('retries a Codex full-auto Enter once when the approval prompt does not advance', async () => {
+  it('does not report a full-auto socket write as confirmed approval and restores a stuck modal', async () => {
     vi.useFakeTimers()
     try {
       const base = fixture()
@@ -1189,7 +1537,7 @@ describe('SessionController recovery evidence', () => {
       })
       await vi.advanceTimersByTimeAsync(0)
       expect(base.handles[0]!.writes).toEqual(['\r'])
-      expect(activity.approved).toHaveBeenCalledTimes(1)
+      expect(activity.approved).not.toHaveBeenCalled()
 
       await vi.advanceTimersByTimeAsync(249)
       expect(base.handles[0]!.writes).toEqual(['\r'])
@@ -1197,6 +1545,14 @@ describe('SessionController recovery evidence', () => {
       expect(base.handles[0]!.writes).toEqual(['\r', '\r'])
       await vi.advanceTimersByTimeAsync(2_000)
       expect(base.handles[0]!.writes).toEqual(['\r', '\r'])
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(controller.listPendingApprovals()).toEqual([expect.objectContaining({
+        source: 'terminal', command: 'pnpm --dir frontend build',
+        reason: expect.stringContaining('自动重试已停止'),
+      })])
+      expect(activity.approved).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(base.handles[0]!.writes).toHaveLength(2)
     } finally {
       vi.useRealTimers()
     }
@@ -1253,7 +1609,7 @@ describe('SessionController recovery evidence', () => {
       expect(decide).toHaveBeenLastCalledWith('git log --oneline')
       expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.pendingApprovalCommand).toBe('git log --oneline')
       controller.approveSession(session.sessionId)
-      base.handles[0]!.emit({ type: 'output', data: 'command completed' })
+      base.handles[0]!.emit({ type: 'output', data: '\x1b[2J\x1b[HCodex\r\ncommand completed\r\n› \r\n' })
       await settle()
     }
 

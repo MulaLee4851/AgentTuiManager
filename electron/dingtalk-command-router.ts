@@ -2,6 +2,7 @@ import type { ApprovalRequest, AuditEntry, BulkApprovalResult, SessionSummary } 
 import { SESSION_STATUS_LABEL, sessionDisplayStatus, parseSessionDisplayStatus, type SessionDisplayStatus } from '../src/shared/session-state'
 import type { StoredDingTalkSettings } from './dingtalk-settings-store'
 import type { DingTalkAgentInterpreter } from './dingtalk-agent-interpreter'
+import { terminalReplayText } from './terminal-state-replay'
 
 export interface DingTalkCommandContext {
   staffId: string
@@ -12,9 +13,11 @@ export interface DingTalkManagerPort {
   listSessions(): SessionSummary[]
   listPendingApprovals(): ApprovalRequest[]
   terminalReplay(sessionId: string): { data: string; sequence: number }
+  terminalText?(sessionId: string): Promise<string>
   approveRequest(requestId: string): void | Promise<void>
   approveAllPendingForced(): Promise<BulkApprovalResult>
   write(sessionId: string, data: string): void | Promise<void>
+  sendMessage?(sessionId: string, content: string): Promise<void>
   stopSession(sessionId: string): Promise<void>
   restartSession(sessionId: string): Promise<void>
   setFullAutoMode(sessionId: string, enabled: boolean): Promise<void>
@@ -48,13 +51,6 @@ function wait(milliseconds: number): Promise<void> {
     const timer = setTimeout(resolve, milliseconds)
     timer.unref?.()
   })
-}
-
-function cleanTerminal(value: string): string {
-  return value.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
-    .replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])/g, '')
-    .replace(/\r/g, '')
-    .trim()
 }
 
 function workspaceKey(value: string): string {
@@ -160,7 +156,9 @@ export class DingTalkCommandRouter {
       }
       case '/tail': {
         const session = this.resolveSession(args, sessions)
-        const output = cleanTerminal(this.manager.terminalReplay(session.sessionId).data)
+        const output = this.manager.terminalText
+          ? await this.manager.terminalText(session.sessionId)
+          : await terminalReplayText(this.manager.terminalReplay(session.sessionId).data)
         return output ? `${session.displayName} 最近输出：\n${output.slice(-3_500)}` : `${session.displayName} 暂无终端输出。`
       }
       case '/workspace': return this.workspaceActivity(args)
@@ -232,6 +230,10 @@ export class DingTalkCommandRouter {
     this.sending.add(sessionId)
     try {
       check()
+      if (this.manager.sendMessage) {
+        await this.manager.sendMessage(sessionId, content)
+        return
+      }
       await this.manager.write(sessionId, content)
       await wait(TERMINAL_SUBMIT_DELAY_MS)
       // A new approval must not consume the Enter intended for a chat message.

@@ -7,6 +7,27 @@ import { sessionDisplayStatus, parseSessionDisplayStatus } from '../../src/share
 import type { SessionSummary } from '../../src/shared/manager-api'
 
 describe('native task activity', () => {
+  it('treats a failed task_complete as an error so overnight recovery uses backoff', () => {
+    expect(parseNativeActivity('codex', { timestamp: 1000, type: 'event_msg',
+      payload: { type: 'task_complete', error: { message: 'retries exhausted' } } }, 'native-one'))
+      .toEqual({ timestamp: 1000, activity: 'error', error: 'retries exhausted' })
+  })
+  it('extracts assistant output without mistaking user prompts or commentary for completion', () => {
+    const event = { timestamp: 1000, type: 'event_msg', payload: { type: 'task_complete', last_agent_message: 'TASK-DONE' } }
+    expect(parseNativeActivity('codex', event, 'native-one')?.assistantMessage?.text).toBe('TASK-DONE')
+    expect(parseNativeActivity('codex', { ...event, payload: { type: 'user_message', message: 'continue TASK-DONE' } }, 'native-one')?.assistantMessage).toBeUndefined()
+    expect(parseNativeActivity('codex', { timestamp: 1000, type: 'response_item',
+      payload: { type: 'message', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: 'TASK-DONE' }] } }, 'native-one')).toBeUndefined()
+  })
+  it('only exposes real parent user messages as delivery receipts', () => {
+    const codex = { timestamp: 1000, type: 'event_msg', payload: { type: 'user_message', message: 'continue' } }
+    expect(parseNativeActivity('codex', codex, 'native-one')?.userMessage).toEqual({ text: 'continue', timestamp: 1000 })
+    const claude = { timestamp: 1000, type: 'user', message: { content: [{ type: 'text', text: 'continue' }] } }
+    expect(parseNativeActivity('claude', claude, 'native-one')?.userMessage?.text).toBe('continue')
+    expect(parseNativeActivity('claude', { ...claude, isSidechain: true }, 'native-one')).toBeUndefined()
+    expect(parseNativeActivity('claude', { ...claude, isMeta: true }, 'native-one')).toBeUndefined()
+    expect(parseNativeActivity('claude', { ...claude, message: { content: [{ type: 'tool_result', content: 'continue' }] } }, 'native-one')?.userMessage).toBeUndefined()
+  })
   it.each([
     ['task_started', 'running'], ['task_complete', 'completed'], ['turn_aborted', 'idle'],
   ])('maps Codex %s to %s', (type, activity) => {

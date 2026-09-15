@@ -59,6 +59,8 @@ describe('App terminal wall', () => {
       platform: 'win32',
       listSessions: vi.fn(async () => [session]), startSession: vi.fn(async (request) => ({ ...session, displayName: request.displayName, agentKind: request.agentKind, workspace: request.workspace })), write: vi.fn(), resize: vi.fn(),
       terminalReplay: vi.fn(async () => ({ data: '', sequence: 0 })),
+      openDeepSeekWeb: vi.fn(async () => undefined),
+      openExternalWeb: vi.fn(async () => undefined),
       listAuditEntries: vi.fn(async () => []),
       exportAuditEntries: vi.fn(async () => undefined),
       listPendingApprovals: vi.fn(async () => []), approveRequest: vi.fn(), approveAndRememberRequest: vi.fn(), rejectRequest: vi.fn(),
@@ -163,12 +165,12 @@ describe('App terminal wall', () => {
     expect(terminalMocks.scrollToBottom).not.toHaveBeenCalled()
   })
 
-  it('keeps DeepSeek lightweight in overview and embeds its official Web UI in detail', async () => {
+  it('opens DeepSeek in an authenticated top-level window, never an iframe', async () => {
     vi.mocked(api.listSessions).mockResolvedValue([{
       ...session,
       agentKind: 'deepseek',
       displayName: 'DeepSeek Harness',
-      webUrl: 'http://127.0.0.1:43127',
+      webUrl: 'http://127.0.0.1:43127/?token=demo-test-token',
     }])
     render(<App />)
     const tile = await screen.findByTestId('terminal-tile-session-1')
@@ -177,8 +179,13 @@ describe('App terminal wall', () => {
     expect(Terminal).not.toHaveBeenCalled()
 
     fireEvent.click(within(tile).getByRole('button', { name: '打开完整界面' }))
-    const frame = await screen.findByTitle('DeepSeek Harness · DeepSeek Harness')
-    expect(frame).toHaveAttribute('src', 'http://127.0.0.1:43127')
+    await waitFor(() => expect(api.openDeepSeekWeb).toHaveBeenCalledWith('session-1'))
+    expect(tile.querySelector('iframe')).toBeNull()
+    expect(document.body.textContent).toContain('demo-test-token')
+    fireEvent.click(within(tile).getByRole('button', { name: '浏览器打开' }))
+    expect(api.openExternalWeb).toHaveBeenCalledWith('http://127.0.0.1:43127/?token=demo-test-token')
+    fireEvent.click(within(tile).getByRole('button', { name: '复制完整地址' }))
+    expect(api.writeClipboardText).toHaveBeenCalledWith('http://127.0.0.1:43127/?token=demo-test-token')
     expect(Terminal).not.toHaveBeenCalled()
   })
 
@@ -474,7 +481,7 @@ describe('App terminal wall', () => {
     const dialog = screen.getByRole('dialog', { name: '开启全自动模式' })
     const enable = within(dialog).getByRole('button', { name: '开启全自动模式' })
     expect(enable).toBeDisabled()
-    fireEvent.click(within(dialog).getByRole('checkbox'))
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: /允许此 Agent 自动执行普通操作/ }))
     expect(enable).toBeEnabled()
     fireEvent.click(enable)
     await waitFor(() => expect(api.setFullAutoMode).toHaveBeenCalledWith('session-1', true))
@@ -620,8 +627,8 @@ describe('App terminal wall', () => {
     expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({
       agentKind: 'deepseek',
       executable: 'dsh',
-      args: ['web', '--host', '127.0.0.1', '--port', '0'],
-      recovery: { executable: 'dsh', args: ['web', '--host', '127.0.0.1', '--port', '0'] },
+      args: ['web', '--host', '127.0.0.1', '--port', '0', '--no-open'],
+      recovery: { executable: 'dsh', args: ['web', '--host', '127.0.0.1', '--port', '0', '--no-open'] },
     }))
   })
 
@@ -724,6 +731,67 @@ describe('App terminal wall', () => {
       providerId: 'cc-provider-1',
       providerName: 'Team Gateway',
     })
+  })
+
+  it('keeps unsupported CCSwitch feedback visible after enabling independent configuration', async () => {
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: /新建 Agent/ }))
+    fireEvent.change(screen.getByLabelText('Agent 类型'), { target: { value: 'deepseek' } })
+    fireEvent.click(screen.getByRole('button', { name: '独立配置' }))
+    fireEvent.click(screen.getByRole('switch', { name: '启用独立配置' }))
+    fireEvent.click(screen.getByRole('button', { name: /CCSwitch 只读选择本机 Provider/ }))
+    expect(await screen.findByText(/CCSwitch 当前仅支持 Codex 和 Claude Code/)).toBeInTheDocument()
+    expect(api.listCCSwitchProviders).not.toHaveBeenCalled()
+  })
+
+  it.each(['codex', 'claude', 'deepseek', 'pi'] as const)('updates installed %s and refreshes its version', async (kind) => {
+    vi.mocked(api.detectAgentEnvironment!).mockImplementation(async (agentKind, executable) => ({
+      agentKind, executable, nodeAvailable: true, npmAvailable: true,
+      agentInstalled: true, executableVersion: '1.0.0', ripgrepAvailable: true,
+    }))
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: /新建 Agent/ }))
+    fireEvent.change(screen.getByLabelText('Agent 类型'), { target: { value: kind } })
+    fireEvent.click(await screen.findByRole('button', { name: '一键更新 Agent CLI' }))
+    await waitFor(() => expect(api.installAgent).toHaveBeenCalledWith(kind, 'configured', 'update'))
+    expect(await screen.findByText('npm 全局包更新成功，正在重新检测当前 CLI 版本。')).toBeInTheDocument()
+    await waitFor(() => expect(vi.mocked(api.detectAgentEnvironment!).mock.calls.filter(call => call[0] === kind).length).toBeGreaterThanOrEqual(2))
+    expect(api.stopSession).not.toHaveBeenCalled()
+    expect(api.restartSession).not.toHaveBeenCalled()
+  })
+
+  it('retains an update error and permits retry without changing the session', async () => {
+    vi.mocked(api.installAgent!).mockRejectedValueOnce(new Error('请先停止正在运行的同类型 Agent'))
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: /新建 Agent/ }))
+    fireEvent.click(await screen.findByRole('button', { name: '一键更新 Agent CLI' }))
+    expect(await screen.findByText('请先停止正在运行的同类型 Agent')).toBeInTheDocument()
+    expect(screen.getByText('更新失败')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '一键更新 Agent CLI' })).toBeEnabled()
+    expect(api.stopSession).not.toHaveBeenCalled()
+  })
+
+  it('ignores a late Codex provider response after switching to Claude', async () => {
+    let finishCodex!: (providers: Awaited<ReturnType<AgentManagerApi['listCCSwitchProviders']>>) => void
+    vi.mocked(api.listCCSwitchProviders).mockImplementation((kind) => kind === 'codex'
+      ? new Promise((resolve) => { finishCodex = resolve })
+      : Promise.resolve([{ id: 'claude-provider', name: 'Claude Gateway', agentKind: 'claude',
+        baseUrl: 'https://claude.example', hasApiKey: true, isCurrent: true }]))
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: /新建 Agent/ }))
+    fireEvent.click(screen.getByRole('button', { name: '独立配置' }))
+    fireEvent.click(screen.getByRole('switch', { name: '启用独立配置' }))
+    fireEvent.click(screen.getByRole('button', { name: /CCSwitch 只读选择本机 Provider/ }))
+    fireEvent.change(screen.getByLabelText('Agent 类型'), { target: { value: 'claude' } })
+    expect(await screen.findByText('Claude Gateway')).toBeInTheDocument()
+    await act(async () => { finishCodex([{ id: 'codex-provider', name: 'Old Codex Gateway', agentKind: 'codex',
+      baseUrl: 'https://codex.example', hasApiKey: true, isCurrent: true }]) })
+    expect(screen.queryByText('Old Codex Gateway')).not.toBeInTheDocument()
+    expect(screen.getByText('Claude Gateway')).toBeInTheDocument()
   })
 
   it('pastes clipboard text without forwarding Ctrl+V and copies a terminal selection', async () => {

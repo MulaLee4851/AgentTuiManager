@@ -15,3 +15,5 @@ docs/
 *.patch
 AGENTS.md
 bug.md
+__pycache__/
+*.py[cod]

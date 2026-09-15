@@ -1,6 +1,8 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import TerminalTile from './TerminalTile'
+import UnattendedControls from './UnattendedControls'
+import { useStoppedSessionGrace } from './useStoppedSessionGrace'
 import { SESSION_STATUS_LABEL, sessionDisplayStatus, type SessionDisplayStatus } from './shared/session-state'
 import ApprovalRulesDialog from './ApprovalRulesDialog'
 import ContinueKeywordDialog from './ContinueKeywordDialog'
@@ -18,7 +20,7 @@ import deepseekLogoUrl from '../logo/deepseek.svg'
 
 import SessionStatusFilter, { normalizeStatusFilter } from './SessionStatusFilter'
 const AGENT_LOGO_URLS: Partial<Record<AgentKind, string>> = { codex: codexLogoUrl, claude: claudeLogoUrl, deepseek: deepseekLogoUrl }
-const DEEPSEEK_WEB_ARGS = ['web', '--host', '127.0.0.1', '--port', '0']
+const DEEPSEEK_WEB_ARGS = ['web', '--host', '127.0.0.1', '--port', '0', '--no-open']
 function AgentLogo({ kind, className = '', label }: { kind: AgentKind; className?: string; label?: string }): JSX.Element {
   const source = AGENT_LOGO_URLS[kind]
   return source ? <img className={className} src={source} alt={label ?? (kind === 'claude' ? 'Claude Code' : kind === 'deepseek' ? 'DeepSeek Harness' : 'Codex')} /> : <span className={className}>{kind === 'pi' ? 'Pi' : kind === 'generic' ? '›_' : 'C'}</span>
@@ -42,6 +44,7 @@ function FullAutoDialog({ session, onClose, onChanged }: { session: SessionSumma
     <header><div><p className={enabling ? 'detail-kicker delete' : 'detail-kicker read'}>{enabling ? '高风险模式' : '当前已开启'}</p><h2 id='full-auto-title'>{enabling ? '开启全自动模式' : '关闭全自动模式'}</h2></div></header>
     <div className='full-auto-dialog-body'><p>仅对 <strong>{session.displayName}</strong> 生效。适合你暂时离开、但仍希望 Agent 连续工作的场景。</p>
       {enabling ? <><div className='full-auto-warning'><strong>除删除和严重危险命令外，其他工具请求都会自动批准</strong><span>操作将直接执行，也可能修改工作区外内容。请先确认 Agent 当前任务和运行环境无误。</span></div><ul><li>删除操作始终需要逐次人工批准</li><li>递归强制删除、提权、下载后执行、敏感文件覆盖和系统破坏命令会被拦截</li><li>Shell 工具未提供完整命令参数时不会自动放行</li><li>每次自动批准和拦截都会写入审计</li></ul><label className='full-auto-confirm'><input type='checkbox' checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />我了解风险，并确认暂时离开期间允许此 Agent 自动执行普通操作</label></> : <div className='full-auto-safe-note'>关闭后，后续没有命中安全规则的请求会重新进入处理中心。已经执行的操作不会撤销。</div>}
+      <UnattendedControls session={session} onChanged={onChanged} />
       {error && <p className='form-error'>{error}</p>}
     </div><footer><button className='button-secondary' type='button' onClick={onClose}>取消</button><button className={enabling ? 'button-danger full-auto-confirm-button' : 'button-primary'} type='button' disabled={busy || (enabling && !confirmed)} onClick={() => { void submit() }}>{busy ? '请稍后…' : enabling ? '开启全自动模式' : '关闭全自动模式'}</button></footer>
   </section></div>
@@ -149,6 +152,7 @@ interface AgentEnvironmentView {
 }
 
 interface AgentInstallView {
+  operation?: 'install' | 'update'
   busy: boolean
   progress?: AgentInstallProgress
   messages: Array<{ text: string; level: 'info' | 'warning' | 'error' }>
@@ -174,6 +178,8 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
   const [proxyPassword, setProxyPassword] = useState('')
   const [ccSwitchProviders, setCCSwitchProviders] = useState<CCSwitchProviderSummary[]>([])
   const [ccSwitchProviderId, setCCSwitchProviderId] = useState('')
+  const ccSwitchRequest = useRef(0)
+  useEffect(() => () => { ccSwitchRequest.current += 1 }, [])
   const [ccSwitchLoading, setCCSwitchLoading] = useState(false)
   const [ccSwitchError, setCCSwitchError] = useState('')
   const [nativeSessions, setNativeSessions] = useState<NativeSessionSummary[]>([])
@@ -191,6 +197,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
   const environmentState = environmentMatches ? environmentView?.state ?? 'idle' : 'idle'
   const environmentError = environmentMatches ? environmentView?.error ?? '' : ''
   const installView = installViews[agentKind]
+  const installVerb = installView?.operation === 'update' ? '更新' : '安装'
   const environmentBusy = installView?.busy ?? false
   const installProgress = installView?.progress
   const installMessages = installView?.messages ?? []
@@ -218,6 +225,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
       return {
         ...current,
         [owner]: {
+          ...previous,
           busy: progress.phase !== 'completed' && progress.phase !== 'failed',
           progress,
           messages,
@@ -279,9 +287,11 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
   }
 
   const loadCCSwitchProviders = async (kind = agentKind): Promise<void> => {
+    const request = ++ccSwitchRequest.current
+    const selectedId = kind === agentKind ? ccSwitchProviderId : ''
+    setCCSwitchProviders([]); setCCSwitchProviderId('')
     setCCSwitchLoading(true); setCCSwitchError('')
     if (kind !== 'codex' && kind !== 'claude') {
-      setConfigSource('custom')
       setCCSwitchProviders([]); setCCSwitchProviderId(''); setCCSwitchLoading(false)
       setCCSwitchError('CCSwitch 当前仅支持 Codex 和 Claude Code')
       return
@@ -289,17 +299,22 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
     try {
       if (typeof window.agentManager.listCCSwitchProviders !== 'function') throw new Error('CCSwitch 功能需要重启 Manager 后启用')
       const providers = await window.agentManager.listCCSwitchProviders(kind)
+      if (request !== ccSwitchRequest.current) return
       setCCSwitchProviders(providers)
-      setCCSwitchProviderId((current) => providers.some((item) => item.id === current) ? current : providers.find((item) => item.isCurrent && !item.issue)?.id ?? '')
+      setCCSwitchProviderId(providers.find((item) => item.id === selectedId && !item.issue)?.id
+        ?? providers.find((item) => item.isCurrent && !item.issue)?.id ?? '')
     } catch (reason) {
+      if (request !== ccSwitchRequest.current) return
       setCCSwitchProviders([])
       setCCSwitchError(reason instanceof Error ? reason.message : String(reason))
     } finally {
-      setCCSwitchLoading(false)
+      if (request === ccSwitchRequest.current) setCCSwitchLoading(false)
     }
   }
 
   const changeKind = (kind: AgentKind): void => {
+    ccSwitchRequest.current += 1
+    setCCSwitchProviders([]); setCCSwitchProviderId(''); setCCSwitchLoading(false)
     setAgentKind(kind)
     setExecutable(defaultExecutable(kind))
     setArgs(kind === 'deepseek' ? DEEPSEEK_WEB_ARGS.join('\n') : '')
@@ -347,11 +362,11 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
     return () => clearTimeout(timer)
   }, [agentKind, executable, open])
 
-  const beginInstall = (kind: AgentKind): void => {
+  const beginInstall = (kind: AgentKind, operation: 'install' | 'update' = 'install'): void => {
     installOwner.current = kind
     setInstallViews((current) => ({
       ...current,
-      [kind]: { busy: true, messages: [] },
+      [kind]: { busy: true, messages: [], operation },
     }))
   }
 
@@ -366,7 +381,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
       const messages = previous.messages.at(-1)?.text === message
         ? previous.messages
         : [...previous.messages, { text: message, level }].slice(-8)
-      return { ...current, [kind]: { busy: false, progress: { ...progress, elapsedMs: progress.elapsedMs || previous.progress?.elapsedMs || 0 }, messages } }
+      return { ...current, [kind]: { ...previous, busy: false, progress: { ...progress, elapsedMs: progress.elapsedMs || previous.progress?.elapsedMs || 0 }, messages } }
     })
     if (installOwner.current === kind) installOwner.current = undefined
   }
@@ -388,15 +403,17 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
     }
   }
 
-  const installSelectedAgent = async (): Promise<void> => {
-    if (typeof window.agentManager.installAgent !== 'function' || anyEnvironmentBusy) return
+  const installSelectedAgent = async (operation: 'install' | 'update' = 'install'): Promise<void> => {
+    if (typeof window.agentManager.installAgent !== 'function' || anyEnvironmentBusy || installOwner.current) return
     const kind = agentKind
     const candidate = executable.trim()
-    beginInstall(kind)
+    beginInstall(kind, operation)
+    const verb = operation === 'update' ? '更新' : '安装'
     try {
-      await window.agentManager.installAgent(kind, npmRegistry)
-      const progress: AgentInstallProgress = { target: 'agent', agentKind: kind, phase: 'completed', elapsedMs: installViews[kind]?.progress?.elapsedMs ?? 0, message: 'Agent CLI 安装成功', level: 'info' }
-      finishInstall(kind, progress, 'Agent CLI 安装成功，可以创建 Agent。', 'info')
+      if (operation === 'update') await window.agentManager.installAgent(kind, npmRegistry, operation)
+      else await window.agentManager.installAgent(kind, npmRegistry)
+      const progress: AgentInstallProgress = { target: 'agent', agentKind: kind, phase: 'completed', elapsedMs: installViews[kind]?.progress?.elapsedMs ?? 0, message: 'Agent CLI ' + verb + '成功', level: 'info' }
+      finishInstall(kind, progress, operation === 'update' ? 'npm 全局包更新成功，正在重新检测当前 CLI 版本。' : 'Agent CLI 安装成功，可以创建 Agent。', 'info')
       await detectEnvironment(kind, candidate)
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason)
@@ -558,12 +575,12 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
                {agentKind === 'pi' && <span className={environment.ripgrepAvailable ? 'ok' : 'bad'}>● ripgrep　{environment.ripgrepVersion ?? '未安装'}</span>}
              </div>}
              {environmentState === 'ready' && environment && (!environment.nodeAvailable || !environment.npmAvailable) && <div className='launcher-environment-install'><span>{agentKind === 'deepseek' && environment.nodeVersion ? 'DeepSeek Harness 需要 Node.js 22.19+ 或 24+，请升级 Node.js/npm。' : '需要先安装 Node.js/npm。'}</span><button type='button' className='button-secondary mini-button' disabled={anyEnvironmentBusy} onClick={() => { void installNode() }}>{environmentBusy ? '安装中…' : otherEnvironmentBusy ? '其他 Agent 安装中…' : '一键安装 Node.js/npm'}</button></div>}
-             {environmentState === 'ready' && environment?.npmAvailable && !environment.agentInstalled && <div className='launcher-environment-install launcher-environment-install-agent'><span>未检测到 Agent CLI，暂时不能创建。</span><label>安装源<select className='launcher-field' aria-label='npm 安装源' disabled={anyEnvironmentBusy} value={npmRegistry} onChange={(event) => setNpmRegistry(event.target.value as NpmRegistryChoice)}><option value='configured'>跟随本机 npm 配置</option><option value='npmmirror'>npmmirror（国内）</option><option value='tencent'>腾讯云（国内）</option><option value='huawei'>华为云（国内）</option><option value='official'>npm 官方源</option></select></label><button type='button' className='button-secondary mini-button' disabled={anyEnvironmentBusy} onClick={() => { void installSelectedAgent() }}>{environmentBusy ? '安装中…' : otherEnvironmentBusy ? '其他 Agent 安装中…' : '一键安装 Agent CLI'}</button></div>}
+             {environmentState === 'ready' && environment?.npmAvailable && <div className='launcher-environment-install launcher-environment-install-agent'><span>{environment.agentInstalled ? '更新 npm 全局安装的 CLI；请先停止同类型 Agent。自定义路径或其他安装渠道请使用原渠道更新。' : '未检测到 Agent CLI，暂时不能创建。'}</span><label>安装源<select className='launcher-field' aria-label='npm 安装源' disabled={anyEnvironmentBusy} value={npmRegistry} onChange={(event) => setNpmRegistry(event.target.value as NpmRegistryChoice)}><option value='configured'>跟随本机 npm 配置</option><option value='npmmirror'>npmmirror（国内）</option><option value='tencent'>腾讯云（国内）</option><option value='huawei'>华为云（国内）</option><option value='official'>npm 官方源</option></select></label><button type='button' className='button-secondary mini-button' disabled={anyEnvironmentBusy} onClick={() => { void installSelectedAgent(environment.agentInstalled ? 'update' : 'install') }}>{environmentBusy ? installVerb + '中…' : otherEnvironmentBusy ? '其他 Agent 安装/更新中…' : environment.agentInstalled ? '一键更新 Agent CLI' : '一键安装 Agent CLI'}</button></div>}
              {agentKind === 'pi' && environmentState === 'ready' && environment?.agentInstalled && !environment.ripgrepAvailable && <div className='launcher-environment-install'><span>Pi 缺少 ripgrep，启动时会重复尝试从 GitHub 下载。</span><button type='button' className='button-secondary mini-button' disabled={anyEnvironmentBusy} onClick={() => { void installPiRipgrep() }}>{environmentBusy ? '安装中…' : otherEnvironmentBusy ? '其他 Agent 安装中…' : '一键安装 ripgrep'}</button></div>}
              {(environmentBusy || installProgress) && <div className={`launcher-install-progress phase-${installProgress?.phase ?? 'starting'}`}>
-               <div className='launcher-install-progress-head'><strong>{installProgress?.phase === 'completed' ? '安装完成' : installProgress?.phase === 'failed' ? '安装失败' : '正在安装'}</strong><time>{Math.floor((installProgress?.elapsedMs ?? 0) / 60_000).toString().padStart(2, '0')}:{Math.floor(((installProgress?.elapsedMs ?? 0) % 60_000) / 1_000).toString().padStart(2, '0')}</time></div>
+               <div className='launcher-install-progress-head'><strong>{installProgress?.phase === 'completed' ? installVerb + '完成' : installProgress?.phase === 'failed' ? installVerb + '失败' : '正在' + installVerb}</strong><time>{Math.floor((installProgress?.elapsedMs ?? 0) / 60_000).toString().padStart(2, '0')}:{Math.floor(((installProgress?.elapsedMs ?? 0) % 60_000) / 1_000).toString().padStart(2, '0')}</time></div>
                <div className='launcher-install-pulse' aria-hidden='true'><span /></div>
-               <div className='launcher-install-output'>{installMessages.length ? installMessages.map((item, index) => <span key={`${index}-${item.text}`} className={item.level}>{item.text}</span>) : <span>正在等待安装程序输出…</span>}</div>
+               <div className='launcher-install-output'>{installMessages.length ? installMessages.map((item, index) => <span key={`${index}-${item.text}`} className={item.level}>{item.text}</span>) : <span>正在等待{installVerb}程序输出…</span>}</div>
              </div>}
              {environmentState === 'ready' && environment?.nodeAvailable && environment.npmAvailable && environment.agentInstalled && <p className='launcher-state success'>环境已就绪，可以创建 Agent。</p>}
            </div>}
@@ -674,7 +691,6 @@ function EditAgentForm({ open, session, onClose, onSaved }: { open: boolean; ses
   const loadCCSwitchProviders = async (): Promise<void> => {
     setCCSwitchLoading(true); setCCSwitchError('')
     if (session.agentKind !== 'codex' && session.agentKind !== 'claude') {
-      setConfigSource('custom')
       setCCSwitchProviders([]); setCCSwitchLoading(false)
       setCCSwitchError('CCSwitch 当前仅支持 Codex 和 Claude Code')
       return
@@ -967,8 +983,10 @@ export default function App(): JSX.Element {
   }, [closeOtherOverlays, externalDrag?.phase, externalDrag?.transactionId])
   const visibleSessions = useMemo(() => orderedSessions.filter((session) => currentWorkspace && workspaceKey(session.workspace) === workspaceKey(currentWorkspace)), [currentWorkspace, orderedSessions])
   const scopedSessions = groupByWorkspace ? visibleSessions : orderedSessions
+  const stoppedGrace = useStoppedSessionGrace(sessions)
   const overviewSessions = useMemo(() => scopedSessions.filter((session) => statusFilter.length === 0
-    || statusFilter.includes(sessionDisplayStatus(session))), [scopedSessions, statusFilter])
+    || statusFilter.includes(sessionDisplayStatus(session))
+    || (stoppedGrace.has(session.sessionId) && statusFilter.includes(stoppedGrace.get(session.sessionId)!))), [scopedSessions, statusFilter, stoppedGrace])
   const overviewSessionIds = useMemo(() => new Set(overviewSessions.map((session) => session.sessionId)), [overviewSessions])
   const listSessions = overviewSessions
   const activeListSessionId = listSessions.some((session) => session.sessionId === listActiveId) ? listActiveId : listSessions[0]?.sessionId
@@ -1040,7 +1058,7 @@ export default function App(): JSX.Element {
         <button type='button' className='button-secondary' onClick={() => setSelectedId(undefined)} aria-label='返回总览'>← 返回总览</button>
         <strong>{selected.displayName}</strong>
         <span>{selected.agentKind.toUpperCase()} · {selected.workspace}</span>
-        <div className='topbar-spacer' /><button type='button' className={'full-auto-toolbar-button' + (selected.fullAutoEnabled ? ' active' : '')} onClick={() => openFullAuto(selected.sessionId)}>{selected.fullAutoEnabled ? '全自动中' : '全自动模式'}</button><button type='button' className='button-secondary button-compact' onClick={() => openAgentEditor(selected.sessionId)}>编辑 Agent</button>
+        <div className='topbar-spacer' /><button type='button' className={'full-auto-toolbar-button' + (selected.fullAutoEnabled || selected.unattended?.enabled ? ' active' : '')} onClick={() => openFullAuto(selected.sessionId)}>{selected.unattended?.enabled ? '无监管中' : selected.fullAutoEnabled ? '全自动中' : '全自动模式'}</button><button type='button' className='button-secondary button-compact' onClick={() => openAgentEditor(selected.sessionId)}>编辑 Agent</button>
       </div> : <header className='topbar'>
         <div className='brand-block'><img src={managerLogoUrl} alt='Agent TUI Manager' /></div>
         <div className='app-title'><strong>Agent TUI Manager</strong><small title={groupByWorkspace ? currentWorkspace : '全部工作区'}>{groupByWorkspace ? currentWorkspace ?? '尚未选择工作区' : '全部工作区'}</small></div>

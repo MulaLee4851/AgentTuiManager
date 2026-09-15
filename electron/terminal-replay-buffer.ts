@@ -59,6 +59,17 @@ export class TerminalReplayBuffer {
     return this.chunks.slice(this.head).join('')
   }
 
+  tail(maxCharacters: number): string {
+    const parts: string[] = []
+    let remaining = maxCharacters
+    for (let i = this.chunks.length - 1; i >= this.head && remaining > 0; i--) {
+      const part = this.chunks[i]!.slice(-remaining)
+      parts.push(part)
+      remaining -= part.length
+    }
+    return parts.reverse().join('')
+  }
+
   get length(): number {
     return this.endOffset - this.startOffset
   }

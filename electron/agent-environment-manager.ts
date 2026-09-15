@@ -289,16 +289,41 @@ export async function installNodeAndNpm(onProgress?: ProgressListener): Promise<
   }
 }
 
-export async function installAgent(agentKind: AgentKind, registry: NpmRegistryChoice = 'configured', onProgress?: ProgressListener): Promise<void> {
-  const packageName = packageForAgent(agentKind)
+let agentInstallInFlight = false
+
+export async function installAgent(agentKind: AgentKind, registry: NpmRegistryChoice = 'configured', onProgress?: ProgressListener, operation: 'install' | 'update' = 'install'): Promise<void> {
+  if (agentInstallInFlight) throw new Error('已有 Agent 正在安装或更新，请等待完成后重试。')
+  agentInstallInFlight = true
+  try {
+    await runAgentInstallation(agentKind, registry, operation === 'update'
+      ? progress => onProgress?.({ ...progress, message: progress.message?.replaceAll('安装', '更新') })
+      : onProgress, operation)
+  } catch (error) {
+    if (operation === 'update') throw new Error((error instanceof Error ? error.message : String(error)).replaceAll('安装', '更新'))
+    throw error
+  } finally { agentInstallInFlight = false }
+}
+
+export function updatePackageForAgent(agentKind: AgentKind): string | undefined {
+  const name = packageForAgent(agentKind)
+  return name ? (agentKind === 'pi' ? name : name + '@latest') : undefined
+}
+
+async function runAgentInstallation(agentKind: AgentKind, registry: NpmRegistryChoice, onProgress: ProgressListener | undefined, operation: 'install' | 'update'): Promise<void> {
+  const packageName = operation === 'update' ? updatePackageForAgent(agentKind) : packageForAgent(agentKind)
   if (!packageName) throw new Error('当前 Agent 类型不支持一键安装')
   const npm = commandCandidates('npm')[0] ?? (process.platform === 'win32' ? 'npm.cmd' : 'npm')
   const selectedRegistry = registryUrl(registry)
-  const environment = process.platform === 'darwin' ? environmentWithFreshPath() : undefined
+  // Node may have been installed after Manager started. Refresh the child PATH
+  // on Windows as well as macOS; never require a Manager restart to find npm.
+  const environment = environmentWithFreshPath()
   let installerExecutable = npm
   let installerPrefix: string[] = []
   let temporaryDirectory: string | undefined
   try {
+    if (process.platform === 'win32') {
+      installerExecutable = resolveExecutableForPty('npm', { path: pathFromEnvironment(environment) })
+    }
     const npmVersion = process.platform === 'darwin' ? await version(npm, ['--version'], environment) : undefined
     if (needsMacNpmCompatibility(npmVersion)) {
       onProgress?.({ phase: 'running', elapsedMs: 0, message: `npm ${npmVersion} 安装器不稳定，正在准备兼容 npm ${MAC_NPM_COMPAT_VERSION}…`, level: 'info' })

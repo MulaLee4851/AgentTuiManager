@@ -4,6 +4,8 @@ import { Terminal } from '@xterm/xterm'
 import type { SessionSummary } from './shared/manager-api'
 import { SESSION_STATUS_LABEL, sessionDisplayStatus } from './shared/session-state'
 import { TerminalWriteWatchdog } from './terminal-write-watchdog'
+import DeepSeekStartupOutput from './DeepSeekStartupOutput'
+import { deepSeekWebUrl as validateDeepSeekWebUrl } from './shared/deepseek-web-url'
 import codexLogoUrl from '../logo/codex.png'
 import claudeLogoUrl from '../logo/claudecode.png'
 import deepseekLogoUrl from '../logo/deepseek.svg'
@@ -106,7 +108,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
   statusRef.current = session.status
   const terminalEnded = session.status === 'completed' || session.status === 'stopped' || session.status === 'failed'
   const deepSeekWeb = session.agentKind === 'deepseek'
-  const deepSeekWebUrl = session.webUrl && /^http:\/\/127\.0\.0\.1:\d+\/?$/.test(session.webUrl) ? session.webUrl : undefined
+  const deepSeekWebUrl = validateDeepSeekWebUrl(session.webUrl)
 
   useEffect(() => {
     if (terminalEnded || deepSeekWeb) return
@@ -130,6 +132,12 @@ export default function TerminalTile({ session, detail = false, embedded = false
       // session really is that long.
       scrollback: 30_000,
       theme: NATIVE_TERMINAL_THEME,
+      linkHandler: {
+        activate: (_event, url) => {
+          void window.agentManager.openExternalWeb(url)
+            .catch(() => setActionError('无法打开链接，仅支持 HTTP/HTTPS 网页。'))
+        },
+      },
     })
     terminal.open(host)
     let pendingOutput = ''
@@ -138,6 +146,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
     let outputBeforeReplay: Array<{ data: string; sequence?: number }> = []
     let outputFrame = 0
     let writeInFlight = false
+    let resizeAfterWrite = false
     let resizeRedrawActive = false
     let resizeRedrawTimer: ReturnType<typeof setTimeout> | undefined
     let resizeCoverFailsafeTimer: ReturnType<typeof setTimeout> | undefined
@@ -221,6 +230,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
       resizeRedrawTimer = setTimeout(flushOutput, Math.min(140, remaining))
     }
     const flushOutput = (): void => {
+      if (disposed) return
       outputFrame = 0
       if (resizeRedrawTimer) {
         clearTimeout(resizeRedrawTimer)
@@ -255,13 +265,19 @@ export default function TerminalTile({ session, detail = false, embedded = false
           requestAnimationFrame(() => requestAnimationFrame(hideResizeCover))
         }
         if (pendingOutput && !outputFrame) outputFrame = requestAnimationFrame(flushOutput)
+        if (resizeAfterWrite || synchronizedResizeRedraw) {
+          resizeAfterWrite = false
+          scheduleResize()
+        }
       }, () => {
         // A timed-out write may still finish later. Repaint and restore only an explicit
         // user scroll lock; never release the current generation's latch from here.
         restoreUserScroll()
         terminal.refresh(0, Math.max(0, terminal.rows - 1))
       })
-      terminal.write(synchronizedResizeRedraw ? `\x1b[?2026h${output}\x1b[?2026l` : output, completeWrite)
+      // Never inject escape sequences at transport chunk boundaries: output may
+      // end halfway through a CSI/OSC command. The visual cover hides resize frames.
+      terminal.write(output, completeWrite)
     }
     const flushTerminalInput = (): void => {
       inputFrame = 0
@@ -435,6 +451,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
       }
     })
     void window.agentManager.terminalReplay(session.sessionId).then((snapshot) => {
+      if (disposed) return
       pendingOutput += preserveLatestReplayScrollback(snapshot.data)
       for (const event of outputBeforeReplay) {
         if (event.sequence === undefined || event.sequence > snapshot.sequence) {
@@ -447,8 +464,10 @@ export default function TerminalTile({ session, detail = false, embedded = false
       else {
         initialReplayLoading = false
         hideResizeCover()
+        scheduleResize()
       }
     }).catch(() => {
+      if (disposed) return
       for (const event of outputBeforeReplay) pendingOutput += event.data
       outputBeforeReplay = []
       replayLoaded = true
@@ -456,26 +475,34 @@ export default function TerminalTile({ session, detail = false, embedded = false
       else {
         initialReplayLoading = false
         hideResizeCover()
+        scheduleResize()
       }
     })
     let resizeFrame = 0
     let ptyResizeTimer: ReturnType<typeof setTimeout> | undefined
-    let lastSentCols = STABLE_TERMINAL_COLS
-    let lastSentRows = STABLE_TERMINAL_ROWS
+    let lastSentCols: number | undefined
+    let lastSentRows: number | undefined
     const sendPtyResize = (cols: number, rows: number): void => {
-      if (ptyResizeTimer) clearTimeout(ptyResizeTimer)
-      // Agents reflow their whole TUI on SIGWINCH, so only tell the PTY once the
-      // drag has settled instead of on every intermediate frame.
-      ptyResizeTimer = setTimeout(() => {
-        ptyResizeTimer = undefined
-        if (disposed || (cols === lastSentCols && rows === lastSentRows)) return
-        lastSentCols = cols
-        lastSentRows = rows
-        void Promise.resolve(window.agentManager.resize(session.sessionId, cols, rows)).catch(() => undefined)
-      }, 180)
+      if (disposed || (cols === lastSentCols && rows === lastSentRows)) return
+      lastSentCols = cols
+      lastSentRows = rows
+      void Promise.resolve(window.agentManager.resize(session.sessionId, cols, rows)).catch(() => {
+        // A failed IPC must not mark dimensions as successfully synchronized.
+        if (lastSentCols === cols && lastSentRows === rows) {
+          lastSentCols = undefined
+          lastSentRows = undefined
+        }
+      })
     }
     const fitTerminal = (): void => {
       if (disposed || !host.isConnected || host.clientWidth === 0 || host.clientHeight === 0) return
+      if (!replayLoaded || initialReplayLoading) return
+      // Drain old-width output before changing the grid. No raw output is discarded.
+      if (writeInFlight || pendingOutput) {
+        resizeAfterWrite = true
+        if (!writeInFlight) flushOutput()
+        return
+      }
       const style = getComputedStyle(host)
       const paddingX = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0)
       const paddingY = (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0)
@@ -498,7 +525,10 @@ export default function TerminalTile({ session, detail = false, embedded = false
       if (!cell) return
       const cols = clamp(Math.floor(availableWidth / cell.width), MIN_TERMINAL_COLS, MAX_TERMINAL_COLS)
       const rows = clamp(Math.floor(availableHeight / cell.height), MIN_TERMINAL_ROWS, MAX_TERMINAL_ROWS)
-      if (cols === terminal.cols && rows === terminal.rows) return
+      if (cols === terminal.cols && rows === terminal.rows) {
+        sendPtyResize(cols, rows)
+        return
+      }
       showResizeCover()
       resizeRedrawActive = true
       resizeRedrawDeadline = performance.now() + 600
@@ -514,7 +544,15 @@ export default function TerminalTile({ session, detail = false, embedded = false
     }
     const scheduleResize = (): void => {
       cancelAnimationFrame(resizeFrame)
-      resizeFrame = requestAnimationFrame(fitTerminal)
+      if (ptyResizeTimer) clearTimeout(ptyResizeTimer)
+      resizeFrame = requestAnimationFrame(() => {
+        // Debounce the grid and PTY together, not just the PTY. Otherwise live
+        // output uses old columns for 180ms while xterm already uses new ones.
+        ptyResizeTimer = setTimeout(() => {
+          ptyResizeTimer = undefined
+          fitTerminal()
+        }, 180)
+      })
     }
     scheduleResize()
     const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(scheduleResize)
@@ -580,7 +618,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
         </div>
         <div className="terminal-actions">
           <span title={session.activityError ?? session.lastError} className={'status-badge status-' + sessionDisplayStatus(session)}>{SESSION_STATUS_LABEL[sessionDisplayStatus(session)]}</span>
-          {!terminalEnded && !deepSeekWeb && onFullAuto && <button className={'full-auto-tile-button' + (session.fullAutoEnabled ? ' active' : '')} type="button" title={session.fullAutoEnabled ? '关闭全自动模式' : '开启全自动模式'} onClick={(event) => { event.stopPropagation(); onFullAuto() }}>{session.fullAutoEnabled ? '全自动中' : '全自动'}</button>}
+          {!terminalEnded && !deepSeekWeb && onFullAuto && <button className={'full-auto-tile-button' + (session.fullAutoEnabled || session.unattended?.enabled ? ' active' : '')} type="button" title={session.unattended?.enabled ? '管理无监管模式' : session.fullAutoEnabled ? '关闭全自动模式' : '开启全自动模式'} onClick={(event) => { event.stopPropagation(); onFullAuto() }}>{session.unattended?.enabled ? '无监管中' : session.fullAutoEnabled ? '全自动中' : '全自动'}</button>}
           {onEdit && <button className="button-ghost" type="button" title="编辑 Agent" onClick={(event) => { event.stopPropagation(); onEdit() }} aria-label={`编辑 ${session.displayName}`}>✎</button>}
           {!detail && !embedded && !terminalEnded && <button className="button-ghost" type="button" onClick={(event) => { event.stopPropagation(); onOpen?.() }} aria-label={`查看 ${session.displayName}`}>⛶</button>}
           {terminalEnded ? <>
@@ -593,14 +631,19 @@ export default function TerminalTile({ session, detail = false, embedded = false
         <div className="terminal-ended-icon">›_</div>
         <strong>{session.status === 'completed' ? 'Agent 已正常完成' : session.status === 'stopped' ? 'Agent 已停止' : 'Agent 运行失败'}</strong>
         <span className={actionError ? 'terminal-ended-error' : undefined}>{actionError || (session.status === 'failed' && session.lastError ? session.lastError : '终端进程已经关闭，可重新启动或从总览删除。')}</span>
+        {deepSeekWeb && <DeepSeekStartupOutput key={session.sessionId} sessionId={session.sessionId} />}
       </div> : deepSeekWeb ? <div className='terminal-surface deepseek-web-surface' onClick={(event) => event.stopPropagation()}>
-        {(detail || embedded) && deepSeekWebUrl
-          ? <iframe src={deepSeekWebUrl} title={session.displayName + ' · DeepSeek Harness'} allow='clipboard-read; clipboard-write' referrerPolicy='no-referrer' />
-          : <div className='deepseek-service-overview'>
+        <div className='deepseek-service-overview'>
             <AgentLogo kind='deepseek' className='deepseek-service-logo' />
-            <div><strong>{deepSeekWebUrl ? 'DeepSeek Harness Web 已就绪' : '正在启动 DeepSeek Harness Web'}</strong><span>{deepSeekWebUrl ?? 'Manager 正在等待官方服务地址…'}</span></div>
-            {!detail && !embedded && <button type='button' className='button-secondary button-compact' disabled={!deepSeekWebUrl} onClick={(event) => { event.stopPropagation(); onOpen?.() }}>打开完整界面</button>}
-          </div>}
+            <div><strong>{deepSeekWebUrl ? 'DeepSeek Harness Web 已就绪' : '正在启动 DeepSeek Harness Web'}</strong><span style={{ overflowWrap: 'anywhere' }}>{deepSeekWebUrl ?? 'Manager 正在等待官方服务地址…'}</span></div>
+            <span>在独立窗口打开官方界面，兼容 Web 登录认证。</span>
+            <button type='button' className='button-secondary button-compact' disabled={!deepSeekWebUrl} onClick={() => runAction(() => window.agentManager.openDeepSeekWeb(session.sessionId))}>打开完整界面</button>
+            <button type='button' className='button-secondary button-compact' disabled={!deepSeekWebUrl} onClick={() => { if (deepSeekWebUrl) runAction(() => window.agentManager.openExternalWeb(deepSeekWebUrl)) }}>浏览器打开</button>
+            <button type='button' className='button-secondary button-compact' disabled={!deepSeekWebUrl} onClick={() => { if (deepSeekWebUrl) runAction(() => window.agentManager.writeClipboardText(deepSeekWebUrl)) }}>复制完整地址</button>
+            {deepSeekWebUrl && <span>地址包含访问凭据，请勿公开分享。</span>}
+            {actionError && <span role='alert'>{actionError}</span>}
+            <DeepSeekStartupOutput key={session.sessionId} sessionId={session.sessionId} />
+          </div>
       </div> : <div
         className="terminal-surface"
         onClick={(event) => event.stopPropagation()}

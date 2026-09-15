@@ -3,9 +3,12 @@ import { describe, expect, it } from 'vitest'
 import {
   CLAUDE_WINDOWS_VT_IDENTITY,
   CODEX_TERMINAL_CAPABILITIES,
-  environmentForAgent,
+  environmentForAgent as createEnvironment,
   MANAGED_TERMINAL_CAPABILITIES,
 } from '../../electron/agent-environment'
+
+const environmentForAgent = (...[kind, source, options]: Parameters<typeof createEnvironment>) =>
+  createEnvironment(kind, source, { registryPaths: [], ...options })
 
 describe('environmentForAgent', () => {
   it('removes parent Codex credentials and orchestration state while preserving user config discovery', () => {
@@ -37,7 +40,7 @@ describe('environmentForAgent', () => {
     expect(environmentForAgent('generic', source)).toEqual(source)
   })
 
-  it('refreshes PATH only for Pi and leaves Codex and Claude untouched', () => {
+  it('refreshes PATH for all managed CLIs without changing the supplied environment', () => {
     const source = { Path: 'C:\\old-bin;C:\\shared', USERPROFILE: 'C:\\Users\\me' }
     const options = {
       platform: 'win32' as const,
@@ -45,8 +48,11 @@ describe('environmentForAgent', () => {
     }
     expect(environmentForAgent('pi', source, options).Path)
       .toBe('C:\\old-bin;C:\\shared;C:\\Users\\me\\new-bin;D:\\machine-bin')
-    expect(environmentForAgent('codex', source, options).Path).toBe(source.Path)
-    expect(environmentForAgent('claude', source, options).Path).toBe(source.Path)
+    for (const kind of ['codex', 'claude', 'deepseek'] as const) {
+      expect(environmentForAgent(kind, source, options).Path)
+        .toBe('C:\\old-bin;C:\\shared;C:\\Users\\me\\new-bin;D:\\machine-bin')
+    }
+    expect(environmentForAgent('generic', source, options).Path).toBe(source.Path)
   })
 
   it('fills terminal capabilities for packaged Explorer launches without inventing WT identity', () => {

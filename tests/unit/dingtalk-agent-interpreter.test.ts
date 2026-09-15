@@ -1,8 +1,23 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { commandFromAgentResponse, commandsFromAgentResponse, withAgentRetries } from '../../electron/dingtalk-agent-interpreter'
+import { commandFromAgentResponse, commandsFromAgentResponse, withAgentRetries, parseAgentJson, AgentResponseFormatError } from '../../electron/dingtalk-agent-interpreter'
 
 describe('DingTalkAgentInterpreter output policy', () => {
+  it('accepts fenced JSON, text blocks and a single prose-wrapped object', () => {
+    expect(parseAgentJson('\x60\x60\x60json\n{"action":"agents"}\n\x60\x60\x60')).toEqual({ action: 'agents' })
+    expect(parseAgentJson([{ type: 'text', text: '{"action":"agents"}' }])).toEqual({ action: 'agents' })
+    expect(parseAgentJson('结果：{"action":"send","content":"{quoted}"} 完毕')).toEqual({ action: 'send', content: '{quoted}' })
+  })
+
+  it.each(['{"action":', '{"action":"agents"} {"action":"stop"}', 'not json', '{"action":"agents"} {"action":'])('rejects ambiguous or partial JSON: %s', value => {
+    expect(() => parseAgentJson(value)).toThrow(AgentResponseFormatError)
+  })
+
+  it('retries format failures without executing partial actions', async () => {
+    const operation = vi.fn().mockRejectedValueOnce(new AgentResponseFormatError('truncated')).mockResolvedValue({ commands: ['/agents'] })
+    await expect(withAgentRetries(operation, 1, async () => undefined)).resolves.toEqual({ commands: ['/agents'] })
+    expect(operation).toHaveBeenCalledTimes(2)
+  })
   it('maps structured actions to the existing fixed command router', () => {
     expect(commandFromAgentResponse({ action: 'agents' })).toBe('/agents')
     expect(commandFromAgentResponse({ action: 'approve', requestId: 'approval-1' })).toBe('/approve approval-1')

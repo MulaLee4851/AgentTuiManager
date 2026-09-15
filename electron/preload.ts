@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron'
+import { preventExternalFileDrop } from '../src/shared/prevent-file-drop'
 
 import { IPC_CHANNELS, type AgentManagerApi, type ManagerEvent, type StartSessionRequest } from '../src/shared/manager-api'
 
@@ -6,6 +7,8 @@ const api: AgentManagerApi = {
   platform: process.platform,
   listSessions: () => ipcRenderer.invoke(IPC_CHANNELS.listSessions),
   terminalReplay: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.terminalReplay, sessionId),
+  openDeepSeekWeb: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.openDeepSeekWeb, sessionId),
+  openExternalWeb: (url) => ipcRenderer.invoke(IPC_CHANNELS.openExternalWeb, url),
   listAuditEntries: () => ipcRenderer.invoke(IPC_CHANNELS.listAuditEntries),
   listTokenUsageSummary: (query) => ipcRenderer.invoke(IPC_CHANNELS.listTokenUsageSummary, query),
   listTokenUsageDetails: (query) => ipcRenderer.invoke(IPC_CHANNELS.listTokenUsageDetails, query),
@@ -25,6 +28,8 @@ const api: AgentManagerApi = {
   updateSessionConfig: (sessionId, config) => ipcRenderer.invoke(IPC_CHANNELS.updateSessionConfig, sessionId, config),
   updateSessionProxy: (sessionId, proxy) => ipcRenderer.invoke(IPC_CHANNELS.updateSessionProxy, sessionId, proxy),
   setFullAutoMode: (sessionId, enabled) => ipcRenderer.invoke(IPC_CHANNELS.setFullAutoMode, sessionId, enabled),
+  setUnattendedMode: (sessionId, settings) => ipcRenderer.invoke(IPC_CHANNELS.setUnattendedMode, sessionId, settings),
+  saveUnattendedSettings: (sessionId, settings) => ipcRenderer.invoke(IPC_CHANNELS.saveUnattendedSettings, sessionId, settings),
   listCCSwitchProviders: (agentKind) => ipcRenderer.invoke(IPC_CHANNELS.listCCSwitchProviders, agentKind),
   getContinueKeywordSettings: () => ipcRenderer.invoke(IPC_CHANNELS.getContinueKeywordSettings),
   updateContinueKeywordSettings: (settings) => ipcRenderer.invoke(IPC_CHANNELS.updateContinueKeywordSettings, settings),
@@ -57,7 +62,9 @@ const api: AgentManagerApi = {
   discoverSessions: (agentKind, workspace) => ipcRenderer.invoke(IPC_CHANNELS.discoverSessions, agentKind, workspace),
   detectAgentEnvironment: (agentKind, executable) => ipcRenderer.invoke(IPC_CHANNELS.detectAgentEnvironment, agentKind, executable),
   installNodeAndNpm: () => ipcRenderer.invoke(IPC_CHANNELS.installNodeAndNpm),
-  installAgent: (agentKind, registry) => ipcRenderer.invoke(IPC_CHANNELS.installAgent, agentKind, registry),
+  installAgent: (agentKind, registry, operation) => operation === undefined
+    ? ipcRenderer.invoke(IPC_CHANNELS.installAgent, agentKind, registry)
+    : ipcRenderer.invoke(IPC_CHANNELS.installAgent, agentKind, registry, operation),
   installRipgrep: () => ipcRenderer.invoke(IPC_CHANNELS.installRipgrep),
   readClipboardText: () => ipcRenderer.invoke(IPC_CHANNELS.readClipboardText),
   writeClipboardText: (text) => ipcRenderer.invoke(IPC_CHANNELS.writeClipboardText, text),
@@ -69,3 +76,6 @@ const api: AgentManagerApi = {
 }
 
 contextBridge.exposeInMainWorld('agentManager', api)
+
+window.addEventListener('dragover', preventExternalFileDrop, true)
+window.addEventListener('drop', preventExternalFileDrop, true)

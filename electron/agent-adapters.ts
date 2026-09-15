@@ -1,4 +1,5 @@
 import type { AgentKind, RecoveryRecipe } from '../src/shared/manager-api'
+import { deepSeekWebUrl } from '../src/shared/deepseek-web-url'
 import { terminalScrollbackArgs } from './start-request-policy'
 
 export interface AgentObservation {
@@ -6,6 +7,7 @@ export interface AgentObservation {
   approvalCommand?: string
   approvalReason?: string
   forwardedSubagentApproval?: boolean
+  nativeClaudeApprovalMenu?: boolean
   ready: boolean
   recoverableError?: {
     code: 'model-capacity'
@@ -317,6 +319,11 @@ class ClaudeAdapter extends EvidenceAdapter {
       && /(?:do you want to proceed|would you like to proceed)\?/i.test(evidence)
       && hasApprovalInteraction(evidence)
     const hasIdentity = /claude\s+code/i.test(evidence)
+    const nativeClaudeApprovalMenu = approvalRequired
+      && /(?:do you want to proceed|would you like to proceed)\?/i.test(evidence)
+      && /(?:^|\n)\s*[❯›>]\s*1\.\s*Yes\b/i.test(evidence)
+      && /(?:^|\n)\s*[23]\.\s*No\b/i.test(evidence)
+      && /Esc to cancel/i.test(evidence)
     const hasPrompt = /(?:^|[\r\n])\s*[❯›]\s*(?:$|[\r\n])/m.test(evidence)
       || /\? for shortcuts/i.test(evidence)
     return {
@@ -324,6 +331,7 @@ class ClaudeAdapter extends EvidenceAdapter {
       ...(approvalCommand ? { approvalCommand } : {}),
       ...(approvalReason ? { approvalReason } : {}),
       ...(forwardedSubagentApproval ? { forwardedSubagentApproval: true } : {}),
+      ...(nativeClaudeApprovalMenu ? { nativeClaudeApprovalMenu: true } : {}),
       ready: !approvalRequired && hasIdentity && hasPrompt,
     }
   }
@@ -350,8 +358,8 @@ class DeepSeekAdapter extends EvidenceAdapter {
   recoveryRecipe(): undefined { return undefined }
 
   protected classify(evidence: string): AgentObservation {
-    const matches = [...evidence.matchAll(/(?:^|\n)dsh web:\s+(http:\/\/127\.0\.0\.1:\d+)(?:\s|$)/gi)]
-    const webUrl = matches.at(-1)?.[1]
+    const matches = [...evidence.matchAll(/(?:^|\n)dsh web:[ \t]+(http:\/\/[^\s]+)(?=\s)/gi)]
+    const webUrl = matches.map((match) => deepSeekWebUrl(match[1])).filter(Boolean).at(-1)
     return {
       approvalRequired: false,
       ready: Boolean(webUrl),
