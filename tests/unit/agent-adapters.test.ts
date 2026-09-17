@@ -231,6 +231,19 @@ describe('native agent adapters', () => {
     })
   })
 
+  it('forgets an old approval after a full clear and native idle prompt', () => {
+    const adapter = createAgentAdapter('codex')
+    expect(adapter.observeOutput('Would you like to run the following command?\n$ echo harmless\n1. Yes, proceed (y)\n2. No (esc)\n').approvalRequired).toBe(true)
+    expect(adapter.observeOutput('\x1b[2J\x1b[Hharmless\nCodex\n› ')).toMatchObject({ approvalRequired: false, ready: true })
+  })
+
+  it('recognizes a new approval painted after a full clear', () => {
+    const adapter = createAgentAdapter('codex')
+    adapter.observeOutput('Would you like to run the following command?\n$ echo old\n1. Yes, proceed (y)\n')
+    expect(adapter.observeOutput('\x1b[2JWould you like to run the following command?\n$ echo new\n1. Yes, proceed (y)\n'))
+      .toMatchObject({ approvalRequired: true, approvalCommand: 'echo new' })
+  })
+
   it('keeps one pending approval on a single command while the TUI repaints', () => {
     const adapter = createAgentAdapter('claude')
     const first = adapter.observeOutput(

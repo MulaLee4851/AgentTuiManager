@@ -17,6 +17,11 @@ interface CodexPermissionInput {
 
 type ApprovalRisk = 'read' | 'write' | 'delete' | 'unknown'
 
+// One small lifecycle record per transition; never log commands, keys or payloads.
+function trace(stage: string, requestId?: string, reason?: string): void {
+  process.stderr.write(JSON.stringify({ component: 'manager-permission-hook', time: new Date().toISOString(), stage, requestId, reason }) + '\n')
+}
+
 function readInput(): Promise<string> {
   return new Promise((resolve) => {
     let value = ''
@@ -104,24 +109,32 @@ async function requestDecision(input: CodexPermissionInput): Promise<'allow' | '
   const endpoint = process.env.AGENT_TUI_MANAGER_HOOK_ENDPOINT
   const token = process.env.AGENT_TUI_MANAGER_HOOK_TOKEN
   const toolName = boundedText(input.tool_name, 256)
-  if (!endpoint || !token || !toolName) return 'ask'
+  if (!endpoint || !token || !toolName) {
+    trace('failed', undefined, 'missing-connection-or-tool')
+    return 'deny'
+  }
   const requestId = randomUUID()
+  trace('received', requestId)
   const details = permissionDetails(input)
   const toolInputFingerprint = fingerprint(input.tool_input)
   return await new Promise((resolve) => {
     const socket = net.createConnection(endpoint)
     let buffer = ''
     let settled = false
-    const finish = (action: 'allow' | 'ask' | 'deny'): void => {
+    const finish = (action: 'allow' | 'ask' | 'deny', reason = 'manager-response'): void => {
       if (settled) return
       settled = true
+      trace('decision-' + action, requestId, reason)
       clearTimeout(timer)
       socket.destroy()
       resolve(action)
     }
-    const timer = setTimeout(() => finish('ask'), 30 * 60_000)
+    // Finish before Codex's 1800-second hook timeout so it receives a decision.
+    const timer = setTimeout(() => finish('deny', 'timeout'), 1790_000)
     socket.setEncoding('utf8')
-    socket.once('connect', () => socket.write(`${JSON.stringify({
+    socket.once('connect', () => {
+      trace('sent', requestId)
+      socket.write(`${JSON.stringify({
       type: 'permission-hook', token, requestId, hookSource: 'codex', toolName,
       toolInput: input.tool_input,
       rawPayload: input,
@@ -135,17 +148,31 @@ async function requestDecision(input: CodexPermissionInput): Promise<'allow' | '
       ...(boundedText(input.agent_type, 128) ? { agentType: boundedText(input.agent_type, 128) } : {}),
       ...(toolInputFingerprint ? { toolInputFingerprint } : {}),
       ...details,
-    })}\n`))
+    })}\n`)
+    })
     socket.on('data', (chunk) => {
       buffer += chunk
-      const newline = buffer.indexOf('\n')
-      if (newline < 0) return
-      try {
-        const event = JSON.parse(buffer.slice(0, newline)) as { type?: string; action?: string }
-        finish(event.type === 'permission-response' && (event.action === 'allow' || event.action === 'deny') ? event.action : 'ask')
-      } catch { finish('ask') }
+      if (buffer.length > 65_536) { finish('deny', 'response-too-large'); return }
+      while (!settled) {
+        const newline = buffer.indexOf('\n')
+        if (newline < 0) return
+        const line = buffer.slice(0, newline)
+        buffer = buffer.slice(newline + 1)
+        try {
+          const event = JSON.parse(line) as { type?: string; action?: string; requestId?: string; data?: unknown }
+          // Older live Hosts briefly broadcast output before recognizing this
+          // socket as a hook. Consume that frame; it is NOT an approval decision.
+          if (event.type === 'output' && typeof event.data === 'string') continue
+          if (event.type !== 'permission-response' || event.requestId !== requestId
+            || !['allow', 'deny', 'ask'].includes(event.action ?? '')) {
+            finish('deny', 'invalid-response')
+          } else finish(event.action as 'allow' | 'deny' | 'ask')
+        } catch { finish('deny', 'invalid-json') }
+      }
     })
-    socket.once('error', () => finish('ask'))
+    socket.once('error', () => finish('deny', 'connection-error'))
+    socket.once('end', () => finish('deny', 'connection-ended'))
+    socket.once('close', () => finish('deny', 'connection-closed'))
   })
 }
 
@@ -154,6 +181,7 @@ async function main(): Promise<void> {
   try { input = JSON.parse(await readInput()) as CodexPermissionInput } catch { return }
   if (input.hook_event_name !== 'PermissionRequest') return
   const response = await requestDecision(input)
+  trace('return-' + response)
   if (response === 'allow') {
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } },
@@ -162,7 +190,7 @@ async function main(): Promise<void> {
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'PermissionRequest',
-        decision: { behavior: 'deny', message: 'Denied by the user in Agent TUI Manager' },
+        decision: { behavior: 'deny', message: 'Agent TUI Manager denied the request or could not confirm approval. Check the approval connection before retrying.' },
       },
     }))
   }

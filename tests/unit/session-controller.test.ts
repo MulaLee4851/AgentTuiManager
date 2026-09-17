@@ -87,6 +87,36 @@ async function settle(): Promise<void> {
 }
 
 describe('SessionController recovery evidence', () => {
+  it('keeps a structured Codex approval pending when the terminal returns to an idle prompt', async () => {
+    vi.useFakeTimers()
+    try {
+      const { controller, handles } = fixture()
+      const session = await controller.startSession(request())
+      handles[0]!.permissionHook = 'codex'
+      handles[0]!.emit({ type: 'permission-request', requestId: 'waiting-hook', hookSource: 'codex', toolName: 'Bash', command: 'echo harmless' })
+      await vi.advanceTimersByTimeAsync(1)
+      handles[0]!.emit({ type: 'output', data: '\x1b[2J\x1b[HCodex\n› ' })
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(controller.listPendingApprovals()).toEqual([expect.objectContaining({ requestId: 'waiting-hook', source: 'codex-hook' })])
+      expect(controller.listSessions().find(s => s.sessionId === session.sessionId)?.status).toBe('needs_approval')
+      expect(handles[0]!.permissionResponses).toEqual([])
+      expect(handles[0]!.writes).toEqual([])
+    } finally { vi.useRealTimers() }
+  })
+
+  it('removes a terminal approval after clear and idle without approving a pending hook', async () => {
+    const { controller, handles } = fixture()
+    const session = await controller.startSession(request())
+    handles[0]!.emit({ type: 'output', data: 'Would you like to run the following command?\n$ echo old\n1. Yes, proceed (y)\n' })
+    await settle()
+    expect(controller.listPendingApprovals()).toHaveLength(1)
+    handles[0]!.emit({ type: 'output', data: '\x1b[2J\x1b[HCodex\n› ' })
+    await settle()
+    expect(controller.listPendingApprovals()).toHaveLength(0)
+    expect(handles[0]!.writes).toEqual([])
+    expect(controller.listSessions().find(s => s.sessionId === session.sessionId)?.status).not.toBe('needs_approval')
+  })
+
   it('persists saved settings and reports a failed disk flush instead of claiming success', async () => {
     const { manager } = fixture()
     const catalog = { list: () => [], upsert: vi.fn(async () => undefined), flush: vi.fn(async () => undefined), remove: vi.fn(async () => undefined), clear: vi.fn(async () => undefined) }
@@ -1658,7 +1688,97 @@ describe('SessionController recovery evidence', () => {
     expect(manager.removeArtifacts).toHaveBeenCalledWith('host-1')
   })
 
-  it('sends Continue once only after a configured keyword remains quiet', async () => {
+  it.each(['idle', 'running', 'newer-reply', 'draft', 'stopped', 'disabled', 'approval'] as const)(
+    'uses only the latest native reply and respects %s state for keyword recovery', async scenario => {
+      vi.useFakeTimers()
+      try {
+        const base = fixture()
+        let enabled = true
+        const policy = {
+          getSettings: () => ({ enabled, quietSeconds: 3, keywords: ['please retry'] }),
+          match: (text: string) => enabled && text.includes('please retry') ? 'please retry' : undefined,
+          maxKeywordLength: () => 12,
+        }
+        const controller = new SessionController(base.manager, undefined, undefined, undefined, undefined, undefined, policy)
+        await controller.startSession({ ...request(true), nativeSessionId: 'native-keyword' })
+        const snapshot = () => controller.listSessions()[0]!
+        controller.observeNativeActivity(snapshot(), {
+          activity: scenario === 'running' ? 'running' : 'completed', timestamp: Date.now(),
+          assistantMessage: { text: 'please retry', timestamp: Date.now() },
+        })
+        if (scenario === 'newer-reply') controller.observeNativeActivity(snapshot(), {
+          activity: 'completed', timestamp: Date.now(),
+          assistantMessage: { text: 'All finished successfully', timestamp: Date.now() },
+        })
+        if (scenario === 'draft') controller.write(snapshot().sessionId, 'my draft')
+        if (scenario === 'stopped') await controller.stopSession(snapshot().sessionId)
+        if (scenario === 'disabled') enabled = false
+        if (scenario === 'approval') {
+          base.handles[0]!.emit({ type: 'permission-request', requestId: 'keyword-approval', hookSource: 'codex', toolName: 'Bash', command: 'test' })
+          await vi.advanceTimersByTimeAsync(0)
+        }
+        // UI status/footer repaint must not erase a fresh native final reply.
+        base.handles[0]!.emit({ type: 'output', data: '\x1b[0m' })
+        await vi.advanceTimersByTimeAsync(3100)
+        expect(base.handles[0]!.writes.filter(value => value === '\r')).toHaveLength(scenario === 'idle' ? 1 : 0)
+        await vi.advanceTimersByTimeAsync(10000)
+        expect(base.handles[0]!.writes.filter(value => value === '\r')).toHaveLength(scenario === 'idle' ? 1 : 0)
+      } finally { vi.useRealTimers() }
+    })
+
+  it('limits consecutive keyword submissions per window without resetting on automatic input', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const policy = {
+        getSettings: () => ({ enabled: true, quietSeconds: 60, maxRetries: 2, keywords: ['please retry'] }),
+        match: (text: string) => text.includes('please retry') ? 'please retry' : undefined,
+        maxKeywordLength: () => 12,
+      }
+      const activity = { keywordMatched: vi.fn(), keywordContinued: vi.fn(), keywordLimitReached: vi.fn() }
+      const controller = new SessionController(base.manager, undefined, undefined, undefined, undefined, undefined, policy, activity)
+      const a = await controller.startSession({ ...request(true), nativeSessionId: 'native-a' })
+      const b = await controller.startSession({ ...request(true), nativeSessionId: 'native-b' })
+      const fail = async (id: string) => {
+        const snapshot = () => controller.listSessions().find(item => item.sessionId === id)!
+        controller.observeNativeActivity(snapshot(), { activity: 'running', timestamp: Date.now(), userMessage: { text: 'continue', timestamp: Date.now() } })
+        controller.observeNativeActivity(snapshot(), { activity: 'error', timestamp: Date.now(), error: 'please retry' })
+        await vi.advanceTimersByTimeAsync(601)
+      }
+      await fail(a.sessionId)
+      await fail(a.sessionId)
+      await fail(a.sessionId)
+      await fail(a.sessionId)
+      expect(base.handles[0]!.writes.filter(value => value === '\r')).toHaveLength(2)
+      expect(activity.keywordLimitReached).toHaveBeenCalledTimes(1)
+      await fail(b.sessionId)
+      expect(base.handles[1]!.writes.filter(value => value === '\r')).toHaveLength(1)
+      controller.write(a.sessionId, 'new task\r')
+      await fail(a.sessionId)
+      expect(base.handles[0]!.writes.filter(value => value === '\r')).toHaveLength(3)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('ignores a keyword in an earlier terminal line when the latest line does not match', async () => {
+    vi.useFakeTimers()
+    try {
+      const base = fixture()
+      const policy = {
+        getSettings: () => ({ enabled: true, quietSeconds: 3, keywords: ['please retry'] }),
+        match: (text: string) => text.includes('please retry') ? 'please retry' : undefined,
+        maxKeywordLength: () => 12,
+      }
+      const controller = new SessionController(base.manager, undefined, undefined, undefined, undefined, undefined, policy)
+      await controller.startSession(request(true))
+      base.handles[0]!.emit({ type: 'output', data: 'please retry\nfinished successfully' })
+      await vi.advanceTimersByTimeAsync(0)
+      controller.observeNativeActivity(controller.listSessions()[0]!, { activity: 'idle', timestamp: Date.now() })
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(base.handles[0]!.writes).toEqual([])
+    } finally { vi.useRealTimers() }
+  })
+
+  it('sends Continue once on idle without waiting for the legacy quiet period', async () => {
     vi.useFakeTimers()
     try {
       const base = fixture()
@@ -1671,14 +1791,16 @@ describe('SessionController recovery evidence', () => {
       const controller = new SessionController(base.manager, undefined, undefined, undefined, undefined, undefined, keywordPolicy, activity)
       const session = await controller.startSession(request(true))
       base.handles[0]!.emit({ type: 'output', data: 'Temporary condition: please retry' })
-      await vi.advanceTimersByTimeAsync(2_999)
-      expect(base.handles[0]!.writes).toEqual([])
-      await vi.advanceTimersByTimeAsync(1)
-      expect(base.handles[0]!.writes).toEqual(['continue\r'])
+      await vi.advanceTimersByTimeAsync(0)
+      controller.observeNativeActivity(controller.listSessions()[0]!, { activity: 'idle', timestamp: Date.now() })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(base.handles[0]!.writes).toEqual(['\x1b[200~continue\x1b[201~'])
+      await vi.advanceTimersByTimeAsync(600)
+      expect(base.handles[0]!.writes).toEqual(['\x1b[200~continue\x1b[201~', '\r'])
       expect(activity.keywordMatched).toHaveBeenCalledWith(session.sessionId, 'please retry')
       expect(activity.keywordContinued).toHaveBeenCalledWith(session.sessionId, 'please retry')
       await vi.advanceTimersByTimeAsync(10_000)
-      expect(base.handles[0]!.writes).toEqual(['continue\r'])
+      expect(base.handles[0]!.writes).toEqual(['\x1b[200~continue\x1b[201~', '\r'])
     } finally {
       vi.useRealTimers()
     }
@@ -1697,10 +1819,10 @@ describe('SessionController recovery evidence', () => {
       const controller = new SessionController(base.manager, undefined, undefined, undefined, undefined, undefined, keywordPolicy)
       await controller.startSession(request(true))
       base.handles[0]!.emit({ type: 'output', data: 'Selected model is at capacity. Please try a different model.' })
-      await vi.advanceTimersByTimeAsync(2_999)
-      expect(base.handles[0]!.writes).toEqual([])
-      await vi.advanceTimersByTimeAsync(1)
-      expect(base.handles[0]!.writes).toEqual(['continue\r'])
+      await vi.advanceTimersByTimeAsync(0)
+      controller.observeNativeActivity(controller.listSessions()[0]!, { activity: 'error', timestamp: Date.now() })
+      await vi.advanceTimersByTimeAsync(600)
+      expect(base.handles[0]!.writes).toEqual(['\x1b[200~continue\x1b[201~', '\r'])
     } finally {
       vi.useRealTimers()
     }

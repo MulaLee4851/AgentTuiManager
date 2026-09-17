@@ -56,7 +56,7 @@ export interface ManagedSessionCatalogPort {
 }
 
 export interface ContinueKeywordPolicyPort {
-  getSettings(): { enabled: boolean; quietSeconds: number; keywords: string[] }
+  getSettings(): { enabled: boolean; quietSeconds: number; keywords: string[]; maxRetries?: number }
   match(value: string): string | undefined
   matchIncremental?(previous: string, current: string): string | undefined
   maxKeywordLength(): number
@@ -65,6 +65,8 @@ export interface ContinueKeywordPolicyPort {
 export interface RecoveryActivityPort {
   keywordMatched(sessionId: string, keyword: string): void
   keywordContinued(sessionId: string, keyword: string): void
+  keywordLimitReached?(sessionId: string, count: number): void
+  keywordFailed?(sessionId: string, reason: string): void
 }
 
 export interface FullAutoActivityPort {
@@ -161,6 +163,9 @@ interface ManagedSession {
     generation: number
   }
   continueKeywordTail: string
+  continueKeywordCount?: number
+  continueKeywordLimitLogged?: boolean
+  continueKeywordNativeText?: string
   continueKeywordSuppressedUntil?: number
   continueKeywordAttempted: Set<string>
   pendingKeywordContinue?: {
@@ -388,6 +393,7 @@ export class SessionController {
       || managed.summary.activitySince !== snapshot.activitySince
       || event.timestamp < (managed.summary.activitySince ?? 0)) return
     if (event.userMessage) {
+      managed.continueKeywordAttempted.clear()
       this.messageDelivery.observe(snapshot.sessionId, event.userMessage.text, event.userMessage.timestamp)
       // Only clear input that the native CLI has actually consumed. A later
       // local draft must survive delayed transcript updates.
@@ -404,6 +410,16 @@ export class SessionController {
     // welcome/prompt screen was not recognized by the terminal adapter.
     if (event.activity !== 'starting') managed.agentReady = true
     this.setActivity(managed, event.activity, event.timestamp, event.error)
+    if (event.assistantMessage || event.error) {
+      managed.continueKeywordNativeText = (event.assistantMessage?.text ?? event.error ?? '').slice(-4096)
+    } else if (event.activity === 'running' || event.userMessage) {
+      managed.continueKeywordNativeText = undefined
+      managed.continueKeywordTail = ''
+      this.cancelKeywordContinue(managed)
+    }
+    if (['idle', 'completed', 'error'].includes(event.activity)) {
+      this.observeContinueKeyword(managed, managed.continueKeywordNativeText ?? managed.continueKeywordTail, { ready: true, approvalRequired: false }, true)
+    }
   }
 
   private setActivity(managed: ManagedSession, activity: NonNullable<SessionSummary['activity']>, timestamp = Date.now(), error?: string): void {
@@ -485,12 +501,8 @@ export class SessionController {
     }
     const storedEntries = this.catalog?.list() ?? []
     const storedBySessionId = new Map(storedEntries.map((entry) => [entry.sessionId, entry]))
-    if (!preserveWorkspaceOnCrash) {
-      const preservedSessionIds = new Set(liveRecords.filter((record) => record.managerOwnership === 'preserved').map((record) => record.sessionId ?? record.hostId))
-      for (const entry of storedEntries) {
-        if (!preservedSessionIds.has(entry.sessionId)) await this.catalog?.remove(entry.sessionId)
-      }
-    }
+    // Process retention and catalog retention are independent: stopped entries
+    // remain available for manual/native workspace restoration.
     for (const record of liveRecords.filter((candidate) => reconnectableHostIds.has(candidate.hostId))) {
       const restoredSessionId = record.sessionId ?? record.hostId
       const stored = storedBySessionId.get(restoredSessionId)
@@ -652,7 +664,15 @@ export class SessionController {
       } else if (managed.summary.agentKind === 'codex') {
         this.cancelCodexTerminalApproval(managed)
       }
-      if (!isTerminalProtocolResponse(data)) managed.continueKeywordAttempted.clear()
+      if (!isTerminalProtocolResponse(data)) {
+        if (!this.submittingRemoteInput) {
+          managed.continueKeywordCount = 0
+          managed.continueKeywordLimitLogged = false
+        }
+        managed.continueKeywordAttempted.clear()
+        managed.continueKeywordTail = ''
+        managed.continueKeywordNativeText = undefined
+      }
       this.cancelTransientRetry(managed, true)
       this.cancelPendingContinueSubmit(managed)
       if (managed.summary.status === 'needs_attention') {
@@ -689,7 +709,7 @@ export class SessionController {
           void this.approveRequest(hookApproval.requestId).catch(() => undefined)
         }
         handledClaudeHookApproval = true
-      } else if (terminalApproval && /[\r\n]/.test(data)) {
+      } else if (terminalApproval && /^[\r\n]+$/.test(data)) {
         managed.adapter.acknowledgeUserInput(true)
         this.completeManualApproval(managed, terminalApproval)
       } else if (managed.summary.status !== 'needs_approval') managed.adapter.acknowledgeUserInput()
@@ -1225,6 +1245,13 @@ export class SessionController {
           this.cancelClaudeTerminalApproval(managed)
         } else if (managed.summary.agentKind === 'codex') {
           this.cancelCodexTerminalApproval(managed)
+          // A returned native prompt is evidence that the old terminal modal
+          // no longer blocks. Never remove a still-pending structured Hook.
+          if (observation.ready && managed.approvalRequests.some(request => request.source === 'terminal')) {
+            this.cancelPendingTerminalAutoApproval(managed)
+            this.removeTerminalApprovals(managed)
+            this.changed(managed.summary.sessionId)
+          }
         }
         const resumedNow = managed.awaitingRecoveryReady && observation.ready
         if (resumedNow) {
@@ -1742,28 +1769,38 @@ export class SessionController {
     managed.pendingContinueSubmit = { timer, generation }
   }
 
-  private observeContinueKeyword(managed: ManagedSession, data: string, observation: AgentObservation): void {
+  private observeContinueKeyword(managed: ManagedSession, data: string, observation: AgentObservation, fromActivity = false): void {
     if (this.unattended.enabled(managed.summary.sessionId)) return
+    if (!fromActivity && managed.continueKeywordNativeText !== undefined) return
     const policy = this.continueKeywordPolicy
     const settings = policy?.getSettings()
     const continueSuppressed = (managed.continueKeywordSuppressedUntil ?? 0) > Date.now()
     if (!policy || !settings?.enabled || settings.keywords.length === 0
       || continueSuppressed
       || managed.pendingUserInterrupt || managed.summary.userStopRequested
-      || managed.summary.status !== 'running' || observation.approvalRequired
+      || !['running', 'needs_attention'].includes(managed.summary.status) || observation.approvalRequired
       || managed.awaitingRecoveryReady) {
       this.cancelKeywordContinue(managed)
       managed.continueKeywordTail = ''
       return
     }
     delete managed.continueKeywordSuppressedUntil
-    const maximum = Math.max(256, policy.maxKeywordLength() * 2)
-    const previousTail = managed.continueKeywordTail
-    managed.continueKeywordTail = (previousTail + data).slice(-maximum)
-    const matchedKeyword = policy.matchIncremental
-      ? policy.matchIncremental(previousTail, data)
-      : policy.match(data)
+    const maximum = fromActivity && managed.continueKeywordNativeText !== undefined
+      ? 4096 : Math.min(4096, Math.max(256, policy.maxKeywordLength() * 2))
+    data = data.slice(-maximum)
+    // A native final reply/error is one bounded message. Raw PTY fallback only
+    // considers its last nonempty line, never an earlier paragraph in scrollback.
+    const latest = fromActivity && managed.continueKeywordNativeText !== undefined
+      ? data : data.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
+        .replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])/g, '').trimEnd().split(/[\r\n]/).at(-1) ?? ''
+    const matchedKeyword = policy.match(latest)
+    if (!fromActivity) managed.continueKeywordTail = latest
     if (!matchedKeyword) {
+      if (fromActivity && managed.continueKeywordNativeText && ['idle', 'completed'].includes(managed.summary.activity ?? '')) {
+        managed.continueKeywordCount = 0
+        managed.continueKeywordLimitLogged = false
+        managed.continueKeywordAttempted.clear()
+      }
       // Any fresh output after a match means the Agent continued by itself.
       // Never carry an old keyword forward until a later quiet period.
       this.cancelKeywordContinue(managed)
@@ -1778,15 +1815,34 @@ export class SessionController {
       const pending = managed.pendingKeywordContinue
       if (!pending || pending.timer !== timer) return
       delete managed.pendingKeywordContinue
-      if (managed.generation !== generation || managed.outputSequence !== outputSequence
+      if (managed.generation !== generation || (!fromActivity && managed.outputSequence !== outputSequence)
+        || (fromActivity && (managed.continueKeywordNativeText ?? managed.continueKeywordTail) !== latest)
         || managed.pendingUserInterrupt || managed.summary.userStopRequested
-        || managed.summary.status !== 'running' || managed.awaitingRecoveryReady
+        || !['running', 'needs_attention'].includes(managed.summary.status) || managed.awaitingRecoveryReady
+        || !['idle', 'completed', 'error'].includes(managed.summary.activity ?? '')
+        || managed.activityInputPending || managed.hostTransitioning || this.unattended.enabled(managed.summary.sessionId)
+        || managed.summary.attentionKind === 'host-unresponsive' || this.messageDelivery.busy(managed.summary.sessionId)
         || managed.approvalRequests.length > 0 || isTerminalStatus(managed.summary.status)) return
+      const currentSettings = policy.getSettings()
+      if (!currentSettings.enabled || policy.match(latest) !== keyword) return
+      const count = managed.continueKeywordCount ?? 0
+      if (count >= (currentSettings.maxRetries ?? 3)) {
+        if (!managed.continueKeywordLimitLogged) this.recoveryActivity?.keywordLimitReached?.(managed.summary.sessionId, count)
+        managed.continueKeywordLimitLogged = true
+        return
+      }
+      managed.continueKeywordCount = count + 1
       managed.continueKeywordAttempted.add(keyword)
       managed.adapter.acknowledgeUserInput()
-      this.recoveryActivity?.keywordContinued(managed.summary.sessionId, keyword)
-      this.submitContinue(managed)
-    }, settings.quietSeconds * 1_000)
+      managed.continueKeywordNativeText = undefined
+      managed.continueKeywordTail = ''
+      const input = (managed.request?.recovery?.continueInput ?? 'continue').replace(/[\r\n]+$/g, '') || 'continue'
+      void this.sendSessionMessage(managed.summary.sessionId, input, false).then(() => {
+        this.recoveryActivity?.keywordContinued(managed.summary.sessionId, keyword)
+      }).catch(error => {
+        this.recoveryActivity?.keywordFailed?.(managed.summary.sessionId, error instanceof Error ? error.message : String(error))
+      })
+    }, 0)
     timer.unref?.()
     managed.pendingKeywordContinue = { timer, generation, keyword, outputSequence }
     this.recoveryActivity?.keywordMatched(managed.summary.sessionId, keyword)

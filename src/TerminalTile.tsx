@@ -162,12 +162,15 @@ export default function TerminalTile({ session, detail = false, embedded = false
     let disposed = false
     let terminalRefreshTimer: ReturnType<typeof setTimeout> | undefined
     let terminalRefreshPending = false
+    let manualRedrawRequested = false
     const writeWatchdog = new TerminalWriteWatchdog(TERMINAL_WRITE_WATCHDOG_MS)
     // How far above the newest line the user has scrolled, counted from the bottom rather
     // than as an absolute row. Once the scrollback is full xterm drops the oldest line on
     // every new one, which shifts every absolute index down; pinning to one dragged the
     // view towards the very start of the history and made the scrollbar snap back.
     let userScrollOffset: number | undefined
+    let pointerScrollGesture = false
+    let keyboardScrollGesture = false
     // scrollToLine/scrollToBottom/resize all emit onScroll as well. Only a genuine user
     // gesture may arm the browsing lock, otherwise a resize latches it onto a line nobody
     // chose and every later redraw re-pins the viewport there.
@@ -332,10 +335,17 @@ export default function TerminalTile({ session, detail = false, embedded = false
     host.addEventListener('paste', pastePlainText, true)
     terminal.attachCustomKeyEventHandler((event) => {
       const isPaste = (event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLocaleLowerCase('en-US') === 'v'
-      const isCopy = (event.ctrlKey || event.metaKey) && event.shiftKey && !event.altKey && event.key.toLocaleLowerCase('en-US') === 'c'
+      const isCopy = (event.ctrlKey || event.metaKey) && !event.altKey
+        && event.key.toLocaleLowerCase('en-US') === 'c'
+        && (event.shiftKey || event.metaKey || terminal.hasSelection())
       if (isCopy) {
-        if (event.type === 'keydown' && terminal.hasSelection()) {
-          void window.agentManager.writeClipboardText(terminal.getSelection())
+        // Consume copying even on failure: never fall through to xterm's ETX.
+        event.preventDefault()
+        event.stopPropagation()
+        if (event.type === 'keydown' && !event.repeat && terminal.hasSelection()) {
+          const selected = terminal.getSelection()
+          void Promise.resolve().then(() => window.agentManager.writeClipboardText(selected))
+            .catch((reason) => setActionError(reason instanceof Error ? reason.message : String(reason)))
         }
         return false
       }
@@ -352,15 +362,45 @@ export default function TerminalTile({ session, detail = false, embedded = false
       // was already handled, so never deliver that duplicate reply as user input. Codex Host also
       // answers live probes itself; preserve the existing all-time Codex guard.
       if (isTerminalProtocolResponse(data) && (session.agentKind === 'codex' || replayProtocolResponsesBlocked)) return
-      userScrollOffset = undefined
+      if (!isTerminalProtocolResponse(data)) {
+        userScrollOffset = undefined
+        keyboardScrollGesture = false
+        pointerScrollGesture = false
+      }
       queueTerminalInput(data, /[\r\n\x03\x1b]/.test(data))
     })
-    const scroll = terminal.onScroll(() => {
-      // Ignore the scrolls we cause ourselves; only a real gesture arms the browsing lock.
-      if (programmaticScrollDepth > 0) return
+    const rememberGestureScroll = (): void => {
+      // Public onScroll also reports TUI output and asynchronous viewport sync.
+      // Those events must not turn an input redraw into a history-browsing lock.
+      if (programmaticScrollDepth > 0 || (!pointerScrollGesture && !keyboardScrollGesture)) return
       const buffer = terminal.buffer.active
       userScrollOffset = buffer.viewportY < buffer.baseY ? buffer.baseY - buffer.viewportY : undefined
-    })
+    }
+    const scroll = terminal.onScroll(rememberGestureScroll)
+    const beginPointerScroll = (event: PointerEvent): void => {
+      pointerScrollGesture = event.target instanceof Element && !!event.target.closest('.xterm-viewport')
+    }
+    const endPointerScroll = (): void => {
+      rememberGestureScroll()
+      pointerScrollGesture = false
+    }
+    const beginKeyboardScroll = (event: KeyboardEvent): void => {
+      keyboardScrollGesture = event.shiftKey && ['PageUp', 'PageDown', 'Home', 'End'].includes(event.key)
+    }
+    const endKeyboardScroll = (): void => {
+      rememberGestureScroll()
+      keyboardScrollGesture = false
+    }
+    host.addEventListener('pointerdown', beginPointerScroll, true)
+    document.addEventListener('pointerup', endPointerScroll)
+    document.addEventListener('pointercancel', endPointerScroll)
+    host.addEventListener('keydown', beginKeyboardScroll, true)
+    host.addEventListener('keyup', endKeyboardScroll)
+    host.addEventListener('blur', endKeyboardScroll, true)
+    // xterm suppresses public onScroll for native scrollbar movement. Listen on
+    // the viewport AFTER xterm's handler, not capture (which sees the old buffer).
+    const scrollViewport = host.querySelector('.xterm-viewport')
+    scrollViewport?.addEventListener('scroll', rememberGestureScroll)
     const scrollTerminal = (event: WheelEvent): void => {
       if (event.deltaY === 0) return
       const buffer = terminal.buffer.active
@@ -381,7 +421,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
     copyButton.type = 'button'
     copyButton.className = 'terminal-copy-button'
     copyButton.textContent = '复制'
-    copyButton.title = '复制选中内容；未选中时复制当前终端屏幕'
+    copyButton.title = '复制选中内容；未选中时复制当前终端屏幕。Ctrl+C：有选中内容时复制，无选中内容时中断'
     copyButton.setAttribute('aria-label', '复制终端内容')
     const visibleTerminalText = (): string => {
       const buffer = terminal.buffer.active
@@ -418,6 +458,24 @@ export default function TerminalTile({ session, detail = false, embedded = false
     copyButton.addEventListener('mousedown', preserveSelection)
     copyButton.addEventListener('click', clickCopy)
     host.appendChild(copyButton)
+    const refreshButton = document.createElement('button')
+    refreshButton.type = 'button'
+    refreshButton.className = 'terminal-copy-button terminal-refresh-button'
+    refreshButton.textContent = '刷新'
+    refreshButton.title = '重绘终端并回到底部，不重启 Agent'
+    refreshButton.setAttribute('aria-label', '刷新终端显示')
+    const clickRefresh = (event: MouseEvent): void => {
+      event.stopPropagation()
+      scrollToLatest()
+      manualRedrawRequested = true
+      scheduleResize()
+      terminal.refresh(0, Math.max(0, terminal.rows - 1))
+      // Also repaint after any in-flight output, without replaying/duplicating it.
+      terminalRefreshPending = writeInFlight
+    }
+    refreshButton.addEventListener('mousedown', preserveSelection)
+    refreshButton.addEventListener('click', clickRefresh)
+    host.appendChild(refreshButton)
     const copySelection = (event: MouseEvent): void => {
       if (!terminal.hasSelection()) return
       event.preventDefault()
@@ -524,7 +582,15 @@ export default function TerminalTile({ session, detail = false, embedded = false
       const cell = terminalCellSize(terminal)
       if (!cell) return
       const cols = clamp(Math.floor(availableWidth / cell.width), MIN_TERMINAL_COLS, MAX_TERMINAL_COLS)
-      const rows = clamp(Math.floor(availableHeight / cell.height), MIN_TERMINAL_ROWS, MAX_TERMINAL_ROWS)
+      const fittedRows = clamp(Math.floor(availableHeight / cell.height), MIN_TERMINAL_ROWS, MAX_TERMINAL_ROWS)
+      const forceRedraw = manualRedrawRequested && cols === terminal.cols && fittedRows === terminal.rows
+      // Initial fitting is not the requested redraw: the PTY may already have
+      // this size from before unmount, so that resize need not repaint anything.
+      // Retain the request until replay is drained AND the local grid is fitted.
+      if (forceRedraw) manualRedrawRequested = false
+      // Notify the native TUI of a real size change, then restore the measured
+      // size. Repainting stale xterm cells is insufficient.
+      const rows = forceRedraw ? (fittedRows > MIN_TERMINAL_ROWS ? fittedRows - 1 : fittedRows + 1) : fittedRows
       if (cols === terminal.cols && rows === terminal.rows) {
         sendPtyResize(cols, rows)
         return
@@ -541,6 +607,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
       if (userScrollOffset === undefined) programmaticScroll(() => terminal.scrollToBottom())
       else restoreUserScroll()
       sendPtyResize(cols, rows)
+      if (forceRedraw || manualRedrawRequested) scheduleResize()
     }
     const scheduleResize = (): void => {
       cancelAnimationFrame(resizeFrame)
@@ -576,12 +643,22 @@ export default function TerminalTile({ session, detail = false, embedded = false
       unsubscribe()
       input.dispose()
       scroll.dispose()
+      host.removeEventListener('pointerdown', beginPointerScroll, true)
+      document.removeEventListener('pointerup', endPointerScroll)
+      document.removeEventListener('pointercancel', endPointerScroll)
+      host.removeEventListener('keydown', beginKeyboardScroll, true)
+      host.removeEventListener('keyup', endKeyboardScroll)
+      host.removeEventListener('blur', endKeyboardScroll, true)
+      scrollViewport?.removeEventListener('scroll', rememberGestureScroll)
       host.removeEventListener('wheel', scrollTerminal, true)
       host.removeEventListener('contextmenu', copySelection)
       host.removeEventListener('paste', pastePlainText, true)
       copyButton.removeEventListener('mousedown', preserveSelection)
       copyButton.removeEventListener('click', clickCopy)
       copyButton.remove()
+      refreshButton.removeEventListener('mousedown', preserveSelection)
+      refreshButton.removeEventListener('click', clickRefresh)
+      refreshButton.remove()
       terminal.dispose()
     }
   }, [session.sessionId, terminalEnded, deepSeekWeb])
@@ -614,7 +691,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
       <header className="terminal-card-header" draggable={draggable} onDragStart={() => onDragStart?.()} onDragEnd={() => onDragEnd?.()}>
         <div className="agent-identity">
           <AgentLogo kind={session.agentKind} className={'agent-dot agent-' + session.agentKind} />
-          <div><h2>{session.displayName}</h2><p title={session.workspace}>{session.workspace}</p></div>
+          <div><h2>{session.displayName}</h2><div className="terminal-session-meta"><p title={session.workspace}>{session.workspace}</p>{session.nativeSessionId && <button type="button" className="native-session-id" title={`原生会话 ID：${session.nativeSessionId}（点击复制）`} aria-label="复制原生会话 ID" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.writeClipboardText(session.nativeSessionId!)) }}>ID: {session.nativeSessionId}</button>}</div></div>
         </div>
         <div className="terminal-actions">
           <span title={session.activityError ?? session.lastError} className={'status-badge status-' + sessionDisplayStatus(session)}>{SESSION_STATUS_LABEL[sessionDisplayStatus(session)]}</span>

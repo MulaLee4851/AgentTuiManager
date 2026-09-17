@@ -8,6 +8,7 @@ import * as pty from 'node-pty'
 
 import type { HostCommand, HostEvent, HostExitFact } from '../src/shared/protocol'
 import { environmentForAgent } from './agent-environment'
+import { codexTerminalCompatibilityArgs } from './codex-terminal-compat'
 import { ensureMacPtySpawnHelper } from './macos-pty-helper'
 import { TerminalReplayBuffer } from './terminal-replay-buffer'
 import { TerminalStateReplay } from './terminal-state-replay'
@@ -204,7 +205,7 @@ function codexArgs(args: string[]): string[] {
     '-c', 'tui.notifications=[' + quote + 'approval-requested' + quote + ']',
     '-c', 'tui.notification_method=' + quote + 'osc9' + quote,
     '-c', 'tui.notification_condition=' + quote + 'always' + quote,
-    ...args,
+    ...codexTerminalCompatibilityArgs(args),
   ]
 }
 
@@ -376,7 +377,8 @@ function handleCommand(socket: Socket, command: HostCommand): void {
 }
 
 const server = net.createServer((socket) => {
-  clients.add(socket)
+  // A new connection may be a PermissionRequest hook. Do not broadcast PTY
+  // output to it before its first message identifies its role.
   socket.setEncoding('utf8')
   let buffer = ''
   socket.on('data', (chunk) => {
@@ -388,7 +390,9 @@ const server = net.createServer((socket) => {
       buffer = buffer.slice(newline + 1)
       if (!line) continue
       try {
-        handleCommand(socket, JSON.parse(line) as HostCommand)
+        const command = JSON.parse(line) as HostCommand
+        if (command.type !== 'permission-hook') clients.add(socket)
+        handleCommand(socket, command)
       } catch (error) {
         send(socket, { type: 'error', message: error instanceof Error ? error.message : String(error) })
       }

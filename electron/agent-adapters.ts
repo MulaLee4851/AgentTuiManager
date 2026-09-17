@@ -85,7 +85,17 @@ abstract class EvidenceAdapter implements AgentAdapter {
   observeOutput(data: string): AgentObservation {
     const raw = completeTerminalOutput(`${this.terminalControlRemainder}${data}`)
     this.terminalControlRemainder = raw.remainder
-    const output = terminalText(raw.complete)
+    // A full screen erase invalidates approval text from older terminal frames.
+    // Keep incremental redraws intact; only discard evidence on explicit ED 2.
+    const clear = [...raw.complete.matchAll(/\x1b\[2J/g)].at(-1)
+    if (this.kind === 'codex' && clear) {
+      this.evidence = ''
+      this.classificationTail = ''
+      this.pendingApprovalCommand = undefined
+      this.handledApprovalSubject = undefined
+    }
+    const output = terminalText(this.kind === 'codex' && clear
+      ? raw.complete.slice(clear.index! + clear[0].length) : raw.complete)
     const recoverableWindow = `${this.recoverableTail}${output}`
     const transientError = this.kind === 'deepseek' ? undefined : recoverableError(recoverableWindow)
     this.recoverableTail = recoverableWindow.slice(-(MODEL_CAPACITY_ERROR.length - 1))
