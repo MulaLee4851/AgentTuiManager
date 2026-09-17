@@ -184,6 +184,10 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
   const [ccSwitchError, setCCSwitchError] = useState('')
   const [nativeSessions, setNativeSessions] = useState<NativeSessionSummary[]>([])
   const [nativeSessionId, setNativeSessionId] = useState('')
+  const rememberedName = nativeSessions.find(item => item.id === nativeSessionId)?.managerDisplayName
+  useEffect(() => {
+    if (rememberedName) setDisplayName(rememberedName)
+  }, [nativeSessionId, rememberedName])
   const [discoveryState, setDiscoveryState] = useState<'idle' | 'loading' | 'ready' | 'unsupported' | 'error'>('idle')
   const [discoveryError, setDiscoveryError] = useState('')
   const [environmentViews, setEnvironmentViews] = useState<Partial<Record<AgentKind, AgentEnvironmentView>>>({})
@@ -819,6 +823,7 @@ export default function App(): JSX.Element {
   const [activeWorkspace, setActiveWorkspace] = useState<string | undefined>(initialOverviewPreferences.current.activeWorkspace)
   const [sessionOrder, setSessionOrder] = useState<string[]>(initialOverviewPreferences.current.sessionOrder ?? [])
   const [draggingSessionId, setDraggingSessionId] = useState<string>()
+  const [listDraggingId, setListDraggingId] = useState<string>()
   const [detachBusy, setDetachBusy] = useState(false)
   const [handoffError, setHandoffError] = useState('')
   const [externalDrag, setExternalDrag] = useState<ExternalTerminalDragProjection | null>(null)
@@ -999,7 +1004,7 @@ export default function App(): JSX.Element {
   const activeWorkspaceName = currentWorkspace?.split(/[\\/]/).filter(Boolean).at(-1) ?? '尚未选择工作区'
   const mountedSessions = selected
     ? sessions.filter((session) => session.sessionId === selected.sessionId)
-    : view === 'overview' ? orderedSessions : []
+    : orderedSessions
 
   const approveNotification = async (request: ApprovalRequest): Promise<void> => {
     setNotificationBusyId(request.requestId)
@@ -1021,12 +1026,12 @@ export default function App(): JSX.Element {
     finally { setNotificationBusyId(undefined) }
   }
   const fullAutoSession = sessions.find((session) => session.sessionId === fullAutoSessionId)
-  const moveDraggedBefore = (targetId: string): void => {
-    if (!draggingSessionId || draggingSessionId === targetId) return
+  const moveDraggedBefore = (targetId: string, draggedId = draggingSessionId, after = false): void => {
+    if (!draggedId || draggedId === targetId) return
     setSessionOrder(() => {
-      const ids = orderedSessions.map((session) => session.sessionId).filter((id) => id !== draggingSessionId)
+      const ids = orderedSessions.map((session) => session.sessionId).filter((id) => id !== draggedId)
       const targetIndex = ids.indexOf(targetId)
-      ids.splice(targetIndex < 0 ? ids.length : targetIndex, 0, draggingSessionId)
+      ids.splice(targetIndex < 0 ? ids.length : targetIndex + (after ? 1 : 0), 0, draggedId)
       return ids
     })
   }
@@ -1105,7 +1110,25 @@ export default function App(): JSX.Element {
           <div className={`workspace-overview-shell${view === 'overview' ? '' : ' workspace-view-hidden'}`}>{sessions.length === 0 && externalDrag?.phase !== 'hovering'
             ? <section className='empty-state'><div className='empty-icon'>›_</div><h2>还没有受管 Agent</h2><p>选择工作区并启动你的第一个终端 Agent。</p><button className='button-primary' type='button' onClick={openAgentForm}>新增 Agent</button></section>
             : <section className={`agent-overview-workbench${overviewMode === 'list' && !selected ? ' agent-overview-workbench-list' : ''}${selected ? ' agent-overview-workbench-detail' : ''}`}>
-              {overviewMode === 'list' && !selected && <aside className='agent-session-list' aria-label='Agent 列表'>{listSessions.map((session) => <button type='button' className={session.sessionId === activeListSessionId ? 'active' : ''} aria-pressed={session.sessionId === activeListSessionId} aria-label={`切换到 ${session.displayName}`} key={session.sessionId} onClick={() => setListActiveId(session.sessionId)}><AgentLogo kind={session.agentKind} className={`agent-dot agent-${session.agentKind}`} label={session.agentKind} /><span><strong>{session.displayName}</strong><small title={session.workspace}>{session.workspace}</small></span><em className={`status-${sessionDisplayStatus(session)}`}>{SESSION_STATUS_LABEL[sessionDisplayStatus(session)]}</em></button>)}</aside>}
+              {overviewMode === 'list' && !selected && <aside className='agent-session-list' aria-label='Agent 列表'>{listSessions.map((session) => <button type='button' className={session.sessionId === activeListSessionId ? 'active' : ''} aria-pressed={session.sessionId === activeListSessionId} aria-label={`切换到 ${session.displayName}`} key={session.sessionId}
+                draggable title='拖动调整顺序'
+                onDragStart={(event) => {
+                  setListActiveId(activeListSessionId)
+                  setListDraggingId(session.sessionId)
+                  event.dataTransfer.effectAllowed = 'move'
+                  event.dataTransfer.setData('application/x-agent-tui-session', session.sessionId)
+                }}
+                onDragOver={(event) => { if (listDraggingId) { event.preventDefault(); event.dataTransfer.dropEffect = 'move' } }}
+                onDrop={(event) => {
+                  if (!listDraggingId) return
+                  event.preventDefault()
+                  event.stopPropagation()
+                  const bounds = event.currentTarget.getBoundingClientRect()
+                  moveDraggedBefore(session.sessionId, listDraggingId, bounds.height > 0 && event.clientY > bounds.top + bounds.height / 2)
+                  setListDraggingId(undefined)
+                }}
+                onDragEnd={() => setListDraggingId(undefined)}
+                onClick={() => setListActiveId(session.sessionId)}><AgentLogo kind={session.agentKind} className={`agent-dot agent-${session.agentKind}`} label={session.agentKind} /><span><strong>{session.displayName}</strong><small title={session.workspace}>{session.workspace}</small></span><em className={`status-${sessionDisplayStatus(session)}`}>{SESSION_STATUS_LABEL[sessionDisplayStatus(session)]}</em></button>)}</aside>}
               <section key='terminal-grid' className={`terminal-grid terminal-grid-count-${Math.min(selected ? 1 : overviewSessions.length + (externalDrag?.phase === 'hovering' ? 1 : 0), 6)}${overviewMode === 'list' && !selected ? ' terminal-grid-list' : ''}${selected ? ' terminal-grid-detail' : ''}`}>{mountedSessions.map((session) => <TerminalTile
                 key={session.sessionId}
                 session={session}

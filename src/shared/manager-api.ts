@@ -69,6 +69,7 @@ export interface AgentProxySummary {
 export interface ContinueKeywordSettings {
   enabled: boolean
   quietSeconds: number
+  maxRetries?: number
   keywords: string[]
 }
 
@@ -281,6 +282,7 @@ export interface BulkApprovalResult {
 export interface NativeSessionSummary {
   id: string
   title: string
+  managerDisplayName?: string
   updatedAt: number
   workspace: string
   subtitle?: string

@@ -40,7 +40,9 @@ function normalizedSettings(value: unknown): ContinueKeywordSettings {
       .map((keyword) => normalizeContinueKeyword(typeof keyword === 'string' ? keyword : ''))
       .filter((keyword): keyword is string => Boolean(keyword)))]
     : []
-  return { enabled: input.enabled === true, quietSeconds, keywords }
+  const maxRetries = Number.isInteger(input.maxRetries) && Number(input.maxRetries) >= 1 && Number(input.maxRetries) <= 100
+    ? Number(input.maxRetries) : 3
+  return { enabled: input.enabled === true, quietSeconds, keywords, maxRetries }
 }
 
 export class ContinueKeywordStore {
@@ -62,7 +64,7 @@ export class ContinueKeywordStore {
   }
 
   getSettings(): ContinueKeywordSettings {
-    return { ...this.settings, keywords: [...this.settings.keywords] }
+    return { ...this.settings, maxRetries: this.settings.maxRetries ?? 3, keywords: [...this.settings.keywords] }
   }
 
   match(value: string): string | undefined {

@@ -23,6 +23,7 @@ import { AgentProxyStore, environmentForAgentProxy } from './agent-proxy-store'
 import { ContinueKeywordStore } from './continue-keyword-store'
 import { SessionSafetyStore } from './session-safety-store'
 import { ManagedSessionCatalog } from './managed-session-catalog'
+import { restoreStartupWorkspace, workspaceRestoreCandidates } from './startup-workspace'
 import { DingTalkSettingsStore } from './dingtalk-settings-store'
 import { DingTalkCommandRouter } from './dingtalk-command-router'
 import { DingTalkStreamService } from './dingtalk-stream-service'
@@ -186,13 +187,14 @@ function agentProxyInput(value: unknown): AgentProxyInput {
 function continueKeywordSettings(value: unknown): ContinueKeywordSettings {
   if (!value || typeof value !== 'object') throw new Error('Continue 关键词设置格式无效')
   const input = value as Record<string, unknown>
-  if (!Number.isInteger(input.quietSeconds) || Number(input.quietSeconds) < 3 || Number(input.quietSeconds) > 60) {
-    throw new Error('静默等待时间必须是 3 到 60 秒的整数')
+  if (input.maxRetries !== undefined && (!Number.isInteger(input.maxRetries) || Number(input.maxRetries) < 1 || Number(input.maxRetries) > 100)) {
+    throw new Error('最大连续续跑次数必须是 1 到 100 的整数')
   }
   if (!Array.isArray(input.keywords) || input.keywords.length > 50) throw new Error('Continue 关键词最多保存 50 条')
   return {
     enabled: input.enabled === true,
-    quietSeconds: Number(input.quietSeconds),
+    quietSeconds: 10, // Legacy storage compatibility only; no quiet-time delay.
+    maxRetries: Number(input.maxRetries ?? 3),
     keywords: input.keywords.map((keyword, index) => text(keyword, 'keywords[' + index + ']', 200)),
   }
 }
@@ -827,7 +829,13 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
     trustedRenderer(event)
     const target = sessionId(id)
     recordAudit({ level: 'info', category: 'session', action: 'session_restart_requested', message: '正在重新启动 Agent', sessionId: target })
-    await controller.restartSession(target)
+    try {
+      await controller.restartSession(target)
+    } catch (error) {
+      recordAudit({ level: 'error', category: 'session', action: 'session_restart_failed', message: 'Agent 重新启动失败', sessionId: target,
+        details: { error: error instanceof Error ? error.message : String(error) } })
+      throw error
+    }
     recordAudit({ level: 'info', category: 'session', action: 'session_restarted', message: 'Agent 已重新启动', sessionId: target })
   })
   ipcMain.handle(IPC_CHANNELS.continueSession, (event, id: unknown) => {
@@ -993,7 +1001,7 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
       category: 'rule',
       action: 'continue_keyword_settings_updated',
       message: settings.enabled ? '已开启关键词 Continue（' + settings.keywords.length + ' 条规则）' : '已关闭关键词 Continue',
-      details: { enabled: settings.enabled, keywordCount: settings.keywords.length, quietSeconds: settings.quietSeconds },
+      details: { enabled: settings.enabled, keywordCount: settings.keywords.length, maxRetries: settings.maxRetries ?? 3 },
     })
     return settings
   })
@@ -1007,7 +1015,7 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
     controller.updateCrashRetentionPolicy(saved.preserveWorkspaceOnCrash)
     recordAudit({
       level: 'info', category: 'session', action: 'crash_retention_changed',
-      message: saved.preserveWorkspaceOnCrash ? '异常退出后将保留运行中的 Agent 并在下次启动接管' : '异常退出后将停止 Agent、释放会话且不保留工作区记录',
+      message: saved.preserveWorkspaceOnCrash ? '异常退出后将保留运行中的 Agent 并在下次启动接管' : '异常退出后将停止 Agent、释放进程，目录记录仍保留供下次恢复',
       details: { preserveWorkspaceOnCrash: saved.preserveWorkspaceOnCrash },
     })
     return saved
@@ -1210,9 +1218,11 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
     const selected = result.filePaths[0]
     return selected && isAbsolute(selected) ? selected : undefined
   })
-  ipcMain.handle(IPC_CHANNELS.discoverSessions, (event, kind: unknown, selectedWorkspace: unknown) => {
+  ipcMain.handle(IPC_CHANNELS.discoverSessions, async (event, kind: unknown, selectedWorkspace: unknown) => {
     trustedRenderer(event)
-    return coalescedDiscovery(validatedAgentKind(kind), workspace(selectedWorkspace))
+    const agentKind = validatedAgentKind(kind)
+    const discovered = await coalescedDiscovery(agentKind, workspace(selectedWorkspace))
+    return sessionCatalog.nameHistory(agentKind, discovered)
   })
   ipcMain.handle(IPC_CHANNELS.readClipboardText, (event) => {
     trustedRenderer(event)
@@ -1263,6 +1273,32 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
   ipcMain.handle(IPC_CHANNELS.writeClipboardText, (event, value: unknown) => {
     trustedRenderer(event)
     clipboard.writeText(text(value, 'clipboard text', 4 * 1024 * 1024), 'clipboard')
+  })
+}
+
+async function promptStartupWorkspace(window: BrowserWindow): Promise<void> {
+  const ids = sessionCatalog.startupWorkspace().map(entry => entry.sessionId)
+  const candidates = workspaceRestoreCandidates(ids, controller.listSessions())
+  if (!candidates.length || window.isDestroyed()) return
+  const result = await dialog.showMessageBox(window, {
+    type: 'question', title: '恢复上次工作区',
+    message: `恢复上次启动的 ${candidates.length} 个 Agent？`,
+    detail: candidates.map(item => `• ${item.displayName}（${item.agentKind}）`).join('\n')
+      + '\n\n只恢复原生会话，不创建新会话。已停止的旧窗口不在此列表；全自动批准保留原开关，无监管仍需手动开启。',
+    buttons: ['恢复上次工作区', '跳过'], defaultId: 0, cancelId: 1, noLink: true,
+  })
+  if (result.response !== 0 || window.isDestroyed() || quitting) return
+  const restored = await restoreStartupWorkspace(ids, controller)
+  await controller.flushCatalog()
+  recordAudit({ level: restored.failed.length ? 'warning' : 'info', category: 'session', action: 'startup_workspace_restored',
+    message: `已恢复 ${restored.restored.length} 个 Agent，${restored.failed.length} 个未恢复` })
+  for (const failure of restored.failed) {
+    recordAudit({ level: 'error', category: 'session', action: 'session_restart_failed', sessionId: failure.sessionId,
+      message: failure.name + ' 启动恢复失败', details: { error: failure.reason } })
+  }
+  if (restored.failed.length && !window.isDestroyed()) await dialog.showMessageBox(window, {
+    type: 'warning', title: '部分 Agent 未恢复', message: '其他 Agent 已继续恢复，以下窗口可在目录中手动处理。',
+    detail: restored.failed.map(item => item.name + '：' + item.reason).join('\n'), buttons: ['知道了'],
   })
 }
 
@@ -1328,9 +1364,9 @@ async function requestManagerQuit(): Promise<void> {
     const options: Electron.MessageBoxOptions = {
       type: 'question',
       title: '退出 Agent TUI Manager',
-      message: '退出后是否保留当前工作区？',
-      detail: '保留：Agent 继续运行，下次打开 Manager 自动恢复。\n不保留：停止受管 Agent 并释放原生会话；不会删除 Codex 或 Claude Code 的原生历史。',
-      buttons: ['保留并退出', '不保留并退出', '取消'],
+      message: '退出后是否让 Agent 继续运行？',
+      detail: '继续运行：下次打开 Manager 接管仍存活的进程。\n停止进程：保留 Agent 目录和配置，下次启动提示恢复本次启动的原生会话。两种方式都会保存启动快照，已停止的 Agent 不加入快照。',
+      buttons: ['继续运行并退出', '停止进程并退出', '取消'],
       defaultId: 0,
       cancelId: 2,
       noLink: true,
@@ -1339,6 +1375,7 @@ async function requestManagerQuit(): Promise<void> {
       ? await dialog.showMessageBox(mainWindow, options)
       : await dialog.showMessageBox(options)
     if (result.response === 2) return
+    await sessionCatalog.captureWorkspaceBeforeExit()
     if (result.response === 0) {
       const count = await controller.preserveAllSessions()
       await controller.flushCatalog()
@@ -1347,12 +1384,8 @@ async function requestManagerQuit(): Promise<void> {
       const sessions = controller.listSessions()
       await controller.stopAllSessions()
       for (const session of sessions) await restoreNativeSessionProvider(session)
-      const count = await controller.clearAllSessions()
-      for (const session of sessions) {
-        if (session.agentConfig?.profileId) await agentConfigurationStore.remove(session.agentConfig.profileId).catch(() => undefined)
-        if (session.agentProxy?.proxyId) await agentProxyStore.remove(session.agentProxy.proxyId).catch(() => undefined)
-      }
-      recordAudit({ level: 'warning', category: 'session', action: 'manager_exit_released', message: `已释放并清除 ${count} 个受管 Agent`, details: { count } })
+      await controller.flushCatalog()
+      recordAudit({ level: 'info', category: 'session', action: 'manager_exit_released', message: '已停止受管进程，保留目录、配置和启动快照', details: { count: sessions.length } })
     }
     quitPrepared = true
     quitting = true
@@ -1360,6 +1393,7 @@ async function requestManagerQuit(): Promise<void> {
   } catch (error) {
     quitting = false
     quitPrepared = false
+    sessionCatalog.startWorkspaceTracking()
     const message = error instanceof Error ? error.message : String(error)
     recordAudit({ level: 'error', category: 'session', action: 'manager_exit_preserve_failed', message: '保留 Agent 失败，Manager 未退出', details: { error: message } })
     const options: Electron.MessageBoxOptions = {
@@ -1561,10 +1595,16 @@ void app.whenReady().then(async () => {
   }
   const recoveryActivity = {
     keywordMatched(sessionId: string, keyword: string) {
-      recordAudit({ level: 'warning', category: 'recovery', action: 'continue_keyword_matched', message: '命中 Continue 关键词，正在等待输出静默', sessionId, details: { keyword, quietSeconds: continueKeywordStore.getSettings().quietSeconds } })
+      recordAudit({ level: 'info', category: 'recovery', action: 'continue_keyword_matched', message: '命中 Continue 关键词，校验 Agent 状态', sessionId, details: { keyword } })
     },
     keywordContinued(sessionId: string, keyword: string) {
-      recordAudit({ level: 'warning', category: 'recovery', action: 'continue_keyword_sent', message: '输出持续静默，已按关键词规则尝试 Continue 一次', sessionId, details: { keyword, attempt: 1 } })
+      recordAudit({ level: 'warning', category: 'recovery', action: 'continue_keyword_sent', message: 'Agent 已停止工作，已按关键词规则尝试 Continue', sessionId, details: { keyword } })
+    },
+    keywordLimitReached(sessionId: string, count: number) {
+      recordAudit({ level: 'warning', category: 'recovery', action: 'continue_keyword_limit_reached', message: '关键词续跑已达连续次数上限，等待人工处理', sessionId, details: { count } })
+    },
+    keywordFailed(sessionId: string, reason: string) {
+      recordAudit({ level: 'warning', category: 'recovery', action: 'continue_keyword_failed', message: '关键词续跑提交未完成，请检查终端', sessionId, details: { reason } })
     },
   }
   const llmApprovalReview = {
@@ -1653,7 +1693,13 @@ void app.whenReady().then(async () => {
       await restoreNativeSessionProvider(session)
     }
   }
-  createWindow(); createTray()
+  const startupWindow = createWindow()
+  createTray()
+  sessionCatalog.startWorkspaceTracking()
+  void promptStartupWorkspace(startupWindow).catch(error => {
+    recordAudit({ level: 'error', category: 'session', action: 'startup_workspace_prompt_failed', message: '恢复上次工作区失败',
+      details: { error: error instanceof Error ? error.message : String(error) } })
+  })
   if (ENABLE_NATIVE_DRAG_IN_BETA) {
     nativeDragBridge = new NativeDragBridge(handleNativeDrag, (message) => {
       recordAudit({ level: 'warning', category: 'session', action: 'native_drag_bridge_warning', message: 'Windows 外部终端拖入监听不可用', details: { error: message } })

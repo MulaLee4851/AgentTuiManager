@@ -237,6 +237,27 @@ describe('App terminal wall', () => {
     expect(Terminal).toHaveBeenCalledTimes(2)
   })
 
+  it('preserves terminal instances and replay state while navigating away and back', async () => {
+    render(<App />)
+    const tile = await screen.findByTestId('terminal-tile-session-1')
+    const opens = terminalMocks.open.mock.calls.length
+    const replays = vi.mocked(api.terminalReplay).mock.calls.length
+    terminalMocks.dispose.mockClear()
+    terminalMocks.scrollToBottom.mockClear()
+    for (let count = 0; count < 3; count += 1) {
+      fireEvent.click(screen.getByRole('button', { name: /审计$/ }))
+      await screen.findByRole('heading', { name: '活动审计' })
+      expect(tile.isConnected).toBe(true)
+      expect(terminalMocks.dispose).not.toHaveBeenCalled()
+      fireEvent.click(screen.getByRole('button', { name: /总览$/ }))
+      await screen.findByRole('heading', { name: 'Agent 总览' })
+      expect(screen.getByTestId('terminal-tile-session-1')).toBe(tile)
+    }
+    expect(terminalMocks.open).toHaveBeenCalledTimes(opens)
+    expect(api.terminalReplay).toHaveBeenCalledTimes(replays)
+    expect(terminalMocks.scrollToBottom).not.toHaveBeenCalled()
+  })
+
   it('filters both overview modes by task activity without rebuilding terminals or scrolling to bottom', async () => {
     vi.mocked(api.listSessions).mockResolvedValue([
       { ...session, activity: 'running' },
@@ -690,6 +711,27 @@ describe('App terminal wall', () => {
     })))
   })
 
+  it('reorders the sidebar list without changing the active terminal and saves the shared order', async () => {
+    vi.mocked(api.listSessions).mockResolvedValue([session, { ...session, sessionId: 'session-2', displayName: 'Second' }])
+    render(<App />)
+    await screen.findByTestId('terminal-tile-session-2')
+    fireEvent.click(within(screen.getByRole('group', { name: 'Agent 显示模式' })).getByRole('button', { name: /列表/ }))
+    const first = screen.getByRole('button', { name: '切换到 Codex API 重构' })
+    const second = screen.getByRole('button', { name: '切换到 Second' })
+    const transfer = { setData: vi.fn(), effectAllowed: '', dropEffect: '' }
+    const mounts = vi.mocked(Terminal).mock.calls.length
+    fireEvent.dragStart(second, { dataTransfer: transfer })
+    fireEvent.dragOver(first, { dataTransfer: transfer })
+    fireEvent.drop(first, { dataTransfer: transfer })
+    expect(within(screen.getByLabelText('Agent 列表')).getAllByRole('button')[0]).toBe(second)
+    expect(first).toHaveAttribute('aria-pressed', 'true')
+    expect(Terminal).toHaveBeenCalledTimes(mounts)
+    expect(document.querySelector('.native-terminal-dropzone')).toBeNull()
+    expect(JSON.parse(localStorage.getItem('agent-tui-manager:overview-preferences:v1')!).sessionOrder).toEqual(['session-2', 'session-1'])
+    fireEvent.click(within(screen.getByRole('group', { name: 'Agent 显示模式' })).getByRole('button', { name: /总览/ }))
+    expect(document.querySelector('.terminal-grid > article')?.getAttribute('data-testid')).toBe('terminal-tile-session-2')
+  })
+
   it('opens and saves disabled-by-default Continue keyword rules', async () => {
     render(<App />)
     await screen.findByText('Codex API 重构')
@@ -698,11 +740,12 @@ describe('App terminal wall', () => {
     expect(screen.getByRole('switch', { name: '启用关键词 Continue' })).not.toBeChecked()
     fireEvent.click(screen.getByRole('switch', { name: '启用关键词 Continue' }))
     fireEvent.change(screen.getByLabelText('Continue 关键词列表'), { target: { value: 'model busy\nconnection lost' } })
-    fireEvent.change(screen.getByLabelText('Continue 静默等待秒数'), { target: { value: '8' } })
+    expect(screen.queryByLabelText('Continue 静默等待秒数')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
     await waitFor(() => expect(api.updateContinueKeywordSettings).toHaveBeenCalledWith({
       enabled: true,
-      quietSeconds: 8,
+      quietSeconds: 10,
+      maxRetries: 3,
       keywords: ['model busy', 'connection lost'],
     }))
   })
@@ -805,7 +848,7 @@ describe('App terminal wall', () => {
     await waitFor(() => expect(api.write).toHaveBeenCalledWith('session-1', '\x1b[200~const pasted = true\x1b[201~'))
     expect(terminalMocks.paste).not.toHaveBeenCalled()
 
-    expect(handler({ type: 'keydown', key: 'c', ctrlKey: true, metaKey: false, altKey: false, shiftKey: true } as KeyboardEvent)).toBe(false)
+    expect(handler(new KeyboardEvent('keydown', { key: 'c', ctrlKey: true, shiftKey: true, cancelable: true }))).toBe(false)
     await waitFor(() => expect(api.writeClipboardText).toHaveBeenCalledWith('selected output'))
 
     fireEvent.click(screen.getByRole('button', { name: '复制终端内容' }))
@@ -1105,6 +1148,24 @@ describe('App terminal wall', () => {
       agentKind: kind, nativeSessionId: id, args: resumeArgs,
       recovery: { executable: kind, args: resumeArgs },
     }))
+  })
+
+  it('restores the latest Manager alias into the selected native session name', async () => {
+    vi.mocked(api.discoverSessions).mockImplementation(async (_kind, workspace) => [{
+      id: 'remembered-native', title: 'AgentTuiManager开发', managerDisplayName: 'AgentTuiManager开发',
+      workspace, updatedAt: 1_786_000_000_000,
+    }])
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: /新建 Agent/ }))
+    fireEvent.click(screen.getByRole('button', { name: '选择文件夹' }))
+    await waitFor(() => expect(screen.getByLabelText('历史会话')).toHaveTextContent('AgentTuiManager开发'))
+    fireEvent.change(screen.getByLabelText('历史会话'), { target: { value: 'remembered-native' } })
+    expect(screen.getByLabelText('显示名称')).toHaveValue('AgentTuiManager开发')
+    fireEvent.click(screen.getByRole('button', { name: '恢复会话' }))
+    await waitFor(() => expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({
+      nativeSessionId: 'remembered-native', displayName: 'AgentTuiManager开发',
+    })))
   })
 
   it('keeps a selected history session while configuring the Agent', async () => {

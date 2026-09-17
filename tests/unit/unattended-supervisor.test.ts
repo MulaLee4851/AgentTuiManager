@@ -26,6 +26,50 @@ function fixture() {
 }
 
 describe('per-window unattended mode', () => {
+  it('approves during recovery cooldown instead of waiting ten seconds', async () => {
+    const f = fixture()
+    f.time(16000); await f.supervisor.tick('a')
+    expect(f.port.send).toHaveBeenCalledTimes(1)
+    f.pending([{ sessionId: 'a', requestId: 'hook-next', source: 'codex-hook' } as ApprovalRequest])
+    f.time(17000); await f.supervisor.tick('a')
+    expect(f.port.approve).toHaveBeenCalledWith('hook-next')
+    expect(f.port.send).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not hold new hooks behind delayed Enter or initial cooldown', async () => {
+    const f = fixture()
+    f.supervisor.enable('a', { ...settings, approvalEnterDelaySeconds: 10 })
+    f.pending([{ sessionId: 'a', requestId: 'one', source: 'codex-hook' } as ApprovalRequest])
+    f.time(11000); await f.supervisor.tick('a')
+    expect(f.port.approve).toHaveBeenCalledWith('one')
+    f.pending([{ sessionId: 'a', requestId: 'two', source: 'codex-hook' } as ApprovalRequest])
+    f.time(12000); await f.supervisor.tick('a')
+    expect(f.port.approve).toHaveBeenCalledWith('two')
+    expect(f.port.enter).not.toHaveBeenCalled()
+    expect(f.port.send).not.toHaveBeenCalled()
+    f.pending([])
+    f.time(20999); await f.supervisor.tick('a')
+    expect(f.port.enter).not.toHaveBeenCalled()
+    f.time(21000); await f.supervisor.tick('a')
+    // A newer hook must not postpone the existing fallback deadline.
+    expect(f.port.enter).toHaveBeenCalledTimes(1)
+    expect(f.port.audit).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'unattended_approved',
+      details: expect.objectContaining({ requestId: 'two', source: 'codex-hook' }),
+    }))
+  })
+
+  it('drains simultaneous approvals without one Enter timer per request', async () => {
+    const f = fixture()
+    f.supervisor.enable('a', { ...settings, approvalEnterDelaySeconds: 7, approvalEnterCount: 5 })
+    f.pending(['one', 'two', 'three'].map(requestId => ({ sessionId: 'a', requestId, source: 'codex-hook' } as ApprovalRequest)))
+    f.time(11000); await f.supervisor.tick('a')
+    expect(f.port.approve.mock.calls).toEqual([['one'], ['two'], ['three']])
+    expect(f.port.audit.mock.calls.filter(([entry]) => entry.action === 'unattended_approval_enter_scheduled')).toHaveLength(1)
+    expect(f.port.enter).not.toHaveBeenCalled()
+    expect(f.port.send).not.toHaveBeenCalled()
+  })
+
   it('sends the configured count one second apart, without catch-up bursts', async () => {
     const f = fixture()
     f.supervisor.enable('a', { ...settings, approvalEnterDelaySeconds: 5, approvalEnterCount: 3 })

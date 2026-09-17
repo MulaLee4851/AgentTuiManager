@@ -108,10 +108,32 @@ export class UnattendedSupervisor {
       this.disable(id, 'Agent 已输出结束词 ' + mode.assistant.text + '，无监管已完成')
       return
     }
-    if (this.now() < mode.nextAt && !mode.approvalEnter) return
     const current = () => this.modes.get(id) === mode
     mode.busy = true
     try {
+      // Permission decisions must not wait for recovery cooldown or Enter fallback.
+      const requests = this.port.approvals(id)
+      if (requests.length) {
+        for (const request of requests) {
+          if (!current()) return
+          if (!this.port.approvals(id).some(item => item.requestId === request.requestId)) continue
+          const revision = mode.inputRevision ?? 0
+          const epoch = this.port.epoch?.(id)
+          await this.port.approve(request.requestId)
+          if (!current()) return
+          const delay = mode.settings.approvalEnterDelaySeconds ?? 0
+          if (!mode.approvalEnter && delay > 0 && this.port.enter && revision === (mode.inputRevision ?? 0) && epoch === this.port.epoch?.(id)) {
+            // At most one pending timestamp per window; reuse the existing tick.
+            const count = mode.settings.approvalEnterCount ?? 1
+            mode.approvalEnter = { at: this.now() + delay * 1000, epoch, requestId: request.requestId, remaining: count, total: count }
+            this.port.audit({ sessionId: id, action: 'unattended_approval_enter_scheduled', message: '审批后将在 ' + delay + ' 秒后补按一次 Enter', details: { requestId: request.requestId, delaySeconds: delay } })
+          }
+          this.port.audit({ sessionId: id, action: 'unattended_approved', message: '无监管已批准工具请求（忽略风险限制）',
+            details: { requestId: request.requestId, source: request.source ?? 'unknown', toolName: request.toolName ?? '', command: request.command ?? '', risk: request.risk } })
+        }
+        mode.nextAt = this.now() + 5000
+        return
+      }
       const followup = mode.approvalEnter
       if (followup) {
         if (followup.epoch !== this.port.epoch?.(id) || ['starting', 'recovering', 'stopped', 'completed', 'failed'].includes(session.status)) {
@@ -133,29 +155,6 @@ export class UnattendedSupervisor {
         }
       }
       if (this.now() < mode.nextAt) return
-      const requests = this.port.approvals(id)
-      if (requests.length) {
-        for (const request of requests) {
-          if (!current()) return
-          if (!this.port.approvals(id).some(item => item.requestId === request.requestId)) continue
-          const revision = mode.inputRevision ?? 0
-          const epoch = this.port.epoch?.(id)
-          await this.port.approve(request.requestId)
-          if (!current()) return
-          const delay = mode.settings.approvalEnterDelaySeconds ?? 0
-          if (delay > 0 && this.port.enter && revision === (mode.inputRevision ?? 0) && epoch === this.port.epoch?.(id)) {
-            // At most one pending timestamp per window; reuse the existing tick.
-            const count = mode.settings.approvalEnterCount ?? 1
-            mode.approvalEnter = { at: this.now() + delay * 1000, epoch, requestId: request.requestId, remaining: count, total: count }
-            this.port.audit({ sessionId: id, action: 'unattended_approval_enter_scheduled', message: '审批后将在 ' + delay + ' 秒后补按一次 Enter', details: { requestId: request.requestId, delaySeconds: delay } })
-          }
-          this.port.audit({ sessionId: id, action: 'unattended_approved', message: '无监管已批准工具请求（忽略风险限制）',
-            details: { requestId: request.requestId, toolName: request.toolName ?? '', command: request.command ?? '', risk: request.risk } })
-          if (mode.approvalEnter) break
-        }
-        mode.nextAt = this.now() + 5000
-        return
-      }
       // An approval acknowledgement may still be in flight. Never send recovery
       // text just because the UI queue has temporarily become empty.
       if (session.status === 'needs_approval') return
