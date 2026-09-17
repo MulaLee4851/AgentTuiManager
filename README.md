@@ -9,6 +9,8 @@
 
 Windows / macOS · MIT Open Source
 
+当前代码版本：**0.4.5**。各平台安装包以 [Releases](https://github.com/MulaLee4851/AgentTuiManager/releases) 实际附件为准。
+
 ---
 
 ## 你是不是也开始变成 Agent 监工了？
@@ -159,6 +161,19 @@ Agent TUI Manager 只是管理进程和交互。
 ![钉钉侧远程命令与审批消息](media/dingtalk-message.png)
 
 ## 核心能力
+
+### 0.4.x 近期更新
+
+- **自定义排序**：总览卡片与列表侧栏支持拖动排序，共用并保存同一份顺序；列表拖动不切换当前 Agent。
+- **历史名称记忆**：Manager 名称与原生会话绑定，只保存最新名称；删除窗口后，恢复历史仍优先显示该名称。
+- **启动恢复工作区**：启动时提示恢复上次启动的 Agent；已停止窗口保留在目录中，但不加入恢复名单。恢复保留各窗口的全自动开关，无监管仍需手动开启。
+- **会话 ID 与手动刷新**：窗口工作目录旁可复制原生会话 ID，终端复制按钮旁提供手动刷新。
+- **关键词续跑**：检查最近回复或错误，结合待命/完成/异常状态触发；取消静默等待设置，支持每个 Agent 独立的最大连续次数（默认 3 次）。待审批、未提交输入和手动中断不触发。
+- **Codex Astra 兼容**：Manager 启动/恢复 Codex 时注入 `-c tui.whimsy=false`，关闭输入栏星星等装饰效果，保留普通动画，不改全局配置。设置随应用分发；已运行的 Codex 需停止后重新启动。
+
+切换页签不再额外触发兜底刷新；真实尺寸变化仍正常适配，手动刷新按钮保留。关闭装饰效果不代表所有 CLI 版本的终端渲染问题都已解决。
+
+### 功能总览
 
 - **多 Agent 总览**：网格墙或列表模式同时管理多个终端 Agent；状态支持多选并记住筛选条件
 - **任务状态**：区分已停止、运行中、待命、待审批、异常，不把“窗口开着”直接当成任务运行中
@@ -389,7 +404,7 @@ claude --resume <session-id>
 - 外部终端**拖入**仍为 Beta，默认关闭；**拖出**可用
 - 代理目前支持 **HTTP**；HTTPS / SOCKS5 配置尚未开放
 - Pi 新建入口暂不可用；DeepSeek Harness 使用官方 Web，不是与 Claude Code / Codex 同等粒度的终端集成
-- 各平台产物以对应 Release 的附件为准；本次 0.3.5 发布 Windows x64 包，不提供新构建的 macOS 包
+- 各平台产物以对应 Release 的附件为准；0.4.5 已构建 Windows x64 安装包，macOS 需要在对应平台另行构建
 
 ---
 
@@ -409,3 +424,11 @@ Electron · React · TypeScript · xterm.js · node-pty（Windows ConPTY / macOS
 ## License
 
 [MIT](LICENSE) © 2026 MulaLee
+
+## 社区
+
+认可并感谢 **LINUX DO 社区**，欢迎与社区分享使用经验、讨论问题和跟踪项目发展。
+
+| 社区 | 说明 |
+| --- | --- |
+| [Linux.Do](https://linux.do/) | 与社区分享、讨论和跟踪发展。 |
