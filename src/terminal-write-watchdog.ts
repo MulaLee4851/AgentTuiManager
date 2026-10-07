@@ -1,4 +1,5 @@
 export type TerminalWriteCompletion = (timedOut: boolean) => void
+export type TerminalWriteCallback = (() => void) & { progress: () => void }
 
 /**
  * Guards xterm's asynchronous `write(data, callback)` completion callback.
@@ -15,20 +16,25 @@ export class TerminalWriteWatchdog {
 
   constructor(private readonly timeoutMs: number) {}
 
-  arm(onComplete: TerminalWriteCompletion, onLateComplete?: () => void): () => void {
+  arm(onComplete: TerminalWriteCompletion, onLateComplete?: () => void): TerminalWriteCallback {
     const generation = ++this.generation
     let completionSent = false
     let callbackSeen = false
 
-    const timer = setTimeout(() => {
+    const expire = (): void => {
       this.timers.delete(generation)
       if (this.disposed || completionSent) return
       completionSent = true
       onComplete(true)
-    }, this.timeoutMs)
-    this.timers.set(generation, timer)
+    }
+    const renew = (): void => {
+      const previous = this.timers.get(generation)
+      if (previous) clearTimeout(previous)
+      this.timers.set(generation, setTimeout(expire, this.timeoutMs))
+    }
+    renew()
 
-    return () => {
+    return Object.assign(() => {
       if (callbackSeen || this.disposed) return
       callbackSeen = true
       const pendingTimer = this.timers.get(generation)
@@ -42,7 +48,13 @@ export class TerminalWriteWatchdog {
       } else {
         onLateComplete?.()
       }
-    }
+    }, {
+      // Parsing may yield between chunks of one logical replay. A progressing
+      // batch is not stalled: keep its protocol/resize latch until the final chunk.
+      progress: () => {
+        if (!this.disposed && !completionSent && !callbackSeen && generation === this.generation) renew()
+      },
+    })
   }
 
   dispose(): void {

@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 
 import type { ApprovalRequest, ApprovalRisk, SessionSummary } from './shared/manager-api'
+import { approvalModeOf } from './shared/approval-mode'
+import { approvalReviewLabel } from './shared/approval-review-label'
 
 interface AttentionCenterProps {
   sessions: SessionSummary[]
@@ -52,6 +54,7 @@ export default function AttentionCenter({
   onOpenSession,
   onReload,
 }: AttentionCenterProps): JSX.Element {
+  const automatic = (request: ApprovalRequest): boolean => { const owner = sessions.find(session => session.sessionId === request.sessionId); return owner ? approvalModeOf(owner) !== 'manual' : Boolean(request.llmReviewStatus) }
   const queue = useMemo<QueueItem[]>(() => [
     ...approvals.map((request) => ({ key: 'approval:' + request.requestId, kind: 'approval' as const, request })),
     ...sessions
@@ -88,7 +91,7 @@ export default function AttentionCenter({
         ? await window.agentManager.approveAllPending()
         : await (async () => {
           let approved = 0
-          for (const request of approvals.filter((item) => item.canBulkApprove)) {
+          for (const request of approvals.filter((item) => item.canBulkApprove && !automatic(item))) {
             await window.agentManager.approveSession(request.sessionId)
             approved += 1
           }
@@ -101,7 +104,7 @@ export default function AttentionCenter({
   }
 
   const recoveryCount = queue.length - approvals.length
-  const bulkCount = approvals.filter((request) => request.canBulkApprove).length
+  const bulkCount = approvals.filter((request) => request.canBulkApprove && !automatic(request)).length
 
   return <section className='attention-page attention-page-embedded'>
     <div className='attention-shell attention-shell-embedded'>
@@ -136,7 +139,7 @@ export default function AttentionCenter({
               onClick={() => setSelectedKey(item.key)}
             >
               <i className='severity' />
-              <span><span className='queue-top'><strong>{item.request.displayName}</strong><em>{item.request.llmReviewStatus === 'pending' ? 'LLM 审查中' : risk.label}</em></span>
+              <span><span className='queue-top'><strong>{item.request.displayName}</strong><em>{item.request.llmReviewStatus ? approvalReviewLabel(item.request) : risk.label}</em></span>
                 <span className='queue-command'>{item.request.toolName ? item.request.toolName + ' · ' : ''}{approvalDisplay(item.request)}</span>
                 <span className='queue-meta'>{item.request.agentKind.toUpperCase()} · {item.request.workspace}{item.request.dangerRuleName ? ' · 命中：' + item.request.dangerRuleName : ''}</span>
               </span>
@@ -151,6 +154,7 @@ export default function AttentionCenter({
             ? <RecoveryDetail session={selected.session} busy={busy} error={error} onOpen={() => onOpenSession(selected.session.sessionId)} onContinue={() => run(() => window.agentManager.continueSession(selected.session.sessionId))} />
             : <ApprovalDetail
               request={selected.request}
+              automatic={automatic(selected.request)}
               busy={busy}
               error={error}
               onOpen={() => onOpenSession(selected.request.sessionId)}
@@ -178,6 +182,7 @@ export default function AttentionCenter({
 
 function ApprovalDetail({
   request,
+  automatic,
   busy,
   error,
   onOpen,
@@ -186,6 +191,7 @@ function ApprovalDetail({
   onApprove,
 }: {
   request: ApprovalRequest
+  automatic: boolean
   busy: boolean
   error: string
   onOpen: () => void
@@ -197,7 +203,7 @@ function ApprovalDetail({
   const highRisk = request.risk === 'delete' || request.risk === 'write' || request.risk === 'unknown'
   const targets = approvalTargets(request)
   return <div className='attention-detail-inner'>
-    <p className={'detail-kicker ' + risk.tone}>{risk.label} · 需要本次确认{request.dangerRuleName ? ' · 命中 ' + request.dangerRuleName : ''}</p>
+    <p className={'detail-kicker ' + risk.tone}>{risk.label} · {automatic ? '自动审批处理中' : '需要本次确认'}{request.dangerRuleName ? ' · 命中 ' + request.dangerRuleName : ''}</p>
     <h2>{approvalTitle(request)}</h2>
     <p className='detail-subtitle'>请求来自“{request.displayName}”会话 · {request.workspace} · 会话 {request.nativeSessionId ?? request.sessionId}</p>
     <section className='command-card'>
@@ -206,18 +212,18 @@ function ApprovalDetail({
       <div className='command-path'>{targets.length ? '目标：' + targets.join(' · ') : '工作目录：' + request.workspace}</div>
     </section>
     <div className='approval-facts'>
-      <div><span>文件影响</span><strong className={risk.tone}>{targets.length ? targets.length + ' 个目标' : risk.impact}</strong></div>
+      <div><span>文件影响</span><strong className={risk.tone}>{targets.length ? targets.length + ' 个目标' : automatic && request.risk === 'unknown' ? '根据实际操作评估' : risk.impact}</strong></div>
       <div><span>工具名称</span><strong>{request.toolName ?? '未提供'}</strong></div>
       <div><span>可恢复性</span><strong className={highRisk ? 'delete' : 'read'}>{risk.reversibility}</strong></div>
       <div><span>{request.dangerRuleName ? '命中规则' : '自动学习'}</span><strong className={highRisk ? 'delete' : 'read'}>{request.dangerRuleName ?? risk.learning}</strong></div>
     </div>
     <div className={'approval-reason ' + (highRisk ? 'danger' : '')}>
-      <strong>{request.dangerRuleName ? '命中高危规则「' + request.dangerRuleName + '」' : highRisk ? '为什么必须人工确认？' : '为什么这次仍需确认？'}</strong>
+      <strong>{request.dangerRuleName ? '命中高危规则「' + request.dangerRuleName + '」' : automatic ? '自动审批依据' : highRisk ? '为什么必须人工确认？' : '为什么这次仍需确认？'}</strong>
       <p>{request.reason}</p>
     </div>
     {request.llmReviewStatus && <section className={'llm-approval-review status-' + request.llmReviewStatus}>
-      <header><div><strong>LLM 安全审查</strong><span>{request.llmReviewStatus === 'pending' ? '正在分析命令、路径和环境假设' : request.llmReviewStatus === 'failed' ? '审查失败 · 已转人工' : request.llmReview?.requiresHumanApproval ? '建议人工确认' : '可由全自动模式放行'}</span></div>{request.llmReview && <em>风险 {request.llmReview.riskScore}/100</em>}</header>
-      {request.llmReviewStatus === 'pending' && <p>本地硬规则仍然优先；等待期间不会自动执行。</p>}
+      <header><div><strong>LLM 安全审查</strong><span>{approvalReviewLabel(request)}</span></div>{request.llmReview && request.llmReviewStatus !== 'failed' && <em>风险 {request.llmReview.riskScore}/100</em>}</header>
+      {request.llmReviewStatus === 'pending' && <p>正在审查本地规则标记的风险；结论返回前等待处理。</p>}
       {request.llmReviewError && <p>{request.llmReviewError}</p>}
       {request.llmReview && <>
         <h3>{request.llmReview.summary}</h3>
@@ -226,15 +232,16 @@ function ApprovalDetail({
         {request.llmReview.assumptions.length > 0 && <div><strong>路径与环境假设</strong><ul>{request.llmReview.assumptions.map((assumption, index) => <li key={index}>{assumption}</li>)}</ul></div>}
         <footer><span>{request.llmReview.model}</span><span>{new Date(request.llmReview.reviewedAt).toLocaleString('zh-CN')}</span></footer>
       </>}
-      <small>LLM 仅提供安全辅助判断，不能覆盖本地高危规则。</small>
+      <small>Agent 审核模式只放行明确批准的请求；拒绝、不确定或审核失败会拒绝本次请求，并让 Agent 调整方案，不转人工。</small>
     </section>}
     {error && <p className='form-error'>{error}</p>}
     <div className='detail-actions'>
       <span>请求键：{request.requestId}</span>
       <button className='button-secondary' type='button' onClick={onOpen}>打开终端</button>
-      <button className='button-danger' type='button' disabled={busy} onClick={onReject}>拒绝</button>
-      {request.command && request.risk !== 'write' && request.risk !== 'delete' && <button className='button-secondary button-safe-command' type='button' disabled={busy} onClick={onRemember}>作为安全命令批准</button>}
-      <button className='button-primary' type='button' disabled={busy} onClick={onApprove}>{busy ? '请稍后…' : '批准这一次'}</button>
+      {!automatic && <button className='button-danger' type='button' disabled={busy} onClick={onReject}>拒绝</button>}
+      {!automatic && request.command && request.risk !== 'write' && request.risk !== 'delete' && <button className='button-secondary button-safe-command' type='button' disabled={busy} onClick={onRemember}>作为安全命令批准</button>}
+      {!automatic && <button className='button-primary' type='button' disabled={busy} onClick={onApprove}>{busy ? '请稍后…' : '批准这一次'}</button>}
+      {automatic && <span role='status'>系统将自动批准或拒绝，无需人工操作</span>}
     </div>
     <PolicySummary />
   </div>

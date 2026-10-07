@@ -3,7 +3,7 @@ import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
 import type { DangerRuleInput, DangerRuleSummary, DangerRuleTestResult } from '../src/shared/manager-api'
-import { ApprovalPolicyEngine, type ApprovalDecision, type ApprovalSuggestion, type CustomDangerRule, type FullAutoApprovalInput } from './approval-policy'
+import { ApprovalPolicyEngine, type ApprovalDecision, type ApprovalSuggestion, type CustomDangerRule, type FullAutoApprovalInput, type LocalApprovalAssessment } from './approval-policy'
 
 interface StoredApprovalPolicy {
   version: 2
@@ -21,7 +21,7 @@ function parseStoredPolicy(value: unknown): StoredApprovalPolicy {
   if ((record.version !== 1 && record.version !== 2) || !Array.isArray(record.rules) || record.rules.length > MAX_RULES) {
     return { version: 2, rules: [], dangerRules: [] }
   }
-  const rules = record.rules.filter((rule): rule is string => typeof rule === 'string' && rule.length > 0 && rule.length <= 2_048)
+  const rules = record.rules.filter((rule): rule is string => typeof rule === 'string' && rule.length > 0 && rule.length <= 16_384)
   const dangerRules = record.version === 2 && Array.isArray(record.dangerRules) && record.dangerRules.length <= MAX_DANGER_RULES
     ? record.dangerRules.filter((value): value is CustomDangerRule => {
         if (!value || typeof value !== 'object') return false
@@ -123,6 +123,10 @@ export class ApprovalPolicyStore {
 
   canFullAutoApprove(input: FullAutoApprovalInput): { allowed: boolean; reason: string } {
     return this.engine.canFullAutoApprove(input)
+  }
+
+  assessApprovalRequest(input: FullAutoApprovalInput): LocalApprovalAssessment {
+    return this.engine.assessApprovalRequest(input)
   }
 
   private async persist(): Promise<void> {

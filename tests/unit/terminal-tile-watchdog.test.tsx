@@ -32,6 +32,7 @@ const terminalMocks = vi.hoisted(() => ({
 vi.mock('@xterm/xterm', () => ({ Terminal: vi.fn(() => terminalMocks) }))
 
 import TerminalTile from '../../src/TerminalTile'
+import { TERMINAL_OUTPUT_CHUNK_SIZE } from '../../src/terminal-output'
 
 const session: SessionSummary = {
   sessionId: 'frozen-renderer-session',
@@ -54,6 +55,7 @@ describe('TerminalTile write watchdog', () => {
     terminalMocks.write.mockReset()
     terminalMocks.cols = 100
     terminalMocks.rows = 30
+    terminalMocks.buffer.active.type = 'normal'
     terminalMocks.buffer.active.baseY = 100
     terminalMocks.buffer.active.viewportY = 100
     terminalMocks.options.fontSize = 12
@@ -97,6 +99,35 @@ describe('TerminalTile write watchdog', () => {
     expect(handler(new KeyboardEvent('keyup', { key: 'c', ctrlKey: true }))).toBe(false)
     expect(handler(new KeyboardEvent('keydown', { key: 'c', ctrlKey: true, repeat: true }))).toBe(false)
     expect(window.agentManager.writeClipboardText).toHaveBeenCalledTimes(1)
+  })
+
+  it('leaves native mouse input and alternate-screen scrolling to Codex', async () => {
+    vi.useFakeTimers()
+    terminalMocks.write.mockImplementation((_data, done) => done?.())
+    const view = render(<TerminalTile session={session} />)
+    await act(async () => { await Promise.resolve(); vi.advanceTimersByTime(250) })
+    const host = view.container.querySelector('.terminal-live-host')!
+    const viewport = host.querySelector('.xterm-viewport')!
+    fireEvent.pointerDown(viewport)
+    terminalMocks.buffer.active.viewportY = 80
+    fireEvent.scroll(viewport)
+    fireEvent.pointerUp(document)
+    terminalMocks.buffer.active.type = 'alternate'
+    terminalMocks.buffer.active.baseY = 0
+    terminalMocks.buffer.active.viewportY = 0
+    terminalMocks.scrollToBottom.mockClear(); terminalMocks.scrollToLine.mockClear()
+    act(() => listener?.({ type: 'output', sessionId: session.sessionId, data: 'fullscreen frame' }))
+    await act(async () => vi.advanceTimersByTime(20))
+    fireEvent.wheel(host, { deltaY: -120 })
+    fireEvent.click(view.getByRole('button', { name: '刷新终端显示' }))
+    expect(terminalMocks.scrollToLine).not.toHaveBeenCalled()
+    expect(terminalMocks.scrollToBottom).not.toHaveBeenCalled()
+    const mouse = '\x1b[<0;5;20M\x1b[<32;9;20M\x1b[<0;9;20m'
+    await act(async () => { terminalMocks.onData.mock.calls[0]![0](mouse) })
+    expect(window.agentManager.write).toHaveBeenCalledWith(session.sessionId, mouse)
+    const handler = terminalMocks.attachCustomKeyEventHandler.mock.calls[0]![0]
+    expect(handler(new KeyboardEvent('keydown', { key: 'c', ctrlKey: true }))).toBe(true)
+    expect(handler(new KeyboardEvent('keydown', { key: 'Delete' }))).toBe(true)
   })
 
   it('retains Ctrl+C interruption without selection and preserves explicit copy shortcuts', () => {
@@ -215,6 +246,50 @@ describe('TerminalTile write watchdog', () => {
     await act(async () => vi.advanceTimersByTime(10000))
     expect(window.agentManager.resize).toHaveBeenCalledTimes(3)
     expect(window.agentManager.write).not.toHaveBeenCalled()
+  })
+
+  it('remeasures a changed font on the next frame without another size debounce', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(1200)
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(320)
+    terminalMocks.write.mockImplementation((_data, done) => done?.())
+    render(<TerminalTile session={session} />)
+    await act(async () => { await Promise.resolve(); vi.advanceTimersByTime(199) })
+    expect(terminalMocks.options.fontSize).toBe(18)
+    expect(terminalMocks.resize).not.toHaveBeenCalled()
+    await act(async () => vi.advanceTimersByTime(32))
+    expect(window.agentManager.resize).toHaveBeenCalledWith(session.sessionId, 148, 20)
+    expect(terminalMocks.resize).toHaveBeenCalledTimes(1)
+    await act(async () => vi.advanceTimersByTime(1000))
+    expect(terminalMocks.resize).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps slow but progressing replay chunks ordered and blocks protocol replies until the batch drains', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(753)
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(320)
+    const callbacks: Array<() => void> = []
+    terminalMocks.write.mockImplementation((_data, callback) => callbacks.push(callback))
+    vi.mocked(window.agentManager.terminalReplay).mockResolvedValue({ data: 'x'.repeat(3 * TERMINAL_OUTPUT_CHUNK_SIZE), sequence: 1 })
+    render(<TerminalTile session={{ ...session, agentKind: 'generic' }} />)
+    await act(async () => { await Promise.resolve(); vi.advanceTimersByTime(20) })
+    expect(terminalMocks.write).toHaveBeenCalledTimes(3)
+    const onData = terminalMocks.onData.mock.calls[0]![0]
+    act(() => listener?.({ type: 'output', sessionId: session.sessionId, sequence: 2, data: 'live tail' }))
+    for (let index = 0; index < 2; index++) {
+      await act(async () => vi.advanceTimersByTime(1_500))
+      act(() => { callbacks[index]!(); onData('\x1b[1;1R') })
+      expect(window.agentManager.resize).not.toHaveBeenCalled()
+      expect(window.agentManager.write).not.toHaveBeenCalled()
+      expect(terminalMocks.write).toHaveBeenCalledTimes(3)
+    }
+    act(() => callbacks[2]!())
+    await act(async () => vi.advanceTimersByTime(20))
+    expect(terminalMocks.write).toHaveBeenCalledTimes(4)
+    expect(terminalMocks.write.mock.lastCall?.[0]).toBe('live tail')
+    act(() => callbacks[3]!())
+    await act(async () => vi.advanceTimersByTime(250))
+    expect(window.agentManager.resize).toHaveBeenCalledWith(session.sessionId, 93, 20)
   })
 
   it('ignores the removed page-return refresh event', async () => {

@@ -75,7 +75,10 @@ function reviewFacts(entry: AuditEntry): Array<[string, string]> {
   const verdict = detailValue(entry, 'verdict')
   add('模型结论', typeof verdict === 'string' ? REVIEW_VERDICT_LABEL[verdict] ?? verdict : verdict)
   const requiresHuman = detailValue(entry, 'requiresHumanApproval')
-  add('人工确认', requiresHuman === true ? '需要' : requiresHuman === false ? '不需要' : requiresHuman)
+  const automaticDecision = detailValue(entry, 'automaticDecision')
+  if (automaticDecision === 'allow' || automaticDecision === 'deny') {
+    add('自动处理方式', automaticDecision === 'allow' ? '批准' : '拒绝，不转人工')
+  } else add('人工确认', requiresHuman === true ? '需要' : requiresHuman === false ? '不需要' : requiresHuman)
   add('请求超时', detailValue(entry, 'timeoutSeconds') !== undefined ? `${detailValue(entry, 'timeoutSeconds')} 秒` : undefined)
   return facts
 }

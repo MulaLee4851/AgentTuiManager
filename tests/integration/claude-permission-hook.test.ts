@@ -46,7 +46,8 @@ describe('Claude PermissionRequest bridge', () => {
         tool_name: 'PowerShell',
         tool_input: { command: 'Set-Content package.json updated' },
         tool_use_id: 'tool-main-1',
-        session_id: '00000000-0000-4000-8000-000000000092',
+        session_id: 'fixture-main-session',
+        transcript_path: join(tmpdir(), 'fixture-main-session.jsonl'),
         cwd: 'B:\\work',
       }))
       const exitCode = await new Promise<number | null>((resolveExit, reject) => {
@@ -55,8 +56,8 @@ describe('Claude PermissionRequest bridge', () => {
       })
 
       expect(exitCode).toBe(0)
-      expect(received).toMatchObject({ hookSource: 'claude', toolName: 'PowerShell', toolUseId: 'tool-main-1' })
-      expect(received).toMatchObject({ nativeSessionId: '00000000-0000-4000-8000-000000000092', cwd: 'B:\\work' })
+      expect(received).toMatchObject({ hookSource: 'claude', toolName: 'PowerShell', toolUseId: 'tool-main-1',
+        nativeSessionId: 'fixture-main-session', transcriptPath: join(tmpdir(), 'fixture-main-session.jsonl'), cwd: 'B:\\work' })
       expect(JSON.parse(stdout)).toEqual({
         hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } },
       })

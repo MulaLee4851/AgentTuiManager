@@ -1,13 +1,15 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { SessionController, type NativeSessionDiscoveryPort, type SessionHostManagerPort } from '../../electron/session-controller'
+import { SessionController, type LlmApprovalReviewPort, type NativeSessionDiscoveryPort, type SessionHostManagerPort } from '../../electron/session-controller'
 import type { HostEvent } from '../../src/shared/protocol'
 import type { StartSessionRequest } from '../../src/shared/manager-api'
 import type { HostHandle, HostRecord, StartHostOptions } from '../../electron/session-host-manager'
 import { ApprovalPolicyEngine } from '../../electron/approval-policy'
 import { TerminalReplayBuffer } from '../../electron/terminal-replay-buffer'
 import { parseNativeActivity } from '../../electron/native-session-activity'
+import { sessionDisplayStatus } from '../../src/shared/session-state'
 import { discoverNativeSessions } from '../../electron/native-session-discovery'
+import type { StoredManagedSession } from '../../electron/managed-session-catalog'
 
 class FakeHandle implements HostHandle {
   readonly writes: string[] = []
@@ -88,6 +90,246 @@ async function settle(): Promise<void> {
 }
 
 describe('SessionController recovery evidence', () => {
+  it.each([
+    ['start', 'start'], ['rebind', 'rebind'], ['rebind', 'start'], ['start', 'rebind'],
+    ['restart', 'rebind'], ['rebind', 'restart'], ['restart', 'restart'],
+  ] as const)('reserves a native target across concurrent %s / %s operations', async (firstKind, secondKind) => {
+    const { controller, manager } = fixture()
+    const target = 'shared-native-target'
+    const boundRequest = (nativeSessionId: string): StartSessionRequest => ({ ...request(), nativeSessionId,
+      recovery: { executable: 'codex', args: ['resume', nativeSessionId] } })
+    const firstWindow = await controller.startSession(boundRequest(firstKind === 'restart' ? target : 'first-history'))
+    await controller.stopSession(firstWindow.sessionId)
+    const secondWindow = await controller.startSession(boundRequest(secondKind === 'restart' ? target : 'second-history'))
+    await controller.stopSession(secondWindow.sessionId)
+    let connected!: (handle: HostHandle) => void
+    vi.mocked(manager.start).mockImplementationOnce(() => new Promise(resolve => { connected = resolve }))
+    const run = (kind: typeof firstKind, sessionId: string) => kind === 'start'
+      ? controller.startSession(boundRequest(target))
+      : kind === 'restart' ? controller.restartSession(sessionId) : controller.replaceSessionBinding(sessionId, target)
+    const first = run(firstKind, firstWindow.sessionId)
+    await expect(run(secondKind, secondWindow.sessionId)).rejects.toThrow('正在另一个窗口中运行或启动')
+    await settle()
+    connected(new FakeHandle('reserved-target-host'))
+    await first
+    expect(manager.start).toHaveBeenCalledTimes(3)
+    await controller.stopAllSessions()
+  })
+
+  it('reserves a recovery-recipe identity even before the summary has captured its native ID', async () => {
+    const { controller, manager } = fixture()
+    let connected!: (handle: HostHandle) => void
+    vi.mocked(manager.start).mockImplementationOnce(() => new Promise(resolve => { connected = resolve }))
+    const first = controller.startSession(request(true))
+    await settle()
+    await expect(controller.startSession({ ...request(true), nativeSessionId: 'native-1' })).rejects.toThrow('正在另一个窗口中运行或启动')
+    connected(new FakeHandle('recipe-reservation-host'))
+    await first
+    await controller.stopAllSessions()
+  })
+
+  it('releases a failed new-host reservation so a later explicit retry can use the target', async () => {
+    const { controller, manager } = fixture()
+    vi.mocked(manager.start).mockRejectedValueOnce(new Error('synthetic startup failure'))
+    const bound = { ...request(true), nativeSessionId: 'failed-target' }
+    await expect(controller.startSession(bound)).rejects.toThrow('synthetic startup failure')
+    await controller.startSession(bound)
+    expect(manager.start).toHaveBeenCalledTimes(2)
+    await controller.stopAllSessions()
+  })
+
+  it('keeps a later Stop authoritative while binding replacement is awaiting old-host release', async () => {
+    const { controller, manager, starts } = fixture()
+    const session = await controller.startSession({ ...request(true), nativeSessionId: 'original-history' })
+    await controller.stopSession(session.sessionId)
+    let released!: () => void
+    vi.mocked(manager.release!).mockImplementationOnce(() => new Promise(resolve => { released = resolve }))
+    const changing = controller.replaceSessionBinding(session.sessionId, 'replacement-history')
+    await settle()
+    await expect(controller.restartSession(session.sessionId)).rejects.toThrow('正在启动或切换')
+    await controller.stopSession(session.sessionId)
+    released()
+    await changing
+    expect(starts).toHaveLength(1)
+    expect(controller.listSessions()[0]).toMatchObject({ nativeSessionId: 'original-history', status: 'stopped', userStopRequested: true })
+    // The cancellation must release its target reservation as well.
+    await controller.replaceSessionBinding(session.sessionId, 'replacement-history')
+    expect(starts).toHaveLength(2)
+    await controller.stopSession(session.sessionId)
+  })
+
+  it('does not absorb a later Stop into the binding change while its own stop receipt is pending', async () => {
+    const { controller, manager, handles, starts } = fixture()
+    const session = await controller.startSession({ ...request(true), nativeSessionId: 'original-history' })
+    handles[0]!.emit({ type: 'output', data: 'OpenAI Codex\r\n›\r\n' })
+    await settle()
+    handles[0]!.fail(new Error('synthetic lost connection'))
+    await settle()
+    expect(controller.listSessions()[0]?.status).toBe('needs_attention')
+    let stopped!: () => void
+    vi.spyOn(handles[0]!, 'stop').mockImplementationOnce(() => new Promise(resolve => { stopped = resolve }))
+    const changing = controller.replaceSessionBinding(session.sessionId, 'replacement-history')
+    await settle()
+    await controller.stopSession(session.sessionId)
+    stopped()
+    await changing
+    expect(starts).toHaveLength(1)
+    expect(manager.release).not.toHaveBeenCalled()
+    expect(controller.listSessions()[0]).toMatchObject({ nativeSessionId: 'original-history', status: 'stopped', userStopRequested: true })
+  })
+
+  it('keeps the native target reserved during a startup retry delay and releases it after cancellation', async () => {
+    vi.useFakeTimers()
+    try {
+      const { controller, handles } = fixture()
+      const bound = { ...request(true), nativeSessionId: 'retry-target' }
+      const session = await controller.startSession(bound)
+      handles[0]!.emit({ type: 'exit', exitCode: 1 })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(controller.listSessions()[0]?.status).toBe('failed')
+      await expect(controller.startSession(bound)).rejects.toThrow('正在另一个窗口中运行或启动')
+      await controller.stopSession(session.sessionId)
+      await vi.advanceTimersByTimeAsync(500)
+      await controller.startSession(bound)
+      await controller.stopAllSessions()
+    } finally { vi.clearAllTimers(); vi.useRealTimers() }
+  })
+
+  it.each([true, false, undefined])('only freshly restarts catalog windows with unusedFreshSession=%s explicitly true', async unusedFreshSession => {
+    const { manager, starts } = fixture()
+    const entry: StoredManagedSession = {
+      sessionId: 'persisted-window', hostId: 'old-host', request: request(), unusedFreshSession,
+      summary: { sessionId: 'persisted-window', displayName: 'Persisted', workspace: 'B:\\work', agentKind: 'codex',
+        status: 'stopped', userStopRequested: true, recoveryAttempts: 0, approvalMode: 'rules-auto' },
+      updatedAt: '2026-01-01T00:00:00Z',
+    }
+    const catalog = { list: () => [entry], upsert: vi.fn(async () => undefined), flush: vi.fn(async () => undefined),
+      remove: vi.fn(async () => undefined), clear: vi.fn(async () => undefined) }
+    const controller = new SessionController(manager, undefined, undefined, undefined, undefined, undefined, undefined, undefined, catalog)
+    await controller.restoreSessions()
+    if (unusedFreshSession) {
+      await controller.restartSession(entry.sessionId)
+      expect(starts).toHaveLength(1)
+      expect(starts[0]).toMatchObject({ approvalMode: 'rules-auto', fullAutoEnabled: true })
+      expect(starts[0]?.nativeSessionId).toBeUndefined()
+      await controller.stopSession(entry.sessionId)
+    } else {
+      await expect(controller.restartSession(entry.sessionId)).rejects.toThrow('尚未绑定原生会话')
+      expect(starts).toHaveLength(0)
+    }
+  })
+
+  it.each(['agent-review', 'rules-auto'] as const)('preserves %s on restart and resets it explicitly on binding replacement', async mode => {
+    const { controller, handles, starts } = fixture()
+    const session = await controller.startSession({ ...request(true), nativeSessionId: 'old-native' })
+    await controller.setApprovalMode(session.sessionId, mode)
+    await controller.stopSession(session.sessionId)
+    await controller.restartSession(session.sessionId)
+    expect(starts[1]).toMatchObject({ approvalMode: mode, fullAutoEnabled: true })
+    await controller.stopSession(session.sessionId)
+    await controller.replaceSessionBinding(session.sessionId, 'new-native')
+    expect(starts[2]).toMatchObject({ approvalMode: 'manual' })
+    expect(starts[2]?.fullAutoEnabled).not.toBe(true)
+    expect(controller.listSessions()[0]).toMatchObject({ approvalMode: 'manual', fullAutoEnabled: false })
+    handles[2]!.emit({ type: 'permission-request', hookSource: 'codex', requestId: 'new-approval', toolName: 'Bash', command: 'git status' })
+    await settle()
+    expect(handles[2]!.permissionResponses).toEqual([])
+    expect(controller.listPendingApprovals().map(item => item.requestId)).toEqual(['new-approval'])
+    await controller.stopSession(session.sessionId)
+  })
+
+  it('aborts old reviews across a parent /resume while handling the new hook in its existing automatic mode', async () => {
+    const base = fixture()
+    let completeReview!: (value: Awaited<ReturnType<LlmApprovalReviewPort['reviewApproval']>>) => void
+    const reviewer = {
+      getSettings: () => ({ enabled: true, level: 'high' as const }),
+      reviewApproval: vi.fn<LlmApprovalReviewPort['reviewApproval']>(() => new Promise(resolve => { completeReview = resolve })),
+    }
+    const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine(), undefined, undefined,
+      undefined, undefined, undefined, reviewer)
+    const oldId = '00000000-0000-4000-8000-000000000071'
+    const nextId = '00000000-0000-4000-8000-000000000072'
+    const session = await controller.startSession({ ...request(true), nativeSessionId: oldId })
+    await controller.setApprovalMode(session.sessionId, 'agent-review')
+    base.handles[0]!.emit({ type: 'permission-request', hookSource: 'codex', requestId: 'old-review', toolName: 'PowerShell',
+      command: 'Remove-Item -LiteralPath .\\cache -Recurse -Force', operation: 'delete' })
+    await settle()
+    expect(reviewer.reviewApproval).toHaveBeenCalledOnce()
+    base.handles[0]!.emit({ type: 'permission-request', hookSource: 'codex', requestId: 'new-safe', toolName: 'PowerShell',
+      command: 'git status --short', operation: 'read', nativeSessionId: nextId, cwd: 'B:\\work' })
+    await settle()
+    expect(reviewer.reviewApproval.mock.calls[0]?.[2]?.aborted).toBe(true)
+    completeReview({ verdict: 'allow', requiresHumanApproval: false, riskScore: 1, summary: 'synthetic', reasons: [], hazards: [], assumptions: [], model: 'test', reviewedAt: 1 })
+    await settle()
+    expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'new-safe', action: 'allow' }])
+    expect(controller.listPendingApprovals()).toEqual([])
+    expect(controller.listSessions()[0]).toMatchObject({ nativeSessionId: nextId, approvalMode: 'agent-review', status: 'running' })
+    await controller.stopSession(session.sessionId)
+  })
+
+  it.each(['stop', 'mode-change'] as const)('releases a late startup result after %s instead of reviving its window', async action => {
+    const { controller, manager, starts } = fixture()
+    const session = await controller.startSession(request(true))
+    await controller.stopSession(session.sessionId)
+    let requested = true
+    let connected!: (handle: HostHandle) => void
+    const late = new FakeHandle('late-host')
+    vi.mocked(manager.start).mockImplementationOnce(() => new Promise(resolve => { connected = resolve }))
+    const restart = controller.restartSession(session.sessionId, () => requested)
+    await settle()
+    if (action === 'stop') await controller.stopSession(session.sessionId)
+    else { requested = false; await controller.setApprovalMode(session.sessionId, 'rules-auto') }
+    connected(late)
+    await restart
+    expect(late.stops).toBe(1)
+    expect(late.disconnects).toBe(1)
+    expect(starts).toHaveLength(1)
+    expect(controller.listSessions()[0]?.status).toBe('stopped')
+    expect(late.writes).toEqual([])
+  })
+
+  it('serializes restart requests while the previous Host is being released', async () => {
+    const { controller, manager, starts } = fixture()
+    const session = await controller.startSession(request(true))
+    await controller.stopSession(session.sessionId)
+    let released!: () => void
+    vi.mocked(manager.release!).mockImplementationOnce(() => new Promise(resolve => { released = resolve }))
+    const restart = controller.restartSession(session.sessionId)
+    await expect(controller.restartSession(session.sessionId)).rejects.toThrow('正在启动')
+    released()
+    await restart
+    expect(starts).toHaveLength(2)
+    await controller.stopSession(session.sessionId)
+  })
+
+  it.each(['before-exit', 'during-delay'])('keeps the unattended request guard when revoked %s during startup', async timing => {
+    vi.useFakeTimers()
+    try {
+      const { controller, handles, starts } = fixture()
+      const session = await controller.startSession({ ...request(true), nativeSessionId: 'native-one' })
+      await controller.stopSession(session.sessionId)
+      let requested = true
+      await controller.restartSession(session.sessionId, () => requested)
+      if (timing === 'before-exit') requested = false
+      handles[1]!.emit({ type: 'exit', exitCode: 1 })
+      await vi.advanceTimersByTimeAsync(0)
+      requested = false
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(starts).toHaveLength(2)
+      expect(controller.listSessions()[0]?.status).toBe('failed')
+    } finally { vi.clearAllTimers(); vi.useRealTimers() }
+  })
+
+  it('constructs a resume recipe from a known native identity when its stored recipe is missing', async () => {
+    const { controller, starts } = fixture()
+    const session = await controller.startSession({ ...request(), nativeSessionId: 'known-history' })
+    await controller.stopSession(session.sessionId)
+    await controller.restartSession(session.sessionId)
+    expect(starts[1]?.args).toEqual(['--no-alt-screen', 'resume', 'known-history'])
+    expect(starts[1]?.recovery?.args).toEqual(starts[1]?.args)
+    await controller.stopSession(session.sessionId)
+  })
+
   it('updates Codex hook identity so completion and future resume follow the actual conversation', async () => {
     const { controller, handles, starts, manager } = fixture()
     const oldId = '00000000-0000-4000-8000-000000000081'
@@ -615,10 +857,10 @@ describe('SessionController recovery evidence', () => {
           : 'Would you like to run the following command?\r\n$ Remove-Item important.txt\r\n1. Yes, proceed\r\n2. No') })
       }
       await vi.advanceTimersByTimeAsync(4000)
-      expect(handle.writes).toEqual(scenario === 'user-input' ? ['\r', 'x'] : ['\r'])
+      expect(handle.writes).toEqual(scenario === 'user-input' ? ['\r', 'x'] : scenario === 'next-command' ? ['\r', '\x1b'] : ['\r'])
       expect(activity.approved).toHaveBeenCalledTimes(scenario === 'ready' ? 1 : 0)
       if (scenario === 'next-command') {
-        expect(controller.listPendingApprovals()).toEqual([expect.objectContaining({ command: 'Remove-Item important.txt' })])
+        expect(controller.listPendingApprovals()).toEqual([])
       }
     } finally { vi.useRealTimers() }
   })
@@ -639,7 +881,9 @@ describe('SessionController recovery evidence', () => {
       await vi.advanceTimersByTimeAsync(800)
       expect(handle.writes).toHaveLength(3)
       await vi.advanceTimersByTimeAsync(2000)
-      expect(controller.listPendingApprovals()).toHaveLength(1)
+      expect(controller.listPendingApprovals()).toEqual([])
+      expect(controller.listSessions()[0]?.status).toBe('failed')
+      expect(handle.stops).toBe(1)
       await vi.advanceTimersByTimeAsync(5000)
       expect(handle.writes).toHaveLength(3)
     } finally { vi.useRealTimers() }
@@ -711,6 +955,57 @@ describe('SessionController recovery evidence', () => {
     expect(handles[0]!.writes).toEqual([])
   })
 
+  it('accepts task events written before the new host finishes connecting', async () => {
+    let now = 1000
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now)
+    try {
+      const { controller, manager } = fixture()
+      vi.mocked(manager.start).mockImplementationOnce(async options => {
+        const handle = new FakeHandle('early-task-host')
+        expect(options.initialPrompt).toBe('Synthetic initial task')
+        now = 2000
+        return handle
+      })
+      const session = await controller.startSession({ ...request(), nativeSessionId: 'native-one' }, 'Synthetic initial task')
+      expect(manager.start).toHaveBeenCalledOnce()
+      controller.observeNativeActivity(session, { activity: 'running', timestamp: 1500 })
+      expect(controller.listSessions()[0]).toMatchObject({ activity: 'running', activitySince: 1000, activityUpdatedAt: 1500 })
+    } finally { clock.mockRestore() }
+  })
+
+  it('lets buffered native tool activity replace provisional readiness without changing approvals or stopped state', async () => {
+    let now = 1000
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now)
+    try {
+      const { controller, handles } = fixture()
+      const session = await controller.startSession({ ...request(), nativeSessionId: 'native-one' })
+      now = 3000
+      handles[0]!.emit({ type: 'output', data: 'OpenAI Codex\r\n›\r\n' })
+      await settle()
+      expect(controller.listSessions()[0]?.activity).toBe('idle')
+      const toolCall = parseNativeActivity('codex', { timestamp: 2000, type: 'response_item',
+        payload: { type: 'custom_tool_call', name: 'functions.exec', call_id: 'tool-1', input: 'synthetic' } }, 'native-one')!
+      controller.observeNativeActivity(controller.listSessions()[0]!, toolCall)
+      expect(sessionDisplayStatus(controller.listSessions()[0]!)).toBe('running')
+      expect(controller.listSessions()[0]?.activityUpdatedAt).toBe(2000)
+
+      controller.observeNativeActivity(session, { activity: 'completed', timestamp: 4000 })
+      handles[0]!.emit({ type: 'output', data: 'Synthetic tool output\r\n›\r\n' })
+      await settle()
+      controller.observeNativeActivity(session, toolCall)
+      expect(controller.listSessions()[0]?.activity).toBe('completed')
+
+      handles[0]!.emit({ type: 'permission-request', hookSource: 'codex', requestId: 'activity-approval', toolName: 'Bash', command: 'npm run test' })
+      await settle()
+      controller.observeNativeActivity(session, { activity: 'running', timestamp: 5000 })
+      expect(sessionDisplayStatus(controller.listSessions()[0]!)).toBe('needs_approval')
+      await controller.stopSession(session.sessionId)
+      controller.observeNativeActivity(session, { activity: 'running', timestamp: 6000 })
+      expect(sessionDisplayStatus(controller.listSessions()[0]!)).toBe('stopped')
+      expect(handles[0]!.writes).toEqual([])
+    } finally { clock.mockRestore() }
+  })
+
   it.each(['codex', 'claude'] as const)('restarts a never-used %s Agent with its edited independent configuration', async agentKind => {
     const { controller, starts } = fixture()
     const session = await controller.startSession({ ...request(), agentKind, executable: agentKind, args: agentKind === 'codex' ? ['--no-alt-screen'] : [] })
@@ -725,16 +1020,14 @@ describe('SessionController recovery evidence', () => {
     expect(starts[1]?.nativeSessionId).toBeUndefined()
   })
 
-  it('starts a fresh session with original configuration when the native ID was never captured', async () => {
+  it('refuses to replace a used conversation whose native ID was never captured', async () => {
     const { controller, handles, starts } = fixture()
     const session = await controller.startSession(request())
     controller.write(session.sessionId, 'implement a feature\r')
     handles[0]!.emit({ type: 'exit', exitCode: 0 })
     await settle()
-    await controller.restartSession(session.sessionId)
-    expect(starts).toHaveLength(2)
-    expect(starts[1]?.nativeSessionId).toBeUndefined()
-    expect(starts[1]?.recovery).toBeUndefined()
+    await expect(controller.restartSession(session.sessionId)).rejects.toThrow('尚未绑定原生会话')
+    expect(starts).toHaveLength(1)
   })
 
   it('renames a managed Agent without restarting its Host and persists the display name', async () => {
@@ -1075,11 +1368,13 @@ describe('SessionController recovery evidence', () => {
     const base = fixture()
     const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
     const session = await controller.startSession(request())
+    await controller.setApprovalMode(session.sessionId, 'rules-auto')
     base.handles[0]!.emit({ type: 'output', data: '$ git status --short\r\nWould you like to run the following command?\r\n1. Yes, proceed\r\n2. No' })
     await settle()
     expect(base.handles[0]!.writes).toEqual(['\r'])
     expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
 
+    await controller.setApprovalMode(session.sessionId, 'manual')
     base.handles[0]!.emit({ type: 'output', data: 'command completed' })
     await settle()
     base.handles[0]!.emit({ type: 'output', data: '$ Remove-Item -Recurse build\r\nWould you like to run the following command?\r\n1. Yes, proceed\r\n2. No' })
@@ -1173,6 +1468,7 @@ describe('SessionController recovery evidence', () => {
     const base = fixture()
     const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
     const session = await controller.startSession(request())
+    await controller.setApprovalMode(session.sessionId, 'rules-auto')
     base.handles[0]!.emit({ type: 'output', data: '\x1b]9;Approval requested: git status --short\x07' })
     await settle()
     expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
@@ -1187,6 +1483,7 @@ describe('SessionController recovery evidence', () => {
     const base = fixture()
     const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
     const session = await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+    await controller.setApprovalMode(session.sessionId, 'rules-auto')
     base.handles[0]!.emit({ type: 'permission-request', requestId: 'read-1', toolName: 'Read' })
     await settle()
     expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'read-1', action: 'allow' }])
@@ -1434,12 +1731,12 @@ describe('SessionController recovery evidence', () => {
       base.handles[0]!.emit({ type: 'output', data: prompt })
       await vi.advanceTimersByTimeAsync(1_000)
       expect(base.handles[0]!.writes).toEqual(['\r'])
-      expect(activity.approved).not.toHaveBeenCalled()
+      expect(activity.approved).toHaveBeenCalledTimes(1)
 
       base.handles[0]!.emit({ type: 'output', data: prompt })
       await vi.advanceTimersByTimeAsync(1_000)
       expect(base.handles[0]!.writes).toEqual(['\r'])
-      expect(activity.approved).not.toHaveBeenCalled()
+      expect(activity.approved).toHaveBeenCalledTimes(1)
       expect(controller.listPendingApprovals()).toEqual([])
     } finally {
       vi.useRealTimers()
@@ -1611,6 +1908,7 @@ describe('SessionController recovery evidence', () => {
     const base = fixture()
     const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
     const session = await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+    await controller.setApprovalMode(session.sessionId, 'rules-auto')
     base.handles[0]!.emit({
       type: 'permission-request',
       requestId: 'bash-ls-1',
@@ -1710,9 +2008,9 @@ describe('SessionController recovery evidence', () => {
     expect(controller.listPendingApprovals()).toEqual([])
   })
 
-  it('auto-approves an in-workspace edit after full-auto is enabled and preserves deletion requests', async () => {
+  it('auto-approves an in-workspace edit after full-auto is enabled and denies deletion requests', async () => {
     const base = fixture()
-    const activity = { approved: vi.fn(), blocked: vi.fn() }
+    const activity = { approved: vi.fn(), blocked: vi.fn(), rejected: vi.fn() }
     const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine(), undefined, activity)
     const session = await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
     await controller.setFullAutoMode(session.sessionId, true)
@@ -1727,11 +2025,11 @@ describe('SessionController recovery evidence', () => {
     })
     await settle()
 
-    expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'edit-auto', action: 'allow' }])
+    expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'edit-auto', action: 'allow' }, { requestId: 'delete-blocked', action: 'deny' }])
     expect(activity.approved).toHaveBeenCalledWith(expect.objectContaining({ requestId: 'edit-auto', agentReason: '更新界面' }))
-    expect(activity.blocked).toHaveBeenCalledWith(expect.objectContaining({ requestId: 'delete-blocked' }), expect.stringContaining('删除'))
-    expect(controller.listPendingApprovals().map((item) => item.requestId)).toEqual(['delete-blocked'])
-    expect(base.manager.updateMetadata).toHaveBeenCalledWith('host-1', { fullAutoEnabled: true })
+    expect(activity.rejected).toHaveBeenCalledWith(expect.objectContaining({ requestId: 'delete-blocked' }), expect.stringContaining('删除'))
+    expect(controller.listPendingApprovals().map((item) => item.requestId)).toEqual([])
+    expect(base.manager.updateMetadata).toHaveBeenCalledWith('host-1', { approvalMode: 'rules-auto', fullAutoEnabled: true })
   })
 
   it('auto-approves ordinary Claude tools without a saved rule or target path', async () => {
@@ -1751,7 +2049,7 @@ describe('SessionController recovery evidence', () => {
     expect(activity.approved).toHaveBeenCalledTimes(2)
   })
 
-  it('does not report a full-auto socket write as confirmed approval and restores a stuck modal', async () => {
+  it('does not report a full-auto socket write as confirmed approval and stops a stuck modal', async () => {
     vi.useFakeTimers()
     try {
       const base = fixture()
@@ -1775,10 +2073,12 @@ describe('SessionController recovery evidence', () => {
       await vi.advanceTimersByTimeAsync(2_000)
       expect(base.handles[0]!.writes).toEqual(['\r', '\r'])
       await vi.advanceTimersByTimeAsync(1_000)
-      expect(controller.listPendingApprovals()).toEqual([expect.objectContaining({
+      expect(controller.listPendingApprovals()).toEqual([])
+      expect(controller.listSessions()[0]?.status).toBe('failed')
+      expect(base.handles[0]!.stops).toBe(1)
+      expect(activity.blocked).toHaveBeenCalledWith(expect.objectContaining({
         source: 'terminal', command: 'pnpm --dir frontend build',
-        reason: expect.stringContaining('自动重试已停止'),
-      })])
+      }), expect.stringContaining('重试耗尽'))
       expect(activity.approved).not.toHaveBeenCalled()
       await vi.advanceTimersByTimeAsync(5_000)
       expect(base.handles[0]!.writes).toHaveLength(2)
@@ -1820,8 +2120,8 @@ describe('SessionController recovery evidence', () => {
 
     base.handles[0]!.emit({ type: 'permission-request', requestId: 'inspect-2', toolName: 'InspectResource', operation: 'unknown' })
     await settle()
-    expect(base.handles[0]!.permissionResponses.at(-1)).toEqual({ requestId: 'inspect-2', action: 'allow' })
-    expect(controller.listPendingApprovals()).toEqual([])
+    expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'inspect-1', action: 'allow' }])
+    expect(controller.listPendingApprovals().map(item => item.requestId)).toEqual(['inspect-2'])
   })
 
   it('suggests a read-only command after three manual approvals and accepts the exact rule', async () => {

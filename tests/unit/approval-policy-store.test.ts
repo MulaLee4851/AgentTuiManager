@@ -47,6 +47,9 @@ describe('ApprovalPolicyStore', () => {
     const rule = await store.addDangerRule({ name: '生产环境', keyword: 'prod-db' })
     expect(rule).toMatchObject({ name: '生产环境', pattern: 'prod-db', enabled: true, origin: 'custom' })
     expect(store.canBulkApproveCommand('deploy prod-db')).toBe(false)
+    expect(store.assessApprovalRequest({ command: 'deploy prod-db', risk: 'read', workspace: 'B:\\work' })).toMatchObject({
+      status: 'high-risk', matchedRules: [expect.objectContaining({ id: rule.id })],
+    })
     expect(store.testDangerCommand('deploy prod-db').matches).toEqual([
       expect.objectContaining({ id: rule.id, name: '生产环境' }),
     ])
@@ -56,6 +59,7 @@ describe('ApprovalPolicyStore', () => {
     const reloaded = await ApprovalPolicyStore.load(path)
     expect(reloaded.listRules()).toContain('git log --oneline')
     expect(reloaded.listDangerRules().find((item) => item.id === rule.id)).toMatchObject({ enabled: false })
+    expect(reloaded.assessApprovalRequest({ command: 'deploy prod-db', risk: 'unknown', workspace: 'B:\\work' }).status).toBe('ordinary')
 
     await reloaded.removeDangerRule(rule.id)
     expect(reloaded.listDangerRules().some((item) => item.id === rule.id)).toBe(false)

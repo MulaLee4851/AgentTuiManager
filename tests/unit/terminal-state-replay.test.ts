@@ -9,6 +9,35 @@ function parse(data: string, cols = 20, rows = 4): Promise<Terminal> {
 }
 
 describe('TerminalStateReplay', () => {
+  it('tracks split mouse encoding controls and clears them on disable or hard reset', async () => {
+    const replay = new TerminalStateReplay(20, 4, 100)
+    try {
+      replay.append('\x1b[?10'); replay.append('06h')
+      expect(await replay.snapshot()).toContain('\x1b[?1006h')
+      replay.append('\x1b[?1006l')
+      expect(await replay.snapshot()).not.toContain('\x1b[?1006h')
+      replay.append('\x1b[?1016h')
+      expect(await replay.snapshot()).toContain('\x1b[?1016h')
+      replay.append('\x1bc')
+      expect(await replay.snapshot()).not.toContain('\x1b[?1016h')
+    } finally { replay.dispose() }
+  })
+  it('restores fullscreen buffer, mouse reporting, paste mode and the normal buffer on return', async () => {
+    const replay = new TerminalStateReplay(20, 4, 100)
+    replay.append('normal-history\r\n\x1b[?1049h\x1b[2J\x1b[Hcomposer\x1b[?1002h\x1b[?1006h\x1b[?2004h')
+    const snapshot = await replay.snapshot()
+    const restored = await parse(snapshot)
+    try {
+      expect(restored.buffer.active.type).toBe('alternate')
+      expect(restored.buffer.active.getLine(0)?.translateToString(true)).toBe('composer')
+      expect(restored.modes.mouseTrackingMode).toBe('drag')
+      expect(restored.modes.bracketedPasteMode).toBe(true)
+      expect(snapshot).toContain('\x1b[?1006h')
+      await new Promise<void>(resolve => restored.write('\x1b[?1049l', resolve))
+      expect(restored.buffer.active.type).toBe('normal')
+      expect(restored.buffer.active.getLine(0)?.translateToString(true)).toBe('normal-history')
+    } finally { replay.dispose(); restored.dispose() }
+  })
   it('parses queued old-width output before resizing', async () => {
     const queued = new TerminalStateReplay(20, 4, 100)
     const reference = new TerminalStateReplay(20, 4, 100)

@@ -192,8 +192,8 @@ export default function ApprovalRulesDialog({ onClose }: { onClose: () => void }
           {busy ? <p className='field-note'>正在读取规则…</p> : rules.length === 0 ? <p className='field-note'>还没有自定义规则</p> : rules.map((rule) => <div className='rule-row' key={rule}><code title={rule}>{rule}</code><button type='button' className='button-danger' onClick={() => { void remove(rule) }}>撤销</button></div>)}
         </div>
       </> : <>
-        <p className='rules-help'>内置底线始终生效且不能删除。自定义规则按关键词包含匹配且不区分大小写，只会扩大拦截范围，不会放宽现有安全边界。</p>
-        {!dangerApiAvailable && <p className='form-error'>当前主进程尚未加载高危规则接口，请重启 Manager 后使用。</p>}
+        <p className='rules-help'>命中高危规则时，“规则自动”模式拒绝请求，“Agent 审核”模式交给审核器判断。内置规则始终生效；可添加关键词扩大检查范围，匹配时不区分大小写。</p>
+        {!dangerApiAvailable && <p className='form-error'>请重启 Manager 后使用高危规则设置。</p>}
         <form className='danger-rule-add' onSubmit={(event) => { void addDanger(event) }}>
           <input aria-label='高危规则名称' required maxLength={80} value={dangerName} onChange={(event) => setDangerName(event.target.value)} placeholder='例如：生产环境部署' />
           <input aria-label='高危命令关键词' required minLength={2} maxLength={256} value={dangerKeyword} onChange={(event) => setDangerKeyword(event.target.value)} placeholder='例如：kubectl delete' />

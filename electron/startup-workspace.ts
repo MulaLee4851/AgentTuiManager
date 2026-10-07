@@ -11,7 +11,7 @@ export function workspaceRestoreCandidates(ids: string[], sessions: SessionSumma
     && ['stopped', 'failed', 'completed'].includes(session.status))
 }
 
-/** 有绑定时恢复原会话；从未取得 ID 的窗口按原配置启动。 */
+/** The controller resumes bound history and permits fresh starts only for known-unused windows. */
 export async function restoreStartupWorkspace(ids: string[], port: StartupWorkspacePort) {
   const result: { restored: string[]; failed: Array<{ sessionId: string; name: string; reason: string }> } = { restored: [], failed: [] }
   const resumedNative = new Set<string>()
@@ -25,7 +25,7 @@ export async function restoreStartupWorkspace(ids: string[], port: StartupWorksp
         && !['stopped', 'failed', 'completed'].includes(other.status)))) {
         throw new Error('同一原生会话已有运行窗口，已跳过重复恢复')
       }
-      // Restart inherits the persisted per-window full-auto setting.
+      // Restart validates missing identities and inherits the saved approval mode.
       await port.restartSession(id)
       if (session.nativeSessionId) resumedNative.add(nativeKey)
       result.restored.push(id)

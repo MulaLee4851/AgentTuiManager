@@ -7,10 +7,28 @@ export class TerminalStateReplay {
   private readonly terminal: Terminal
   private readonly serializer = new SerializeAddon()
   private readonly responseSubscription?: { dispose(): void }
+  private readonly modeSubscriptions: Array<{ dispose(): void }> = []
+  private mouseEncoding: 0 | 1006 | 1016 = 0
 
   constructor(cols: number, rows: number, scrollback = DEFAULT_SCROLLBACK_LINES, onResponse?: (data: string) => void) {
     this.terminal = new Terminal({ cols, rows, scrollback, convertEol: true })
     this.terminal.loadAddon(this.serializer)
+    // SerializeAddon restores mouse tracking, but omits its coordinate encoding.
+    // Observe parsed PTY controls (including split chunks) without consuming them.
+    // Otherwise a recreated fullscreen tile sends legacy coordinates to an app
+    // that is still expecting SGR mouse events.
+    for (const final of ['h', 'l']) {
+      this.modeSubscriptions.push(this.terminal.parser.registerCsiHandler({ prefix: '?', final }, params => {
+        for (const param of params) {
+          if (param === 1006 || param === 1016) this.mouseEncoding = final === 'h' ? param : 0
+        }
+        return false
+      }))
+    }
+    this.modeSubscriptions.push(this.terminal.parser.registerEscHandler({ final: 'c' }, () => {
+      this.mouseEncoding = 0
+      return false
+    }))
     if (onResponse) this.responseSubscription = this.terminal.onData(onResponse)
   }
 
@@ -27,7 +45,8 @@ export class TerminalStateReplay {
   snapshot(): Promise<string> {
     return new Promise((resolve) => {
       // An empty write callback runs after all previously queued PTY output has been parsed.
-      this.terminal.write('', () => resolve(this.serializer.serialize()))
+      this.terminal.write('', () => resolve(this.serializer.serialize()
+        + (this.mouseEncoding ? `\x1b[?${this.mouseEncoding}h` : '')))
     })
   }
 
@@ -55,6 +74,7 @@ export class TerminalStateReplay {
 
   dispose(): void {
     this.responseSubscription?.dispose()
+    for (const subscription of this.modeSubscriptions) subscription.dispose()
     this.terminal.dispose()
   }
 }

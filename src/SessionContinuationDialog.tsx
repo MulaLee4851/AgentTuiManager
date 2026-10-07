@@ -36,9 +36,9 @@ export default function SessionContinuationDialog({ source, onClose, onCreated, 
     <section className='continuation-confirm-dialog' role='dialog' aria-modal='true' aria-labelledby='continuation-confirm-heading'>
       <header><div><p className='detail-kicker read'>新窗口已创建</p><h2 id='continuation-confirm-heading'>是否移除旧窗口？</h2></div></header>
       <div className='continuation-confirm-body'>
-        <p><strong>{created.displayName}</strong> 已启动，并会读取旧会话历史继续开发。</p>
+        <p><strong>{created.displayName}</strong> 已启动，并已收到读取旧会话、继续任务的提示。</p>
         <p>是否从 Agent TUI Manager 移除旧窗口「{source.displayName}」？</p>
-        <p className='continuation-confirm-note'>确认后只停止旧窗口并删除 Manager 记录，不会删除原生会话历史、全局配置或工作区文件。新窗口的配置为独立副本。</p>
+        <p className='continuation-confirm-note'>移除会停止旧 Agent，并从列表中移除该窗口。历史对话和工作区文件仍会保留。</p>
         {warning && <p className='continuation-confirm-error' role='alert'>{warning}</p>}
         {error && <p className='continuation-confirm-error' role='alert'>{error}</p>}
       </div>
@@ -51,9 +51,9 @@ export default function SessionContinuationDialog({ source, onClose, onCreated, 
       <div className='launcher-content'><section className='launcher-panel'>
         <div className='launcher-config-intro'><strong>{source.displayName}</strong><span>{source.workspace}</span></div>
         <>
-          <p>新建干净的原生会话，并自动发送：请读取 {source.nativeSessionId} 会话的内容，并继续进行开发。</p>
-          <p>继承当前窗口的独立配置、模型、启动参数、代理、重试、压缩与自动模式；名字自动添加 v1、v2 等后缀。旧会话 ID、旧提示词和恢复参数不会复用。</p>
-          <p>新窗口只引用旧历史文件，按需读取；不会把全部历史一次性塞进上下文。创建后再询问是否移除旧窗口。两个窗口暂时共用工作区，请避免同时修改相同文件。</p>
+          <p>新建会话，并提示 Agent：请读取 {source.nativeSessionId} 会话的内容，并继续进行开发。</p>
+          <p>新窗口沿用当前 Agent 的模型、代理和任务设置，并使用带版本后缀的新名称。</p>
+          <p>Agent 按需读取旧对话。创建后可选择移除旧窗口；两个窗口共用工作区，同时运行时请避免修改相同文件。</p>
         </>
         {error && <p className='launcher-error' role='alert'>{error}</p>}
       </section></div>

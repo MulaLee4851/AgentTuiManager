@@ -27,7 +27,7 @@ export interface AgentAdapter {
   recoveryRecipe(executable: string, nativeSessionId: string): RecoveryRecipe | undefined
 }
 
-// Approval modals keep the command next to the prompt. Eight KiB covers the
+// Approval modals keep the command next to the prompt. This covers the
 // maximum supported command plus redraw noise without rescanning a full TUI
 // screen on every small PTY output chunk.
 const MAX_EVIDENCE_CHARACTERS = 32_768
@@ -112,7 +112,10 @@ abstract class EvidenceAdapter implements AgentAdapter {
     } else if (freshApprovalSignal) {
       this.pendingApprovalCommand = observation.approvalCommand
     } else if (this.pendingApprovalCommand !== undefined) {
-      if (this.pendingApprovalCommand === 'tool:Shell'
+      if (observation.approvalCommand === 'tool:Shell') {
+        // A newly visible continuation/truncation invalidates an earlier preview.
+        this.pendingApprovalCommand = 'tool:Shell'
+      } else if (this.pendingApprovalCommand === 'tool:Shell'
         && observation.approvalCommand !== undefined
         && observation.approvalCommand !== 'tool:Shell') {
         this.pendingApprovalCommand = observation.approvalCommand
@@ -207,6 +210,7 @@ function hasClaudeForwardedSubagentMarker(evidence: string): boolean {
 
 
 export function extractApprovalCommand(evidence: string): string | undefined {
+  evidence = evidence.replace(/\r\n?/g, '\n')
   const normalizedEvidence = evidence.toLocaleLowerCase('en-US')
   const editApproval = Math.max(
     evidence.lastIndexOf('AGENT_MANAGER_CODEX_APPROVAL_EDIT:'),
@@ -228,33 +232,56 @@ export function extractApprovalCommand(evidence: string): string | undefined {
   if (/would you like to grant these permissions\?/i.test(evidence)) return 'tool:Permissions'
 
   const commandEvidence = execNotification >= 0 ? evidence.slice(execNotification) : evidence
-  const candidates: Array<{ index: number; value: string }> = []
-  // Only accept a command line that is already terminated. A TUI paints its approval box
-  // progressively, so an unterminated line can hold just the head of the command ("cd" out
-  // of `cd ... && rm -f ...`). Taking it both showed the wrong command in the approval UI
-  // and made the completed line arrive later as a second, different approval request.
-  for (const match of commandEvidence.matchAll(/(?:^|\n)\s*\$\s+([^\n]+)(?=\n)/g)) {
-    const value = match[1]?.trim()
-    if (value) candidates.push({ index: match.index, value })
-  }
-  for (const match of commandEvidence.matchAll(/(?:^|\n)\s*Bash command\s*\n\s*([^\n]+)(?=\n)/gi)) {
-    const value = match[1]?.trim()
-    if (value) candidates.push({ index: match.index, value })
+  const offset = evidence.length - commandEvidence.length
+  const shellCandidates = terminalShellCandidates(commandEvidence)
+    .filter((candidate) => execTitle < 0 || candidate.index + offset >= execTitle || candidate.end + offset >= execTitle)
+  const candidates: Array<{ index: number; value: string }> = [...shellCandidates]
+  const isShellBody = (index: number): boolean => shellCandidates.some((candidate) => index >= candidate.index && index < candidate.end)
+  const addToolCandidate = (index: number, tool: string): void => {
+    // A word such as Read(...) inside a shell preview is code/data, not another tool request.
+    if ((execApproval < 0 || latestCodexApproval !== execApproval) && !isShellBody(index)) candidates.push({ index, value: `tool:${tool}` })
   }
   for (const match of commandEvidence.matchAll(/(?:^|\n)\s*(?:tool(?: use)?|工具)\s*[:：]\s*([A-Za-z][\w-]*)/gi)) {
-    if (match[1]) candidates.push({ index: match.index, value: `tool:${match[1]}` })
+    if (match[1]) addToolCandidate(match.index, match[1])
   }
   for (const match of commandEvidence.matchAll(/(?:^|\n)\s*(Read|Glob|Grep|WebFetch|WebSearch|Edit|Write|NotebookEdit|TodoWrite|Bash|Task)\b(?!\s+command\b)(?:[^\n]*)/gi)) {
-    if (match[1]) candidates.push({ index: match.index, value: `tool:${match[1]}` })
+    if (match[1]) addToolCandidate(match.index, match[1])
   }
   for (const match of commandEvidence.matchAll(/\b(Read|Glob|Grep|WebFetch|WebSearch|Edit|Write|NotebookEdit|TodoWrite|Bash|Task)\b(?=\s*(?:\(|file\b|files\b|tool\b|[:：]))/gi)) {
-    if (match[1]) candidates.push({ index: match.index, value: `tool:${match[1]}` })
+    if (match[1]) addToolCandidate(match.index, match[1])
   }
   const latestCandidate = candidates.sort((left, right) => left.index - right.index).at(-1)
   if (latestCandidate) return latestCandidate.value
   // Codex truncates Exec OSC notifications to 30 graphemes. The notification
   // proves an approval exists, but it is never safe to treat its text as a command.
-  return execNotification >= 0 ? 'tool:Shell' : undefined
+  return execNotification >= 0 || (execTitle >= 0 && hasApprovalInteraction(commandEvidence)) ? 'tool:Shell' : undefined
+}
+
+function terminalShellCandidates(evidence: string): Array<{ index: number; end: number; value: string }> {
+  const candidates: Array<{ index: number; end: number; value: string }> = []
+  const markers = [
+    /(?:^|\n)[ \t]*\$[ \t]+([^\n]+)(?=\n)/g,
+    /(?:^|\n)[ \t]*Bash command[ \t]*\n\s*([^\n]+)(?=\n)/gi,
+  ]
+  const matches = markers.flatMap((pattern) => [...evidence.matchAll(pattern)]).sort((left, right) => left.index! - right.index!)
+  for (const match of matches) {
+    const index = match.index!
+    if (candidates.some((candidate) => index >= candidate.index && index < candidate.end)) continue
+    const value = match[1]?.trim()
+    if (!value) continue
+    const afterLine = index + match[0].length
+    const following = evidence.slice(afterLine)
+    // A line ending only proves that one display row has arrived. Wait for a
+    // recognizable prompt/menu after the entire preview before calling it complete.
+    const boundary = /^[ \t]*(?:(?:[›❯>][ \t]*)?\d+[.)][ \t]*(?:yes|allow|no|cancel)\b|(?:would you like|do you want)\b|allow this tool use\?|press enter\b|esc to cancel\b|(?:reason|原因)[ \t]*[:：])/im.exec(following)
+    const end = boundary ? afterLine + boundary.index : evidence.length
+    const continuation = evidence.slice(afterLine, end).trim()
+    const truncated = /(?:\[(?:[^\]]*\b(?:truncated|omitted|hidden|more lines)\b[^\]]*)\]|<truncated>|(?:^|\s)(?:[…⋮]|\.{3})(?=\s|$)|(?:…|\.{3})$)/i.test(value)
+    // Terminal wrapping and real newlines cannot be distinguished reliably here.
+    // Structured hooks retain the original multiline source; terminal excerpts do not.
+    candidates.push({ index, end, value: boundary && !continuation && !truncated ? value : 'tool:Shell' })
+  }
+  return candidates
 }
 
 export function extractApprovalReason(evidence: string): string | undefined {

@@ -1,0 +1,32 @@
+/* UI_MOTION in ui-motion.ts is the duration source; fallbacks support isolated components. */
+:root { --motion-ease: cubic-bezier(.2, .8, .2, 1); }
+.motion-presence { display: contents; }
+.motion-presence[data-open='true'] > :not(.launcher-scrim) { animation: surface-enter var(--motion-enter, 120ms) var(--motion-ease) both; }
+.motion-presence[data-open='false'] > * { animation: surface-exit var(--motion-exit, 100ms) ease-out both; }
+.motion-presence[data-open='false'], .motion-presence[data-open='false'] * { pointer-events: none !important; }
+/* Opacity only: hit targets occupy final positions on the very first frame. */
+@keyframes surface-enter { from { opacity: .65; } to { opacity: 1; } }
+@keyframes surface-exit { from { opacity: 1; } to { opacity: 0; } }
+.animated-collapse { display: grid; grid-template-rows: 0fr; opacity: 0; visibility: hidden; transition: grid-template-rows var(--motion-expand, 160ms) var(--motion-ease), opacity var(--motion-exit, 100ms) ease-out, visibility 0s linear var(--motion-expand, 160ms); }
+.animated-collapse[data-open='true'] { grid-template-rows: 1fr; opacity: 1; visibility: visible; transition-delay: 0s; }
+.animated-collapse-clip { min-height: 0; overflow: hidden; }
+.animated-collapse[data-open='false'] { pointer-events: none; }
+.collapse-chevron { display: inline-block; transition: transform var(--motion-expand, 160ms) var(--motion-ease); }
+[aria-expanded='true'] > .collapse-chevron { transform: rotate(90deg); }
+.animated-details-trigger { display: flex; align-items: center; gap: 0.375rem; width: 100%; min-height: 2.125rem; padding: 0.625rem 0.125rem 0.25rem; border: 0; background: transparent; color: inherit; text-align: left; font-size: var(--ui-font-note); font-weight: 800; }
+.collapsible-panel { transition: width var(--motion-expand, 160ms) var(--motion-ease); }
+.panel-surface { overflow: hidden; opacity: 1; transition: width var(--motion-expand, 160ms) var(--motion-ease), opacity var(--motion-exit, 100ms) ease-out, box-shadow var(--motion-enter, 120ms) ease-out, visibility 0s; }
+.panel-hidden:not(.panel-expanded) .panel-surface { opacity: 0; transition-delay: 0s, 0s, 0s, var(--motion-exit, 100ms); }
+.launcher-scrim { opacity: 1; visibility: visible; transition: opacity var(--motion-exit, 100ms) ease-out, visibility 0s; }
+.launcher-scrim:not(.launcher-scrim-hidden) { animation: surface-enter var(--motion-enter, 120ms) var(--motion-ease) both; }
+.launcher-scrim-hidden { display: block; opacity: 0; visibility: hidden; pointer-events: none; transition-delay: 0s, var(--motion-exit, 100ms); }
+.notification-popover { transition: none; transform: none; }
+.notification-popover.is-visible { opacity: 1; visibility: visible; }
+button, select { transition: background-color var(--motion-feedback, 90ms) ease-out, border-color var(--motion-feedback, 90ms) ease-out, color var(--motion-feedback, 90ms) ease-out; }
+.launcher-config-fields, .launcher-proxy-form, .continue-keyword-fields { transition-duration: var(--motion-enter, 120ms); }
+.workspace-scope-toggle i::after { transition-duration: var(--motion-enter, 120ms); }
+.approval-suggestion-summary::after { transition-duration: var(--motion-enter, 120ms), var(--motion-enter, 120ms), 0s; transition-delay: 0s, 0s, var(--motion-exit, 100ms); }
+.approval-suggestion-summary:hover::after, .approval-suggestion-summary:focus-visible::after { transition-delay: 0s; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0s !important; animation-delay: 0s !important; transition-duration: 0s !important; transition-delay: 0s !important; }
+}

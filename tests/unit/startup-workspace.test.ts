@@ -37,4 +37,14 @@ describe('startup workspace native resume', () => {
     expect(port.restartSession).toHaveBeenCalledTimes(1)
     expect(result.failed[0]!.sessionId).toBe('duplicate')
   })
+
+  it('reports a missing-history refusal and still restores the next known-unused window', async () => {
+    const sessions = ['used-unbound', 'unused-blank'].map(id => ({ ...entry(id), nativeSessionId: undefined }))
+    const restartSession = vi.fn(async (id: string) => {
+      if (id === 'used-unbound') throw new Error('请选择历史会话，或明确选择新会话')
+    })
+    const result = await restoreStartupWorkspace(sessions.map(item => item.sessionId), { listSessions: () => sessions, restartSession })
+    expect(result.restored).toEqual(['unused-blank'])
+    expect(result.failed).toEqual([{ sessionId: 'used-unbound', name: 'used-unbound', reason: '请选择历史会话，或明确选择新会话' }])
+  })
 })

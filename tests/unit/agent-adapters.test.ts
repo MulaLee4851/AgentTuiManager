@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
-import { createAgentAdapter } from '../../electron/agent-adapters'
+import { createAgentAdapter, extractApprovalCommand } from '../../electron/agent-adapters'
+import { assessApprovalRequest } from '../../electron/approval-policy'
 
 describe('native agent adapters', () => {
   it('requires Codex identity and prompt evidence before reporting ready', () => {
@@ -146,6 +147,10 @@ describe('native agent adapters', () => {
 
     expect(adapter.observeOutput('\r\n$ npm run typecheck\r\n')).toMatchObject({
       approvalRequired: true,
+      approvalCommand: 'tool:Shell',
+    })
+    expect(adapter.observeOutput('1. Yes, proceed\r\n2. No')).toMatchObject({
+      approvalRequired: true,
       approvalCommand: 'npm run typecheck',
     })
   })
@@ -282,5 +287,44 @@ describe('native agent adapters', () => {
       approvalCommand: 'tool:Read',
       forwardedSubagentApproval: true,
     })
+  })
+
+  it.each([
+    ['codex', 'Would you like to run the following command?\n$ Write-Output ready\n  Remove-Item -Recurse -Force build\n1. Yes, proceed\n2. No'],
+    ['codex', 'Would you like to run the following command?\n$ Write-Output ready\n$ rm -rf build\n1. Yes, proceed\n2. No'],
+    ['claude', 'Bash command\nWrite-Output ready\n  Remove-Item -Recurse -Force build\nDo you want to proceed?\n1. Yes\n2. No'],
+    ['claude', 'Bash command\npython -c "print(1)"\nRead(file)\nDo you want to proceed?\n1. Yes\n2. No'],
+    ['codex', 'Would you like to run the following command?\n$ python -c "import pathlib; …"\n  … +12 lines\n1. Yes, proceed\n2. No'],
+    ['codex', 'Would you like to run the following command?\n$ npm run very-long-command…\n1. Yes, proceed\n2. No'],
+    ['codex', 'Would you like to run the following command?\n$ echo ready [truncated]\n1. Yes, proceed\n2. No'],
+    ['claude', 'Bash command\npython -c @\'\nprint(1)\n\'@\nDo you want to proceed?\n1. Yes\n2. No'],
+  ] as const)('keeps %s multiline or visibly truncated terminal previews incomplete', (kind, screen) => {
+    const observation = createAgentAdapter(kind).observeOutput(screen)
+    expect(observation).toMatchObject({ approvalRequired: true, approvalCommand: 'tool:Shell' })
+    expect(assessApprovalRequest({ command: observation.approvalCommand, risk: 'unknown', workspace: 'C:\\work' }).status).toBe('incomplete')
+  })
+
+  it('does not approve a first display row before a later destructive continuation arrives', () => {
+    const adapter = createAgentAdapter('codex')
+    const first = adapter.observeOutput('Would you like to run the following command?\n$ Write-Output ready\n')
+    expect(first.approvalCommand).toBe('tool:Shell')
+    expect(adapter.observeOutput('  Remove-Item -Recurse -Force build\n1. Yes, proceed\n2. No').approvalCommand).toBe('tool:Shell')
+  })
+
+  it.each([
+    '$ npm test\nWould you like to run the following command?',
+    'Would you like to run the following command?\n$ npm test\n1. Yes, proceed\n2. No',
+    'Bash command\n npm test\nAllow this tool use?',
+    'Would you like to run the following command?\n$ Write-Output "..."\n1. Yes, proceed\n2. No',
+  ])('keeps a bounded complete single-line preview available: %s', (screen) => {
+    const command = extractApprovalCommand(screen)
+    expect(command).toBe(screen.includes('Write-Output') ? 'Write-Output "..."' : 'npm test')
+    expect(assessApprovalRequest({ command, risk: 'unknown', workspace: 'C:\\work' }).status).toBe('ordinary')
+  })
+
+  it('does not reuse the previous completed command for a new empty modal', () => {
+    const adapter = createAgentAdapter('codex')
+    adapter.observeOutput('Would you like to run the following command?\n$ npm test\n1. Yes, proceed\n2. No\n')
+    expect(adapter.observeOutput('Would you like to run the following command?\n1. Yes, proceed\n2. No').approvalCommand).toBe('tool:Shell')
   })
 })

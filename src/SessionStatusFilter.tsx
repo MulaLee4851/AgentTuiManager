@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react'
+import MotionPresence from './MotionPresence'
 import { SESSION_STATUS_LABEL, parseSessionDisplayStatus, type SessionDisplayStatus } from './shared/session-state'
 
 const OPTIONS = Object.entries(SESSION_STATUS_LABEL) as Array<[SessionDisplayStatus, string]>
@@ -44,7 +45,7 @@ export default function SessionStatusFilter({ value, onChange }: {
       aria-controls={id} title={summary} onClick={() => setOpen((shown) => !shown)}>
       <span>{summary}</span><span aria-hidden='true'>▾</span>
     </button>
-    {open && <div id={id} className='overview-status-options' role='group' aria-label='Agent 状态选项'>
+    <MotionPresence open={open}><div id={id} className='overview-status-options' role='group' aria-label='Agent 状态选项'>
       <button type='button' onClick={() => onChange([])}>显示全部状态</button>
       {OPTIONS.map(([status, label]) => <label key={status}>
         <input type='checkbox' checked={value.includes(status)} onChange={() => onChange(
@@ -52,6 +53,6 @@ export default function SessionStatusFilter({ value, onChange }: {
         )} />{label}
       </label>)}
       <small>可多选；未勾选时显示全部</small>
-    </div>}
+    </div></MotionPresence>
   </div>
 }

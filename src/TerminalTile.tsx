@@ -1,9 +1,15 @@
-import { useEffect, useRef, useState } from 'react'
+import { type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, useEffect, useRef, useState } from 'react'
+import type { FreeWindowRect, ResizeEdge } from './free-overview-layout'
+import { APPROVAL_MODE_LABEL, approvalModeOf } from './shared/approval-mode'
 import { Terminal } from '@xterm/xterm'
+import { useAppearanceSettings } from './appearance-settings'
+import { TerminalFontSizer } from './terminal-font-size'
 
-import type { SessionSummary } from './shared/manager-api'
+import type { ApprovalRequest, SessionSummary } from './shared/manager-api'
+import { approvalReviewLabel } from './shared/approval-review-label'
 import { SESSION_STATUS_LABEL, sessionDisplayStatus } from './shared/session-state'
 import { TerminalWriteWatchdog } from './terminal-write-watchdog'
+import { writeTerminalOutput } from './terminal-output'
 import DeepSeekStartupOutput from './DeepSeekStartupOutput'
 import { deepSeekWebUrl as validateDeepSeekWebUrl } from './shared/deepseek-web-url'
 import codexLogoUrl from '../logo/codex.png'
@@ -25,8 +31,6 @@ const MIN_TERMINAL_COLS = 24
 const MAX_TERMINAL_COLS = 500
 const MIN_TERMINAL_ROWS = 8
 const MAX_TERMINAL_ROWS = 200
-const MIN_FONT_SIZE = 8
-const MAX_FONT_SIZE = 18
 // `.xterm-viewport` keeps a thin scrollbar gutter; reserve it so the last column
 // is never clipped and the grid still fills the surface.
 const TERMINAL_SCROLLBAR_WIDTH = 9
@@ -86,12 +90,22 @@ function isClosedPreviousHostError(message: string): boolean {
 
 
 interface TerminalTileProps {
+  freeLayout?: {
+    rect: FreeWindowRect
+    start: (edge: 'move' | ResizeEdge, event: ReactPointerEvent<HTMLElement>) => void
+    keyAdjust: (edge: 'move' | ResizeEdge, event: ReactKeyboardEvent<HTMLElement>) => void
+  }
   session: SessionSummary
+  approval?: ApprovalRequest
   detail?: boolean
   embedded?: boolean
   hidden?: boolean
+  retained?: boolean
+  active?: boolean
+  onActivate?: () => void
   onOpen?: () => void
   onEdit?: () => void
+  onBinding?: (mode: 'history' | 'fresh') => void
   onContinuation?: () => void
   onFullAuto?: () => void
   draggable?: boolean
@@ -101,8 +115,15 @@ interface TerminalTileProps {
   onDragOver?: () => void
 }
 
-export default function TerminalTile({ session, detail = false, embedded = false, hidden = false, onOpen, onEdit, onContinuation, onFullAuto, draggable = false, dragging = false, onDragStart, onDragEnd, onDragOver }: TerminalTileProps): JSX.Element {
+export default function TerminalTile({ session, approval, detail = false, embedded = false, hidden = false, retained = true, active = false, onActivate, onOpen, onEdit, onContinuation, onBinding, onFullAuto, draggable = false, dragging = false, onDragStart, onDragEnd, onDragOver, freeLayout }: TerminalTileProps): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
+  const { settings: appearance } = useAppearanceSettings()
+  const fontSizeRef = useRef(appearance.terminalFontSize)
+  const uiSizeRef = useRef(appearance.uiSize)
+  const requestFit = useRef<() => void>()
+  fontSizeRef.current = appearance.terminalFontSize
+  uiSizeRef.current = appearance.uiSize
+  useEffect(() => { requestFit.current?.() }, [appearance.terminalFontSize, appearance.uiSize])
   const [actionError, setActionError] = useState('')
   const [actionBusy, setActionBusy] = useState<'restart' | 'remove'>()
   const statusRef = useRef(session.status)
@@ -112,16 +133,17 @@ export default function TerminalTile({ session, detail = false, embedded = false
   const deepSeekWebUrl = validateDeepSeekWebUrl(session.webUrl)
 
   useEffect(() => {
-    if (terminalEnded || deepSeekWeb) return
+    if (terminalEnded || deepSeekWeb || !retained) return
     const host = hostRef.current
     if (!host) return
+    const fontSizer = new TerminalFontSizer()
     const terminal = new Terminal({
       cols: STABLE_TERMINAL_COLS,
       rows: STABLE_TERMINAL_ROWS,
       cursorBlink: true,
       convertEol: true,
       fontFamily: 'Cascadia Code, Consolas, monospace',
-      fontSize: 12,
+      fontSize: fontSizeRef.current === 'auto' ? 12 : fontSizeRef.current,
       minimumContrastRatio: 1,
       drawBoldTextInBrightColors: true,
       // Counted in visual rows, not messages. Narrowing the tile re-wraps every long line,
@@ -181,13 +203,14 @@ export default function TerminalTile({ session, detail = false, embedded = false
       try { action() } finally { programmaticScrollDepth -= 1 }
     }
     const restoreUserScroll = (): void => {
+      if (terminal.buffer.active.type !== 'normal') { userScrollOffset = undefined; return }
       if (userScrollOffset === undefined) return
       const target = Math.max(0, terminal.buffer.active.baseY - userScrollOffset)
       programmaticScroll(() => terminal.scrollToLine(target))
     }
     const scrollToLatest = (): void => {
       userScrollOffset = undefined
-      programmaticScroll(() => terminal.scrollToBottom())
+      if (terminal.buffer.active.type === 'normal') programmaticScroll(() => terminal.scrollToBottom())
     }
     const preserveLatestReplayScrollback = (data: string): string => {
       const standard = data.lastIndexOf('\x1b[3J')
@@ -265,7 +288,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
           terminal.refresh(0, Math.max(0, terminal.rows - 1))
         }
         if (synchronizedResizeRedraw) {
-          if (resizeWasAtBottom && userScrollOffset === undefined) programmaticScroll(() => terminal.scrollToBottom())
+          if (terminal.buffer.active.type === 'normal' && resizeWasAtBottom && userScrollOffset === undefined) programmaticScroll(() => terminal.scrollToBottom())
           requestAnimationFrame(() => requestAnimationFrame(hideResizeCover))
         }
         if (pendingOutput && !outputFrame) outputFrame = requestAnimationFrame(flushOutput)
@@ -281,7 +304,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
       })
       // Never inject escape sequences at transport chunk boundaries: output may
       // end halfway through a CSI/OSC command. The visual cover hides resize frames.
-      terminal.write(output, completeWrite)
+      writeTerminalOutput(terminal, output, completeWrite, completeWrite.progress)
     }
     const flushTerminalInput = (): void => {
       inputFrame = 0
@@ -373,6 +396,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
     const rememberGestureScroll = (): void => {
       // Public onScroll also reports TUI output and asynchronous viewport sync.
       // Those events must not turn an input redraw into a history-browsing lock.
+      if (terminal.buffer.active.type !== 'normal') { userScrollOffset = undefined; return }
       if (programmaticScrollDepth > 0 || (!pointerScrollGesture && !keyboardScrollGesture)) return
       const buffer = terminal.buffer.active
       userScrollOffset = buffer.viewportY < buffer.baseY ? buffer.baseY - buffer.viewportY : undefined
@@ -572,12 +596,13 @@ export default function TerminalTile({ session, detail = false, embedded = false
       // agent screen wants, then let the column and row counts take up whatever space
       // is left. Scaling the font alone pinned the grid at 100x30, so any container
       // whose aspect ratio or size did not match that box was left with black margins.
-      const fontSize = clamp(Math.floor(availableWidth / (STABLE_TERMINAL_COLS * .62)), MIN_FONT_SIZE, MAX_FONT_SIZE)
+      const fontSize = fontSizer.measure(availableWidth, uiSizeRef.current, fontSizeRef.current)
       if (terminal.options.fontSize !== fontSize) {
         terminal.options.fontSize = fontSize
         // xterm re-measures its cell box after the font changes, so fit the grid on the
-        // next frame when the new metrics are available rather than with stale ones.
-        scheduleResize()
+        // next frame. The outer size change has already settled; do not add a second
+        // 180ms debounce just to read the updated font metrics.
+        scheduleResize(false)
         return
       }
       const cell = terminalCellSize(terminal)
@@ -605,15 +630,16 @@ export default function TerminalTile({ session, detail = false, embedded = false
       // A resize changes how many lines fit, so re-anchor explicitly rather than leaving
       // the viewport wherever the reflow happened to drop it. Going fullscreen and back
       // otherwise left the tile parked at the top of the history.
-      if (userScrollOffset === undefined) programmaticScroll(() => terminal.scrollToBottom())
+      if (terminal.buffer.active.type === 'normal' && userScrollOffset === undefined) programmaticScroll(() => terminal.scrollToBottom())
       else restoreUserScroll()
       sendPtyResize(cols, rows)
       if (forceRedraw || manualRedrawRequested) scheduleResize()
     }
-    const scheduleResize = (): void => {
+    const scheduleResize = (debounce = true): void => {
       cancelAnimationFrame(resizeFrame)
       if (ptyResizeTimer) clearTimeout(ptyResizeTimer)
       resizeFrame = requestAnimationFrame(() => {
+        if (!debounce) { fitTerminal(); return }
         // Debounce the grid and PTY together, not just the PTY. Otherwise live
         // output uses old columns for 180ms while xterm already uses new ones.
         ptyResizeTimer = setTimeout(() => {
@@ -622,10 +648,12 @@ export default function TerminalTile({ session, detail = false, embedded = false
         }, 180)
       })
     }
+    requestFit.current = scheduleResize
     scheduleResize()
-    const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(scheduleResize)
+    const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(() => scheduleResize())
     observer?.observe(host)
     return () => {
+      requestFit.current = undefined
       disposed = true
       pendingTerminalInput = ''
       if (inputFrame) cancelAnimationFrame(inputFrame)
@@ -662,7 +690,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
       refreshButton.remove()
       terminal.dispose()
     }
-  }, [session.sessionId, terminalEnded, deepSeekWeb])
+  }, [session.sessionId, terminalEnded, deepSeekWeb, retained])
 
   useEffect(() => {
     if (session.status === 'starting' || session.status === 'recovering' || session.status === 'running') {
@@ -682,22 +710,32 @@ export default function TerminalTile({ session, detail = false, embedded = false
 
   return (
     <article
-      className={`terminal-card${detail ? ' terminal-card-detail' : ''}${embedded ? ' terminal-card-embedded' : ''}${hidden ? ' terminal-card-hidden' : ''}${dragging ? ' terminal-card-dragging' : ''}`}
+      className={`terminal-card${freeLayout ? ' terminal-card-floating' : ''}${active ? ' terminal-card-active' : ''}${detail ? ' terminal-card-detail' : ''}${embedded ? ' terminal-card-embedded' : ''}${hidden ? ' terminal-card-hidden' : ''}${dragging ? ' terminal-card-dragging' : ''}`}
+      style={freeLayout ? { left: freeLayout.rect.x, top: freeLayout.rect.y, width: freeLayout.rect.width, height: freeLayout.rect.height, zIndex: freeLayout.rect.zIndex } : undefined}
+      onPointerDownCapture={() => { if (!hidden) onActivate?.() }}
+      onFocusCapture={() => { if (!hidden) onActivate?.() }}
       onDragOver={(event) => { if (!draggable) return; event.preventDefault(); onDragOver?.() }}
       data-testid={`terminal-tile-${session.sessionId}`}
-      onClick={openDetail}
-      onKeyDown={(event) => { if ((event.key === 'Enter' || event.key === ' ') && !detail && !embedded) openDetail() }}
+      onClick={freeLayout ? undefined : openDetail}
+      onKeyDown={(event) => { if (event.target === event.currentTarget && (event.key === 'Enter' || event.key === ' ') && !detail && !embedded) openDetail() }}
       tabIndex={detail || embedded || hidden || terminalEnded ? -1 : 0}
       aria-hidden={hidden || undefined}
     >
-      <header className="terminal-card-header" draggable={draggable} onDragStart={() => onDragStart?.()} onDragEnd={() => onDragEnd?.()}>
+      <header className="terminal-card-header" draggable={draggable} onDragStart={() => onDragStart?.()} onDragEnd={() => onDragEnd?.()}
+        onPointerDown={event => { if (!(event.target as HTMLElement).closest('button, a, input, select, textarea')) freeLayout?.start('move', event) }}
+        onDoubleClick={event => { if (freeLayout && !(event.target as HTMLElement).closest('button, a, input, select, textarea')) openDetail() }}>
         <div className="agent-identity">
+          {freeLayout && <button className='free-window-move' type='button' aria-label={`移动 ${session.displayName}`} title='拖动移动窗口；方向键微调，Shift 加速' onPointerDown={event => freeLayout.start('move', event)} onKeyDown={event => freeLayout.keyAdjust('move', event)} onClick={event => event.stopPropagation()}>⠿</button>}
           <AgentLogo kind={session.agentKind} className={'agent-dot agent-' + session.agentKind} />
-          <div><h2>{session.displayName}</h2><div className="terminal-session-meta"><p title={session.workspace}>{session.workspace}</p>{session.nativeSessionId && <button type="button" className="native-session-id" title={`原生会话 ID：${session.nativeSessionId}（点击复制）`} aria-label="复制原生会话 ID" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.writeClipboardText(session.nativeSessionId!)) }}>ID: {session.nativeSessionId}</button>}</div></div>
+          <div><h2>{session.displayName}</h2><div className="terminal-session-meta">
+            <button type="button" className="workspace-path-link" title={`打开工作区文件夹：${session.workspace}`} aria-label={`打开工作区：${session.workspace}`} onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.openSessionWorkspace(session.sessionId)) }}>{session.workspace}</button>
+            {session.nativeSessionId && <button type="button" className="native-session-id" title={`原生会话 ID：${session.nativeSessionId}（点击复制）`} aria-label="复制原生会话 ID" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.writeClipboardText(session.nativeSessionId!)) }}>ID: {session.nativeSessionId}</button>}
+          </div></div>
         </div>
         <div className="terminal-actions">
           <span title={session.activityError ?? session.lastError} className={'status-badge status-' + sessionDisplayStatus(session)}>{session.status === 'starting' ? '正在启动' : SESSION_STATUS_LABEL[sessionDisplayStatus(session)]}</span>
-          {!terminalEnded && !deepSeekWeb && onFullAuto && <button className={'full-auto-tile-button' + (session.fullAutoEnabled || session.unattended?.enabled ? ' active' : '')} type="button" title={session.unattended?.enabled ? '管理无监管模式' : session.fullAutoEnabled ? '关闭全自动模式' : '开启全自动模式'} onClick={(event) => { event.stopPropagation(); onFullAuto() }}>{session.unattended?.enabled ? '无监管中' : session.fullAutoEnabled ? '全自动中' : '全自动'}</button>}
+          {!terminalEnded && !deepSeekWeb && onFullAuto && <button className={'full-auto-tile-button' + (approvalModeOf(session) !== 'manual' ? ' active' : '')} type="button" title="随时切换审批模式" aria-label={'审批模式：' + APPROVAL_MODE_LABEL[approvalModeOf(session)]} onClick={(event) => { event.stopPropagation(); onFullAuto() }}>{APPROVAL_MODE_LABEL[approvalModeOf(session)]}</button>}
+          <button className="button-ghost workspace-folder-button" type="button" title="打开工作区文件夹" aria-label={`打开 ${session.displayName} 的工作区文件夹`} onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.openSessionWorkspace(session.sessionId)) }}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 7V5a1 1 0 0 1 1-1h5l2 3h9a1 1 0 0 1 1 1v2M3 7v12a1 1 0 0 0 1 1h15l3-10H7L4 20" /></svg></button>
           {onEdit && <button className="button-ghost" type="button" title="编辑 Agent" onClick={(event) => { event.stopPropagation(); onEdit() }} aria-label={`编辑 ${session.displayName}`}>✎</button>}
           {onContinuation && (session.agentKind === 'codex' || session.agentKind === 'claude') && <button className="button-ghost" type="button" disabled={!session.nativeSessionId} title={session.nativeSessionId ? '新窗口清洗续写，继承配置' : '等待原生会话 ID 后可续写'} aria-label={`新窗口续写 ${session.displayName}`} onClick={event => { event.stopPropagation(); onContinuation() }}>↗</button>}
           {!detail && !embedded && !terminalEnded && <button className="button-ghost" type="button" onClick={(event) => { event.stopPropagation(); onOpen?.() }} aria-label={`查看 ${session.displayName}`}>⛶</button>}
@@ -707,6 +745,10 @@ export default function TerminalTile({ session, detail = false, embedded = false
           </> : <button className="button-danger" type="button" aria-label="停止" title="停止" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.stopSession(session.sessionId)) }}>■</button>}
         </div>
       </header>
+      {onBinding && (terminalEnded || session.status === 'needs_attention') && ['codex', 'claude'].includes(session.agentKind) && <div className='session-binding-actions' onClick={event => event.stopPropagation()}>
+        <button type='button' className='button-secondary mini-button' onClick={() => onBinding('history')}>切换历史会话</button>
+        <button type='button' className='button-secondary mini-button' onClick={() => onBinding('fresh')}>按原配置开启新会话</button>
+      </div>}
       {terminalEnded ? <div className="terminal-ended" onClick={(event) => event.stopPropagation()}>
         <div className="terminal-ended-icon">›_</div>
         <strong>{session.status === 'completed' ? 'Agent 已正常完成' : session.status === 'stopped' ? 'Agent 已停止' : 'Agent 运行失败'}</strong>
@@ -733,12 +775,15 @@ export default function TerminalTile({ session, detail = false, embedded = false
       </div>}
       {!terminalEnded && <div className="terminal-status-slot">
         {actionError && session.status !== 'needs_approval' && session.status !== 'needs_attention' ? <div className="tile-error">{actionError}</div>
-          : session.status === 'needs_approval' ? <div className="inline-request"><span title={session.pendingApprovalCommand ?? session.approvalInputSummary ?? session.approvalToolName ?? '授权详情待确认'}>Agent 正在等待授权 · {(session.pendingApprovalCount ?? 1) > 1 ? `${session.pendingApprovalCount} 笔 · ` : ''}{session.pendingApprovalCommand ?? session.approvalInputSummary ?? session.approvalToolName ?? '详情待确认'}</span><button className="button-approve" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.approveSession(session.sessionId)) }}>批准</button></div>
+          : session.status === 'needs_approval' ? <div className="inline-request"><span title={approval?.llmReview?.summary ?? session.pendingApprovalCommand ?? session.approvalInputSummary ?? session.approvalToolName ?? '授权详情待确认'}>{approvalModeOf(session) === 'manual' || approval?.llmReviewStatus ? approvalReviewLabel(approval) : '自动审批处理中'} · {(session.pendingApprovalCount ?? 1) > 1 ? `${session.pendingApprovalCount} 笔 · ` : ''}{session.pendingApprovalCommand ?? session.approvalInputSummary ?? session.approvalToolName ?? '详情待确认'}</span>{approvalModeOf(session) === 'manual' && <button className="button-approve" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.approveSession(session.sessionId)) }}>批准</button>}</div>
             : session.status === 'needs_attention' ? <div className="inline-request attention-request"><span title={session.lastError}>{session.attentionKind === 'host-unresponsive' ? 'Agent 窗口疑似卡死，是否重启？' : '检测到异常：' + (session.lastError ?? '原因未知')}</span><button className="button-secondary button-compact" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.dismissRecoverySuggestion(session.sessionId)) }}>{session.attentionKind === 'host-unresponsive' ? '暂不重启' : '忽略'}</button>{session.attentionKind !== 'host-unresponsive' && <button className="button-secondary button-compact" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.acceptRecoverySuggestion(session.sessionId)) }}>采纳</button>}<button className="button-approve" type="button" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.tryRecoveryOnce(session.sessionId)) }}>{session.attentionKind === 'host-unresponsive' ? '重启 Agent' : '尝试一次'}</button></div>
               : session.status === 'recovering' ? <div className="recovery-bar"><span>↻</span><span>请稍后…</span></div>
                 : session.approvalSuggestion ? <div className="approval-suggestion"><span className="approval-suggestion-summary" tabIndex={0} data-tooltip={`已手动批准 ${session.approvalSuggestion.approvalCount} 次\n命令：${session.approvalSuggestion.command}\n加入后，相同命令将按安全规则自动批准。`}>已手动批准 {session.approvalSuggestion.approvalCount} 次 · {session.approvalSuggestion.command}</span><button type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.acceptApprovalSuggestion(session.sessionId) }}>加入</button><button type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.dismissApprovalSuggestion(session.sessionId) }}>暂不</button></div>
                   : null}
       </div>}
+      {freeLayout && (['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw'] as ResizeEdge[]).map(edge => <button key={edge} type='button' className={'free-window-resize free-window-resize-' + edge} data-resize-edge={edge}
+        aria-label={`调整 ${session.displayName} 的${({ n: '上边', ne: '右上角', e: '右边', se: '右下角', s: '下边', sw: '左下角', w: '左边', nw: '左上角' })[edge]}`}
+        title='拖动调整窗口宽高；方向键微调，Shift 加速' onPointerDown={event => freeLayout.start(edge, event)} onKeyDown={event => freeLayout.keyAdjust(edge, event)} onClick={event => event.stopPropagation()} />)}
     </article>
   )
 }

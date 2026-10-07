@@ -1,0 +1,14 @@
+.reviewer-pool { grid-column: 1 / -1; border: 0.0625rem solid var(--line); border-radius: 0.5rem; padding: 0.875rem; }
+.reviewer-pool p { font-size: var(--ui-font-control); color: var(--muted); line-height: 1.6; margin: 0.5rem 0; }
+.reviewer-pool-toolbar { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.reviewer-pool-toolbar strong { flex: 1; }
+.reviewer-pool ol { list-style: none; padding: 0; margin: 0.625rem 0; display: grid; gap: 0.3125rem; }
+.reviewer-pool li { display: flex; align-items: center; gap: 0.5rem; padding: 0.375rem; border: 0.0625rem solid transparent; border-radius: 0.4375rem; }
+.reviewer-pool li.selected { border-color: #397860; background: var(--green-soft); }
+.reviewer-pool li > button { border: 0.0625rem solid var(--line); border-radius: 0.3125rem; padding: 0.3125rem 0.5rem; background: transparent; color: inherit; cursor: pointer; }
+.reviewer-pool li > .reviewer-pool-select { flex: 1; text-align: left; min-width: 0; overflow-wrap: anywhere; border: 0; }
+.reviewer-pool-select small { display: block; font-size: var(--ui-font-control); opacity: .7; }
+.reviewer-pool li button:disabled { opacity: .4; cursor: default; }
+.reviewer-pool-import { padding: 0.625rem 0; }
+.reviewer-pool-test { grid-column: 1 / -1; }
+.reviewer-deadline-help { grid-column: 1 / -1; margin: 0; font-size: var(--ui-font-control); line-height: 1.6; color: var(--muted); }

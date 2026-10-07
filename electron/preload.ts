@@ -1,20 +1,45 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { preventExternalFileDrop } from '../src/shared/prevent-file-drop'
+import { parseAppearanceSettings } from '../src/shared/appearance-settings'
+import { DEFAULT_ATTENTION_AUDIO_SETTINGS, parseAttentionAudioSettings } from '../src/shared/attention-audio-settings'
 
 import { IPC_CHANNELS, type AgentManagerApi, type ManagerEvent, type StartSessionRequest } from '../src/shared/manager-api'
 
 const api: AgentManagerApi = {
-  platform: process.platform,
-  getWindowState: () => ipcRenderer.invoke(IPC_CHANNELS.getWindowState),
-  onWindowState: (listener) => {
-    const handler = (_event: Electron.IpcRendererEvent, state: { maximized: boolean }): void => listener(state)
-    ipcRenderer.on(IPC_CHANNELS.windowState, handler)
-    return () => { ipcRenderer.removeListener(IPC_CHANNELS.windowState, handler) }
+  setActiveSession: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.setActiveSession, sessionId),
+  testAttentionSound: (settings) => ipcRenderer.invoke(IPC_CHANNELS.testAttentionSound, settings),
+  getTerminalSettings: () => ipcRenderer.invoke(IPC_CHANNELS.getTerminalSettings),
+  getAppearanceSettings: () => ipcRenderer.invoke(IPC_CHANNELS.getAppearanceSettings),
+  updateAppearanceSettings: (settings) => ipcRenderer.invoke(IPC_CHANNELS.updateAppearanceSettings, settings),
+  onAppearanceSettingsChanged: (listener) => {
+    const handle = (_event: unknown, value: unknown): void => { listener(parseAppearanceSettings(value)) }
+    ipcRenderer.on(IPC_CHANNELS.appearanceSettingsChanged, handle)
+    return () => { ipcRenderer.removeListener(IPC_CHANNELS.appearanceSettingsChanged, handle) }
   },
+  updateTerminalSettings: (settings) => ipcRenderer.invoke(IPC_CHANNELS.updateTerminalSettings, settings),
+  getAttentionSoundSettings: () => ipcRenderer.invoke(IPC_CHANNELS.getAttentionSoundSettings),
+  updateAttentionSoundSettings: (settings) => ipcRenderer.invoke(IPC_CHANNELS.updateAttentionSoundSettings, settings),
+  onAttentionSound: (listener) => {
+    const handle = (_event: unknown, id: unknown, settings: unknown): void => {
+      if (typeof id !== 'string' || id.length > 64) return
+      Promise.resolve().then(() => listener(parseAttentionAudioSettings(settings ?? DEFAULT_ATTENTION_AUDIO_SETTINGS))).then(
+        () => ipcRenderer.send(IPC_CHANNELS.attentionSoundResult, id, true),
+        () => ipcRenderer.send(IPC_CHANNELS.attentionSoundResult, id, false),
+      )
+    }
+    ipcRenderer.on(IPC_CHANNELS.attentionSound, handle)
+    ipcRenderer.send(IPC_CHANNELS.attentionSoundReady, true)
+    return () => {
+      ipcRenderer.removeListener(IPC_CHANNELS.attentionSound, handle)
+      ipcRenderer.send(IPC_CHANNELS.attentionSoundReady, false)
+    }
+  },
+  platform: process.platform,
   listSessions: () => ipcRenderer.invoke(IPC_CHANNELS.listSessions),
   terminalReplay: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.terminalReplay, sessionId),
   openDeepSeekWeb: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.openDeepSeekWeb, sessionId),
   openExternalWeb: (url) => ipcRenderer.invoke(IPC_CHANNELS.openExternalWeb, url),
+  openSessionWorkspace: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.openSessionWorkspace, sessionId),
   listAuditEntries: () => ipcRenderer.invoke(IPC_CHANNELS.listAuditEntries),
   listTokenUsageSummary: (query) => ipcRenderer.invoke(IPC_CHANNELS.listTokenUsageSummary, query),
   listTokenUsageDetails: (query) => ipcRenderer.invoke(IPC_CHANNELS.listTokenUsageDetails, query),
@@ -36,6 +61,7 @@ const api: AgentManagerApi = {
   renameSession: (sessionId, displayName) => ipcRenderer.invoke(IPC_CHANNELS.renameSession, sessionId, displayName),
   updateSessionConfig: (sessionId, config) => ipcRenderer.invoke(IPC_CHANNELS.updateSessionConfig, sessionId, config),
   updateSessionProxy: (sessionId, proxy) => ipcRenderer.invoke(IPC_CHANNELS.updateSessionProxy, sessionId, proxy),
+  setApprovalMode: (sessionId, mode, settings) => ipcRenderer.invoke(IPC_CHANNELS.setApprovalMode, sessionId, mode, settings),
   setFullAutoMode: (sessionId, enabled) => ipcRenderer.invoke(IPC_CHANNELS.setFullAutoMode, sessionId, enabled),
   setUnattendedMode: (sessionId, settings) => ipcRenderer.invoke(IPC_CHANNELS.setUnattendedMode, sessionId, settings),
   saveUnattendedSettings: (sessionId, settings) => ipcRenderer.invoke(IPC_CHANNELS.saveUnattendedSettings, sessionId, settings),
@@ -65,11 +91,15 @@ const api: AgentManagerApi = {
   removeDangerRule: (ruleId) => ipcRenderer.invoke(IPC_CHANNELS.removeDangerRule, ruleId),
   testDangerCommand: (command) => ipcRenderer.invoke(IPC_CHANNELS.testDangerCommand, command),
   getLlmReviewSettings: () => ipcRenderer.invoke(IPC_CHANNELS.getLlmReviewSettings),
+  listLlmReviewModels: (settings, reviewerId) => ipcRenderer.invoke(IPC_CHANNELS.listLlmReviewModels, settings, reviewerId),
+  testLlmReviewer: (settings, reviewerId) => ipcRenderer.invoke(IPC_CHANNELS.testLlmReviewer, settings, reviewerId),
+  importLlmReviewer: (input) => ipcRenderer.invoke(IPC_CHANNELS.importLlmReviewer, input),
   updateLlmReviewSettings: (settings) => ipcRenderer.invoke(IPC_CHANNELS.updateLlmReviewSettings, settings),
   reviewApprovalRules: () => ipcRenderer.invoke(IPC_CHANNELS.reviewApprovalRules),
   chooseWorkspace: () => ipcRenderer.invoke(IPC_CHANNELS.chooseWorkspace),
   chooseExecutable: (agentKind) => ipcRenderer.invoke(IPC_CHANNELS.chooseExecutable, agentKind),
   discoverSessions: (agentKind, workspace) => ipcRenderer.invoke(IPC_CHANNELS.discoverSessions, agentKind, workspace),
+  discoverRecentCodexSessions: () => ipcRenderer.invoke(IPC_CHANNELS.discoverRecentCodexSessions),
   detectAgentEnvironment: (agentKind, executable) => ipcRenderer.invoke(IPC_CHANNELS.detectAgentEnvironment, agentKind, executable),
   installNodeAndNpm: () => ipcRenderer.invoke(IPC_CHANNELS.installNodeAndNpm),
   installAgent: (agentKind, registry, operation) => operation === undefined

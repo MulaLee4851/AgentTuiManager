@@ -1,0 +1,79 @@
+/* UI_TYPOGRAPHY_STANDARD.md: interface text only; xterm sizes its own cells. */
+:root {
+  --ui-font-caption: 0.75rem;
+  --ui-font-note: 0.8125rem;
+  --ui-font-control: 0.875rem;
+  --ui-font-body: 0.9375rem;
+  --ui-font-heading: 1.125rem;
+}
+
+body { line-height: 1.5; }
+.field-note, .field-error, .form-error, .rules-help { line-height: 1.65; overflow-wrap: anywhere; }
+.field-note { margin-bottom: 0.625rem; }
+.button-primary, .button-secondary, .button-danger, .button-approve { font-size: var(--ui-font-control); }
+.button-primary, .button-secondary { min-height: 2.25rem; }
+.button-compact, .button-danger, .button-approve, .full-auto-tile-button, .full-auto-toolbar-button { min-height: 1.875rem; }
+.agent-form h2, .rules-dialog h2, .launcher-head h1, .top-navigation-dialog h2,
+.continuation-confirm-dialog > header h2 { font-size: var(--ui-font-heading); }
+.agent-identity h2, .agent-session-list strong, .ccswitch-provider-main strong,
+.launcher-section-title h2, .launcher-agent-capability-note strong,
+.notification-item strong, .audit-row strong { font-size: var(--ui-font-control); }
+.agent-form label, .launcher-workspace-row > label, .favorite-workspace-manager > label,
+.dingtalk-settings-fields > label, .animated-details-trigger { font-size: var(--ui-font-control); }
+.agent-form input:not([type='checkbox']):not([type='radio']), .agent-form select, .agent-form textarea,
+.launcher-field, .rules-dialog select, .rules-dialog textarea,
+.rules-dialog input:not([type='checkbox']):not([type='radio']):not([type='range']) {
+  min-width: 0;
+  font-size: var(--ui-font-body);
+}
+.agent-form label, .launcher-config-form > label, .llm-review-fields > label { min-width: 0; }
+.notification-button i, .nav-count, .top-navigation-count, .rules-tabs button span,
+.ccswitch-provider-main em, .eyebrow { font-size: var(--ui-font-caption); line-height: 1.25; }
+.notification-button i, .rules-tabs button span { min-width: 1.25rem; height: 1.25rem; }
+
+/* Allow readable text to wrap or scroll instead of shrinking it to fit. */
+.agent-identity p, .agent-session-list small { line-height: 1.45; }
+.terminal-session-meta { gap: 0.1875rem 0.625rem; }
+.terminal-mode-guide { margin: 1.125rem 0; padding: 1rem; border: 0.0625rem solid var(--line); border-radius: 0.5rem; background: var(--panel); }
+.terminal-mode-guide .terminal-mode-summary { margin: 0 0 0.75rem; color: var(--text); }
+.terminal-mode-guide ul { display: grid; gap: 0.75rem; margin: 0; padding-left: 1.25rem; font-size: var(--ui-font-control); line-height: 1.65; }
+.terminal-mode-guide li { padding-left: 0.125rem; color: #bdc9ca; }
+.terminal-mode-guide strong { color: var(--text); font-weight: 600; }
+.terminal-settings-scope { margin-top: 1.125rem; }
+.terminal-settings-dialog > footer { padding-top: 0.875rem; border-top: 0.0625rem solid var(--line); }
+.terminal-settings-dialog fieldset { margin: 1rem 0; }
+.top-navigation-menu { min-width: 13.125rem; }
+.top-navigation-menu-item { min-height: 2.375rem; }
+.top-navigation-slot { grid-template-columns: 6rem minmax(0, 1fr) 3.5rem 4rem; gap: 0.625rem; }
+.ccswitch-provider-main { grid-template-columns: minmax(0, 1fr) auto; }
+.ccswitch-provider-meta { white-space: normal; text-align: right; overflow-wrap: anywhere; }
+.token-usage-table-wrap { overflow-x: auto; }
+.token-usage-toolbar { flex-wrap: wrap; padding-bottom: 0.5rem; }
+.audit-row { grid-template-columns: 10.75rem 4.75rem minmax(0, 1fr) 3.375rem; }
+.approval-suggestion-summary::after { max-height: min(20rem, 50vh); overflow-y: auto; }
+
+.appearance-dialog { display: flex; flex-direction: column; overflow: hidden; }
+.appearance-dialog > header, .appearance-dialog > footer, .appearance-save-status { flex-shrink: 0; }
+.appearance-body { flex: 1; min-height: 0; overflow-y: auto; padding-right: 0.25rem; }
+.appearance-body fieldset { min-width: 0; margin: 1.25rem 0; padding: 0; border: 0; }
+.appearance-body legend, .appearance-font-label { display: block; margin-bottom: 0.625rem; font-weight: 600; }
+.appearance-size-options { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.5rem; margin-bottom: 0.625rem; }
+.appearance-size-options label { display: flex; align-items: center; gap: 0.5rem; min-height: 4rem; padding: 0.75rem; border: 0.0625rem solid var(--line); border-radius: 0.4375rem; background: var(--panel); cursor: pointer; }
+.appearance-size-options label.selected { border-color: var(--green); background: var(--green-soft); }
+.appearance-size-options input { margin: 0; accent-color: var(--green); }
+.appearance-size-options small { display: block; color: var(--muted); font-size: var(--ui-font-note); }
+.appearance-font-label { margin-top: 1.375rem; }
+.appearance-body select { width: 100%; min-height: 2.375rem; margin-bottom: 0.625rem; padding: 0.4375rem 0.625rem; border: 0.0625rem solid var(--line); border-radius: 0.3125rem; background: var(--bg); }
+.appearance-save-status { padding-top: 0.75rem; color: var(--muted); font-size: var(--ui-font-note); }
+.appearance-dialog > footer { justify-content: space-between; padding-top: 0.875rem; border-top: 0.0625rem solid var(--line); }
+
+@media (max-width: 980px) {
+  .audit-workbench { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 650px) {
+  .audit-row { grid-template-columns: minmax(0, 1fr); }
+  .terminal-mode-guide { padding: 0.75rem; }
+}
+@media (max-width: 520px) {
+  .top-navigation-slot { grid-template-columns: minmax(0, 1fr) 4rem; gap: 0.5625rem; }
+}

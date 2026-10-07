@@ -5,9 +5,10 @@ import net, { type Socket } from 'node:net'
 import { join } from 'node:path'
 import { resolveNetworkRetry } from './agent-network-retry'
 import { autoCompactArgs } from '../src/shared/auto-compact'
+import { DEFAULT_TERMINAL_SETTINGS } from '../src/shared/terminal-settings'
 
 import type { HostCommand, HostEvent, HostExitFact } from '../src/shared/protocol'
-import type { AgentConfigSummary, AgentKind, AgentProxySummary, RecoveryRecipe } from '../src/shared/manager-api'
+import type { ApprovalMode, AgentConfigSummary, AgentKind, AgentProxySummary, RecoveryRecipe } from '../src/shared/manager-api'
 
 const DEFAULT_TIMEOUT_MS = 5_000
 const DEFAULT_STARTUP_TIMEOUT_MS = 30_000
@@ -35,6 +36,7 @@ export interface HostRecord {
   agentConfig?: AgentConfigSummary
   agentProxy?: AgentProxySummary
   fullAutoEnabled?: boolean
+  approvalMode?: ApprovalMode
   permissionHook?: 'claude' | 'codex'
   pid: number
   endpoint: string
@@ -58,6 +60,7 @@ export interface StartHostOptions {
   agentConfig?: AgentConfigSummary
   agentProxy?: AgentProxySummary
   fullAutoEnabled?: boolean
+  approvalMode?: ApprovalMode
   nativeSessionId?: string
   recovery?: RecoveryRecipe
 }
@@ -69,6 +72,7 @@ export interface HostMetadataUpdate {
   agentConfig?: AgentConfigSummary | null
   agentProxy?: AgentProxySummary | null
   fullAutoEnabled?: boolean
+  approvalMode?: ApprovalMode
 }
 
 export interface HostHandle {
@@ -79,8 +83,8 @@ export interface HostHandle {
   write(data: string): void
   resize(cols: number, rows: number): void
   replay(timeoutMs?: number): Promise<string>
-  respondToPermission(requestId: string, action: 'allow' | 'ask' | 'deny'): void
-  respondToPermissionChecked?(requestId: string, action: 'allow' | 'ask' | 'deny'): Promise<boolean>
+  respondToPermission(requestId: string, action: 'allow' | 'ask' | 'deny', reason?: string): void
+  respondToPermissionChecked?(requestId: string, action: 'allow' | 'ask' | 'deny', reason?: string): Promise<boolean>
   stop(): Promise<void>
   preserveOnDisconnect?(): Promise<void>
   resumeManagement?(): void
@@ -98,6 +102,7 @@ export interface SessionHostManagerOptions {
   onStartupProgress?: (progress: HostStartupProgress) => void
   leaseMs?: number
   preserveOnLeaseExpiry?: boolean
+  getCodexTerminalMode?: () => import('../src/shared/terminal-settings').CodexTerminalMode
   resolveAgentConfig?: (profileId: string, agentKind: AgentKind, args: string[]) => Promise<{ environment: Record<string, string>; args: string[] }>
   resolveAgentProxy?: (proxyId: string) => Promise<Record<string, string>>
 }
@@ -180,11 +185,11 @@ class PipeHostHandle implements HostHandle {
     return pending.promise.then((event) => event.type === 'replay' ? event.data : '')
   }
 
-  respondToPermission(requestId: string, action: 'allow' | 'ask' | 'deny'): void {
-    this.send({ type: 'permission-response', requestId, action })
+  respondToPermission(requestId: string, action: 'allow' | 'ask' | 'deny', reason?: string): void {
+    this.send({ type: 'permission-response', requestId, action, ...(reason ? { reason: reason.slice(0, 2000) } : {}) })
   }
 
-  respondToPermissionChecked(requestId: string, action: 'allow' | 'ask' | 'deny'): Promise<boolean> {
+  respondToPermissionChecked(requestId: string, action: 'allow' | 'ask' | 'deny', reason?: string): Promise<boolean> {
     const previous = this.permissionResponseWaiters.get(requestId)
     if (previous) {
       clearTimeout(previous.timer)
@@ -198,7 +203,7 @@ class PipeHostHandle implements HostHandle {
       }, Math.max(1_000, Math.min(this.timeoutMs, 5_000)))
       this.permissionResponseWaiters.set(requestId, { resolve, timer })
       try {
-        this.send({ type: 'permission-response', requestId, action })
+        this.send({ type: 'permission-response', requestId, action, ...(reason ? { reason: reason.slice(0, 2000) } : {}) })
       } catch {
         clearTimeout(timer)
         this.permissionResponseWaiters.delete(requestId)
@@ -356,6 +361,7 @@ class PipeHostHandle implements HostHandle {
 }
 
 export class SessionHostManager {
+  private readonly metadataWrites = new Map<string, Promise<void>>()
   private readonly startupTimeoutMs: number
   private readonly onStartupProgress?: SessionHostManagerOptions['onStartupProgress']
   private readonly runtimeDir: string
@@ -363,6 +369,7 @@ export class SessionHostManager {
   private readonly hostEntry: string
   private readonly nodeExecutable: string
   private readonly timeoutMs: number
+  private readonly getCodexTerminalMode?: SessionHostManagerOptions['getCodexTerminalMode']
   private readonly resolveAgentConfig?: SessionHostManagerOptions['resolveAgentConfig']
   private readonly resolveAgentProxy?: SessionHostManagerOptions['resolveAgentProxy']
   private readonly managerId = randomUUID()
@@ -379,6 +386,7 @@ export class SessionHostManager {
     this.onStartupProgress = options.onStartupProgress
     this.leaseMs = Math.max(5_000, Math.min(60_000, options.leaseMs ?? 15_000))
     this.preserveOnLeaseExpiry = options.preserveOnLeaseExpiry !== false
+    this.getCodexTerminalMode = options.getCodexTerminalMode
     this.resolveAgentConfig = options.resolveAgentConfig
     this.resolveAgentProxy = options.resolveAgentProxy
   }
@@ -388,6 +396,7 @@ export class SessionHostManager {
   }
 
   async start(options: StartHostOptions): Promise<HostHandle> {
+    const codexTerminalMode = this.getCodexTerminalMode?.() ?? DEFAULT_TERMINAL_SETTINGS.codexMode
     await mkdir(this.runtimeDir, { recursive: true })
     if (this.socketDir !== this.runtimeDir) await mkdir(this.socketDir, { recursive: true, mode: 0o700 })
     const hostId = randomUUID()
@@ -408,6 +417,7 @@ export class SessionHostManager {
       ...(options.agentConfig ? { agentConfig: { ...options.agentConfig, extraArgs: [...options.agentConfig.extraArgs] } } : {}),
       ...(options.agentProxy?.enabled ? { agentProxy: { ...options.agentProxy } } : {}),
       ...(options.fullAutoEnabled ? { fullAutoEnabled: true } : {}),
+      ...(options.approvalMode ? { approvalMode: options.approvalMode } : {}),
       pid: 0,
       endpoint,
       lifecycle: 'starting',
@@ -467,6 +477,7 @@ export class SessionHostManager {
       report('ready')
       handle.send({
         type: 'start',
+        ...(options.agentKind === 'codex' ? { codexTerminalMode } : {}),
         ...(options.initialPrompt ? { initialPrompt: options.initialPrompt } : {}),
         agentKind: options.agentKind,
         executable: options.executable,
@@ -592,6 +603,15 @@ export class SessionHostManager {
   }
 
   async updateMetadata(hostId: string, update: HostMetadataUpdate): Promise<void> {
+    const snapshot = structuredClone(update)
+    const previous = this.metadataWrites.get(hostId) ?? Promise.resolve()
+    const writing = previous.catch(() => undefined).then(() => this.writeMetadataUpdate(hostId, snapshot))
+    this.metadataWrites.set(hostId, writing)
+    try { await writing }
+    finally { if (this.metadataWrites.get(hostId) === writing) this.metadataWrites.delete(hostId) }
+  }
+
+  private async writeMetadataUpdate(hostId: string, update: HostMetadataUpdate): Promise<void> {
     const record = await this.readRecord(hostId)
     const updated: HostRecord = {
       ...record,
@@ -605,6 +625,7 @@ export class SessionHostManager {
       ...(update.agentConfig === undefined || update.agentConfig === null ? {} : { agentConfig: { ...update.agentConfig, extraArgs: [...update.agentConfig.extraArgs] } }),
       ...(update.agentProxy === undefined || update.agentProxy === null ? {} : { agentProxy: { ...update.agentProxy } }),
       ...(update.fullAutoEnabled === undefined ? {} : { fullAutoEnabled: update.fullAutoEnabled }),
+      ...(update.approvalMode === undefined ? {} : { approvalMode: update.approvalMode }),
       updatedAt: new Date().toISOString(),
     }
     if (update.agentConfig === null) delete updated.agentConfig
@@ -613,6 +634,9 @@ export class SessionHostManager {
   }
 
   async removeArtifacts(hostId: string): Promise<void> {
+    // Finish queued resume/mode writes before deletion, so an old write cannot
+    // recreate the released Host's record and revive an obsolete binding.
+    await this.metadataWrites.get(hostId)?.catch(() => undefined)
     await Promise.all([
       unlink(this.registryPath(hostId)).catch(() => undefined),
       unlink(this.exitPath(hostId)).catch(() => undefined),

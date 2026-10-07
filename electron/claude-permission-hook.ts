@@ -1,8 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto'
 import net from 'node:net'
+import { boundedHookText as boundedText, permissionHookFields } from './permission-hook-input'
+import type { ApprovalInputIssue } from '../src/shared/manager-api'
 
 interface HookInput {
   session_id?: unknown
+  transcript_path?: unknown
   cwd?: unknown
   tool_name?: unknown
   tool_input?: unknown
@@ -20,6 +23,8 @@ interface PermissionDetails {
   targetPaths?: string[]
   toolInputSummary?: string
   reason?: string
+  inputTruncated?: boolean
+  inputIssue?: ApprovalInputIssue
 }
 
 function readInput(): Promise<string> {
@@ -32,14 +37,8 @@ function readInput(): Promise<string> {
 }
 
 function objectInput(input: HookInput): Record<string, unknown> | undefined {
-  return typeof input.tool_input === 'object' && input.tool_input !== null
+  return typeof input.tool_input === 'object' && input.tool_input !== null && !Array.isArray(input.tool_input)
     ? input.tool_input as Record<string, unknown>
-    : undefined
-}
-
-function boundedText(value: unknown, maxLength: number): string | undefined {
-  return typeof value === 'string' && value.length > 0 && value.length <= maxLength && !value.includes('\0')
-    ? value
     : undefined
 }
 
@@ -60,95 +59,99 @@ function toolInputFingerprint(input: HookInput): string | undefined {
 function permissionDetails(input: HookInput): PermissionDetails {
   const toolName = typeof input.tool_name === 'string' ? input.tool_name : ''
   const details = objectInput(input)
-  const command = toolName === 'Bash' || toolName === 'PowerShell'
-    ? boundedText(details?.command, 2_048)
-    : undefined
-  const filePath = boundedText(details?.file_path ?? details?.notebook_path ?? details?.path, 1_024)
-  const rawPaths = details?.file_paths ?? details?.paths
-  const targetPaths = Array.isArray(rawPaths)
-    ? rawPaths
-      .map((value) => boundedText(value, 1_024))
-      .filter((value): value is string => value !== undefined)
-      .slice(0, 50)
-    : undefined
-  const operation: ApprovalRisk = command && /(?:^|\s)(?:rm|rmdir|del|erase|Remove-Item|Clear-Content|format)(?:\s|$)/i.test(command)
-    ? 'delete'
-    : /^(?:Read|Glob|Grep|WebFetch|WebSearch)$/i.test(toolName)
+  const fields = permissionHookFields(details)
+  const { command, filePath, targetPaths } = fields
+  const operation: ApprovalRisk = /^(?:Read|Glob|Grep|WebFetch|WebSearch)$/i.test(toolName)
       ? 'read'
       : /^(?:Edit|Write|NotebookEdit|TodoWrite)$/i.test(toolName)
         ? 'write'
         : 'unknown'
   const summary = command ?? filePath ?? (targetPaths?.length ? targetPaths.join(', ') : undefined)
     ?? (() => {
-      try { return details ? JSON.stringify(details).slice(0, 2_048) : undefined } catch { return undefined }
+      try { return details ? JSON.stringify(details) : undefined } catch { return undefined }
     })()
   return {
-    ...(command ? { command } : {}),
+    ...fields,
     operation,
-    ...(filePath ? { filePath } : {}),
-    ...(targetPaths?.length ? { targetPaths } : {}),
-    ...(summary ? { toolInputSummary: summary.slice(0, 2_048) } : {}),
+    ...(summary ? { toolInputSummary: summary.slice(0, 16_384) } : {}),
     ...(boundedText(details?.description ?? details?.reason, 2_048) ? { reason: boundedText(details?.description ?? details?.reason, 2_048) } : {}),
   }
+}
+
+function denyUnavailable(): void {
+  process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: {
+    behavior: 'deny', message: 'Agent TUI Manager could not obtain a valid approval. This request was not executed. Use a materially safer, complete request; do not bypass review or wait for a human.',
+  } } }))
 }
 
 async function main(): Promise<void> {
   const endpoint = process.env.AGENT_TUI_MANAGER_HOOK_ENDPOINT
   const token = process.env.AGENT_TUI_MANAGER_HOOK_TOKEN
-  if (!endpoint || !token) return
+  if (!endpoint || !token) { denyUnavailable(); return }
   let input: HookInput
-  try { input = JSON.parse(await readInput()) as HookInput } catch { return }
-  if (typeof input.tool_name !== 'string' || !input.tool_name) return
+  try { input = JSON.parse(await readInput()) as HookInput } catch { denyUnavailable(); return }
+  if (!input || typeof input.tool_name !== 'string' || !input.tool_name) { denyUnavailable(); return }
 
   const requestId = randomUUID()
   const details = permissionDetails(input)
   const fingerprint = toolInputFingerprint(input)
-  const response = await new Promise<'allow' | 'ask' | 'deny'>((resolve) => {
+  const response = await new Promise<{ action: 'allow' | 'ask' | 'deny'; reason?: string }>((resolve) => {
     const socket = net.createConnection(endpoint)
     let buffer = ''
     let settled = false
-    const finish = (action: 'allow' | 'ask' | 'deny'): void => {
+    const finish = (action: 'allow' | 'ask' | 'deny', reason?: string): void => {
       if (settled) return
       settled = true
       clearTimeout(timer)
       socket.destroy()
-      resolve(action)
+      resolve({ action, ...(reason ? { reason } : {}) })
     }
-    const timer = setTimeout(() => finish('ask'), 30 * 60_000)
+    const timer = setTimeout(() => finish('deny'), 1790_000)
     socket.setEncoding('utf8')
     socket.once('connect', () => socket.write(`${JSON.stringify({
       type: 'permission-hook', token, requestId, hookSource: 'claude', toolName: input.tool_name,
       toolInput: input.tool_input,
       rawPayload: input,
+      ...(boundedText(input.session_id, 256) ? { nativeSessionId: boundedText(input.session_id, 256) } : {}),
+      ...(boundedText(input.transcript_path, 4_096) ? { transcriptPath: boundedText(input.transcript_path, 4_096) } : {}),
+      ...(boundedText(input.cwd, 4_096) ? { cwd: boundedText(input.cwd, 4_096) } : {}),
       ...(boundedText(input.tool_use_id, 256) ? { toolUseId: boundedText(input.tool_use_id, 256) } : {}),
       ...(boundedText(input.agent_id, 256) ? { agentId: boundedText(input.agent_id, 256) } : {}),
-      ...(boundedText(input.session_id, 256) ? { nativeSessionId: boundedText(input.session_id, 256) } : {}),
-      ...(boundedText(input.cwd, 4096) ? { cwd: boundedText(input.cwd, 4096) } : {}),
       ...(boundedText(input.agent_type, 128) ? { agentType: boundedText(input.agent_type, 128) } : {}),
       ...(fingerprint ? { toolInputFingerprint: fingerprint } : {}),
       ...details,
     })}\n`))
     socket.on('data', (chunk) => {
       buffer += chunk
-      const newline = buffer.indexOf('\n')
-      if (newline < 0) return
-      try {
-        const event = JSON.parse(buffer.slice(0, newline)) as { type?: string; action?: string }
-        finish(event.type === 'permission-response' && (event.action === 'allow' || event.action === 'deny') ? event.action : 'ask')
-      } catch { finish('ask') }
+      if (buffer.length > 65_536) { finish('deny'); return }
+      while (!settled) {
+        const newline = buffer.indexOf('\n')
+        if (newline < 0) return
+        const line = buffer.slice(0, newline)
+        buffer = buffer.slice(newline + 1)
+        try {
+          const event = JSON.parse(line) as { type?: string; action?: string; requestId?: string; data?: unknown; reason?: unknown }
+          if (event.type === 'output' && typeof event.data === 'string') continue
+          if (event.type !== 'permission-response' || event.requestId !== requestId
+            || !['allow', 'deny', 'ask'].includes(event.action ?? '')) finish('deny')
+          else finish(event.action as 'allow' | 'deny' | 'ask', boundedText(event.reason, 2_000)?.trim())
+        } catch { finish('deny') }
+      }
     })
-    socket.once('error', () => finish('ask'))
+    socket.once('error', () => finish('deny'))
+    socket.once('end', () => finish('deny'))
+    socket.once('close', () => finish('deny'))
   })
 
-  if (response === 'allow') {
+  if (response.action === 'allow') {
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } },
     }))
-  } else if (response === 'deny') {
+  } else if (response.reason) {
     process.stdout.write(JSON.stringify({
-      hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny', message: 'Denied by the user in Agent TUI Manager' } },
+      hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny', message: response.reason ?? 'Denied by Agent TUI Manager' } },
     }))
-  }
+  } else denyUnavailable()
 }
 
-void main().finally(() => setTimeout(() => process.exit(0), 0))
+void main().catch(() => denyUnavailable()).finally(() => setTimeout(() => process.exit(0), 0))

@@ -148,7 +148,7 @@ describe('ApprovalPolicyEngine', () => {
     }).allowed).toBe(true)
     expect(canFullAutoApprove({ command: 'tool:Task', toolName: 'Task', risk: 'unknown', workspace: 'B:\\work' }).allowed).toBe(true)
     expect(canFullAutoApprove({ command: 'tool:Write', toolName: 'Write', risk: 'write', workspace: 'B:\\work' }).allowed).toBe(true)
-    expect(canFullAutoApprove({ command: undefined, toolName: 'Read', risk: 'unknown', workspace: 'B:\\work' }).allowed).toBe(true)
+    expect(canFullAutoApprove({ command: undefined, toolName: 'Read', filePath: 'B:\\work\\README.md', risk: 'unknown', workspace: 'B:\\work' }).allowed).toBe(true)
   })
 
   it.each([

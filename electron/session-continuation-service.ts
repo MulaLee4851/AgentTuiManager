@@ -1,3 +1,4 @@
+import { approvalModeOf } from '../src/shared/approval-mode'
 import type { AgentConfigSummary, SessionSummary } from '../src/shared/manager-api'
 import type { AgentConfigurationStore } from './agent-configuration-store'
 import type { AgentProxyStore } from './agent-proxy-store'
@@ -11,7 +12,7 @@ export class SessionContinuationService {
   private busy = false
 
   constructor(
-    private readonly controller: Pick<SessionController, 'continuationSource' | 'listSessions' | 'startSession' | 'setFullAutoMode' | 'saveUnattendedSettings' | 'setUnattendedMode' | 'flushCatalog'>,
+    private readonly controller: Pick<SessionController, 'continuationSource' | 'listSessions' | 'startSession' | 'setFullAutoMode' | 'setApprovalMode' | 'saveUnattendedSettings' | 'setUnattendedMode' | 'flushCatalog'>,
     private readonly configs: Pick<AgentConfigurationStore, 'get' | 'save' | 'remove'>,
     private readonly proxies: Pick<AgentProxyStore, 'get' | 'save' | 'remove'>,
     private readonly findTranscript = findNativeSessionTranscriptPath,
@@ -57,7 +58,7 @@ export class SessionContinuationService {
       }, prompt)
       if (summary.unattended) await this.controller.saveUnattendedSettings(created.sessionId, { ...summary.unattended, enabled: false })
       if (summary.unattended?.enabled) await this.controller.setUnattendedMode(created.sessionId, structuredClone(summary.unattended))
-      else if (summary.fullAutoEnabled) await this.controller.setFullAutoMode(created.sessionId, true)
+      else await this.controller.setApprovalMode(created.sessionId, approvalModeOf(summary))
       await this.controller.flushCatalog()
       return { session: this.controller.listSessions().find(item => item.sessionId === created!.sessionId) ?? created }
     } catch (error) {

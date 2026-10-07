@@ -113,6 +113,30 @@ describe('SessionHostManager integration', () => {
     expect(await readdir(workspace)).toEqual([])
   })
 
+  it('captures the latest terminal mode per start and leaves reconnected hosts and recovery metadata unchanged', async () => {
+    const { runtimeDir, workspace } = await fixture()
+    let mode: 'scrollback' | 'native-fullscreen' = 'scrollback'
+    const manager = new SessionHostManager({ runtimeDir, hostEntry: resolve('tests/fixtures/capture-start-host.cjs'), getCodexTerminalMode: () => mode })
+    const recipe = { executable: 'fixture-codex', args: ['--no-alt-screen', 'resume', 'native-id'] }
+    const options = { agentKind: 'codex' as const, ...recipe, cwd: workspace, cols: 80, rows: 24, nativeSessionId: 'native-id', recovery: recipe }
+    const startCaptured = async () => {
+      const handle = await manager.start(options)
+      handles.push(handle); startedHosts.push({ manager, hostId: handle.hostId, runtimeDir })
+      return handle
+    }
+    const first = await startCaptured()
+    mode = 'native-fullscreen'
+    const second = await startCaptured()
+    expect(JSON.parse(await first.replay())).toMatchObject({ codexTerminalMode: 'scrollback', args: recipe.args })
+    expect(JSON.parse(await second.replay())).toMatchObject({ codexTerminalMode: 'native-fullscreen', args: recipe.args })
+    const reconnected = await manager.reconnect(first.hostId)
+    handles.push(reconnected)
+    expect(JSON.parse(await reconnected.replay()).codexTerminalMode).toBe('scrollback')
+    const record = JSON.parse(await readFile(join(runtimeDir, `host-${second.hostId}.json`), 'utf8'))
+    expect(record.recovery).toEqual(recipe)
+    expect(record).not.toHaveProperty('codexTerminalMode')
+  })
+
   it.each([['normal-exit', 0], ['crash', 1]] as const)('reports %s as factual exit code %i', async (mode, exitCode) => {
     const { manager, workspace } = await fixture()
     const handle = await start(manager, workspace, mode)

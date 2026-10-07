@@ -55,6 +55,39 @@ describe('TerminalWriteWatchdog', () => {
     expect(secondCompleted).toHaveBeenCalledWith(false)
   })
 
+  it('renews the stall deadline on progress without completing the logical write', () => {
+    vi.useFakeTimers()
+    const completed = vi.fn()
+    const watchdog = new TerminalWriteWatchdog(2_000)
+    const callback = watchdog.arm(completed)
+    for (let index = 0; index < 5; index++) {
+      vi.advanceTimersByTime(1_500)
+      callback.progress()
+      expect(completed).not.toHaveBeenCalled()
+    }
+    callback()
+    callback.progress()
+    vi.advanceTimersByTime(10_000)
+    expect(completed).toHaveBeenCalledTimes(1)
+    expect(completed).toHaveBeenCalledWith(false)
+  })
+
+  it('still times out a stalled batch and ignores stale progress', () => {
+    vi.useFakeTimers()
+    const first = vi.fn(), second = vi.fn()
+    const watchdog = new TerminalWriteWatchdog(2_000)
+    const old = watchdog.arm(first)
+    vi.advanceTimersByTime(1_500); old.progress()
+    vi.advanceTimersByTime(2_000)
+    expect(first).toHaveBeenCalledTimes(1)
+    expect(first).toHaveBeenCalledWith(true)
+    watchdog.arm(second)
+    vi.advanceTimersByTime(1_500); old.progress()
+    vi.advanceTimersByTime(500)
+    expect(second).toHaveBeenCalledTimes(1)
+    expect(second).toHaveBeenCalledWith(true)
+  })
+
   it('does not release anything after disposal', () => {
     vi.useFakeTimers()
     const completed = vi.fn()
